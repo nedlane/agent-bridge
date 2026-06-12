@@ -11,7 +11,10 @@
 # `cl` sessions, whose titles use the directory name.
 #
 #   claude-worker start <name> [--dir DIR] [-- claude args...]
+#                                            # blocks until the worker is ready
 #   claude-worker send  <name> <text|->     # '-' reads the message from stdin
+#   claude-worker wait  <name> [--for TEXT] [--timeout SECS]
+#                                            # block until idle (or TEXT shows)
 #   claude-worker read  <name> [lines]      # capture the worker's screen
 #   claude-worker list
 #   claude-worker status <name>
@@ -29,6 +32,10 @@ SESSION_PREFIX="cw-"
 # Delay between pasting a message and pressing Enter, so the TUI registers the
 # paste first. Tunable for tests.
 SEND_DELAY="${CLAUDE_WORKER_SEND_DELAY:-0.4}"
+# Polling cadence for wait/start readiness, and how long start blocks for the
+# worker to boot to an idle prompt.
+POLL="${CLAUDE_WORKER_POLL:-4}"
+START_TIMEOUT="${CLAUDE_WORKER_START_TIMEOUT:-90}"
 
 usage() {
   sed -n '/^#   claude-worker/,/^# Orchestrators/p' "$0" | sed 's/^# \{0,2\}//'
@@ -48,10 +55,50 @@ require_name() {
 session_for() { printf '%s%s' "$SESSION_PREFIX" "$1"; }
 
 # tmux's -t matching is prefix-fuzzy; '=' forces an exact session match.
+# Commands that take a target-PANE need the trailing ':' ("=name:") — bare
+# "=name" only resolves for target-session commands on tmux 3.2.
 alive() { tmux has-session -t "=$(session_for "$1")" 2>/dev/null; }
+pane_for() { printf '=%s:' "$(session_for "$1")"; }
 
 meta_get() { # meta_get <name> <key>
   sed -n "s/^$2=//p" "$STATE_ROOT/$1/meta" 2>/dev/null | head -1
+}
+
+screen_of() { tmux capture-pane -p -t "$(pane_for "$1")" -S -50 2>/dev/null || true; }
+
+# Claude Code shows "esc to interrupt" the whole time it is working.
+is_busy() { grep -q "esc to interrupt" <<<"$1"; }
+# First boot in a new directory stops at the folder-trust dialog.
+is_trust_dialog() { grep -qE "trust this folder|Do you trust" <<<"$1"; }
+# Idle: the input prompt is on screen and nothing is running or blocking.
+is_ready() {
+  grep -q "❯" <<<"$1" && ! is_busy "$1" && ! is_trust_dialog "$1"
+}
+
+# wait_until <name> <timeout> [text] — poll the worker's screen until it is
+# idle at its prompt (or [text] appears). Auto-accepts the folder-trust dialog
+# (the orchestrator chose the directory deliberately via --dir).
+# Returns 0 ready/matched, 1 worker died, 2 timeout.
+wait_until() {
+  local name="$1" timeout="$2" for_text="${3:-}" started=$SECONDS screen
+  while :; do
+    alive "$name" || { echo "claude-worker: worker '$name' died while waiting" >&2; return 1; }
+    screen="$(screen_of "$name")"
+    if is_trust_dialog "$screen"; then
+      tmux send-keys -t "$(pane_for "$name")" Enter
+    elif [[ -n "$for_text" ]]; then
+      # The marker counts only once the worker is idle again — the sent
+      # instruction usually echoes the marker on screen, so the text alone
+      # proves nothing while work is still running.
+      if ! is_busy "$screen" && grep -qF -- "$for_text" <<<"$screen"; then
+        return 0
+      fi
+    elif is_ready "$screen"; then
+      return 0
+    fi
+    (( SECONDS - started >= timeout )) && return 2
+    sleep "$POLL"
+  done
 }
 
 cmd_start() {
@@ -87,7 +134,7 @@ cmd_start() {
   cmd="$(printf '%q ' env "CLAUDE_WORKER=$name" "$launcher" \
     --label "worker:$name" ${extra[@]+"${extra[@]}"})"
   tmux new-session -d -s "$session" -c "$dir" "$cmd"
-  tmux pipe-pane -t "=$session" -o "cat >> $(printf '%q' "$state/output.log")"
+  tmux pipe-pane -t "=$session:" -o "cat >> $(printf '%q' "$state/output.log")"
 
   {
     echo "name=$name"
@@ -102,6 +149,45 @@ cmd_start() {
   echo "  tmux:   tmux attach -t $session"
   echo "  dir:    $dir"
   echo "  log:    $state/output.log"
+
+  # Block until the worker is at its idle prompt (accepting the folder-trust
+  # dialog on the way), so the caller can send work immediately after.
+  if wait_until "$name" "$START_TIMEOUT"; then
+    echo "  state:  ready"
+  else
+    case $? in
+      1) die "worker '$name' exited during startup (check $state/output.log)" ;;
+      *) echo "  state:  still starting after ${START_TIMEOUT}s — check with: claude-worker read $name" >&2 ;;
+    esac
+  fi
+}
+
+cmd_wait() {
+  require_name "${1:-}"
+  local name="$1"
+  shift
+  local for_text="" timeout=600
+  while (($#)); do
+    case "$1" in
+      --for)       for_text="${2:?--for needs a value}"; shift 2 ;;
+      --for=*)     for_text="${1#--for=}"; shift ;;
+      --timeout)   timeout="${2:?--timeout needs a value}"; shift 2 ;;
+      --timeout=*) timeout="${1#--timeout=}"; shift ;;
+      *)           die "unknown wait option '$1'" ;;
+    esac
+  done
+  [[ "$timeout" =~ ^[0-9]+$ ]] || die "timeout must be a number, got '$timeout'"
+  alive "$name" || die "worker '$name' is not running"
+  if wait_until "$name" "$timeout" "$for_text"; then
+    echo "ready"
+    return
+  fi
+  case $? in
+    1) exit 1 ;;
+    *) echo "claude-worker: timed out after ${timeout}s; current screen:" >&2
+       screen_of "$name" | grep -v '^[[:space:]]*$' | tail -15 >&2
+       exit 2 ;;
+  esac
 }
 
 cmd_send() {
@@ -110,14 +196,20 @@ cmd_send() {
   [[ -n "$text" ]] || die "usage: claude-worker send <name> <text|->"
   alive "$name" || die "worker '$name' is not running"
   [[ "$text" == "-" ]] && text="$(cat)"
-  local session
-  session="$(session_for "$name")"
+  local pane
+  pane="$(pane_for "$name")"
   # Stage the message as a bracketed paste so multi-line text stays one
   # message instead of submitting at the first newline, then press Enter.
+  # Enter is sent twice with a delay: if the TUI was still registering the
+  # paste the first one is swallowed, and on an already-submitted (empty)
+  # input the second is a no-op. This is what makes send reliable right
+  # after startup.
   printf '%s' "$text" | tmux load-buffer -b claude-worker-send -
-  tmux paste-buffer -p -d -b claude-worker-send -t "=$session"
+  tmux paste-buffer -p -d -b claude-worker-send -t "$pane"
   sleep "$SEND_DELAY"
-  tmux send-keys -t "=$session" Enter
+  tmux send-keys -t "$pane" Enter
+  sleep "$SEND_DELAY"
+  tmux send-keys -t "$pane" Enter
 }
 
 cmd_read() {
@@ -125,7 +217,7 @@ cmd_read() {
   local name="$1" lines="${2:-80}"
   [[ "$lines" =~ ^[0-9]+$ ]] || die "lines must be a number, got '$lines'"
   alive "$name" || die "worker '$name' is not running"
-  tmux capture-pane -p -t "=$(session_for "$name")" -S "-$lines"
+  tmux capture-pane -p -t "$(pane_for "$name")" -S "-$lines"
 }
 
 cmd_list() {
@@ -133,6 +225,9 @@ cmd_list() {
   printf '%-20s %-8s %s\n' NAME STATE DIR
   for dir in "$STATE_ROOT"/*/; do
     [[ -d "$dir" ]] || continue
+    # Skip artifact dirs without meta (e.g. created by the todo relay for
+    # non-worker hash storage) — they aren't workers.
+    [[ -f "$dir/meta" ]] || continue
     name="$(basename "$dir")"
     if alive "$name"; then
       printf '%-20s %-8s %s\n' "$name" running "$(meta_get "$name" dir)"
@@ -144,7 +239,7 @@ cmd_list() {
   # Live cw-* sessions someone created without state (e.g. by hand).
   while IFS= read -r session; do
     name="${session#"$SESSION_PREFIX"}"
-    [[ -d "$STATE_ROOT/$name" ]] && continue
+    [[ -f "$STATE_ROOT/$name/meta" ]] && continue
     printf '%-20s %-8s %s\n' "$name" running "(no recorded state)"
     printed=1
   done < <(tmux list-sessions -F '#S' 2>/dev/null | grep "^$SESSION_PREFIX" || true)
@@ -189,7 +284,7 @@ cmd_restart() {
 cmd="${1:-}"
 shift || true
 case "$cmd" in
-  start|send|read|list|status|stop|restart) "cmd_$cmd" "$@" ;;
+  start|send|wait|read|list|status|stop|restart) "cmd_$cmd" "$@" ;;
   ''|-h|--help|help) usage ;;
   *) die "unknown command '$cmd' (see claude-worker --help)" ;;
 esac
