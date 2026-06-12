@@ -78,23 +78,33 @@ is_ready() {
 # wait_until <name> <timeout> [text] — poll the worker's screen until it is
 # idle at its prompt (or [text] appears). Auto-accepts the folder-trust dialog
 # (the orchestrator chose the directory deliberately via --dir).
+#
+# The done-condition must hold on TWO consecutive polls: right after a send
+# there is a short window where the message is echoed (marker visible) but
+# the busy indicator hasn't appeared yet — a single look reports done while
+# the task hasn't even started. A second look one poll later sees the busy
+# indicator instead, and the echoed marker alone never counts while busy.
 # Returns 0 ready/matched, 1 worker died, 2 timeout.
 wait_until() {
-  local name="$1" timeout="$2" for_text="${3:-}" started=$SECONDS screen
+  local name="$1" timeout="$2" for_text="${3:-}" started=$SECONDS screen done_now stable=0
   while :; do
     alive "$name" || { echo "claude-worker: worker '$name' died while waiting" >&2; return 1; }
     screen="$(screen_of "$name")"
+    done_now=0
     if is_trust_dialog "$screen"; then
       tmux send-keys -t "$(pane_for "$name")" Enter
     elif [[ -n "$for_text" ]]; then
-      # The marker counts only once the worker is idle again — the sent
-      # instruction usually echoes the marker on screen, so the text alone
-      # proves nothing while work is still running.
       if ! is_busy "$screen" && grep -qF -- "$for_text" <<<"$screen"; then
-        return 0
+        done_now=1
       fi
     elif is_ready "$screen"; then
-      return 0
+      done_now=1
+    fi
+    if (( done_now )); then
+      (( stable >= 1 )) && return 0
+      stable=$((stable + 1))
+    else
+      stable=0
     fi
     (( SECONDS - started >= timeout )) && return 2
     sleep "$POLL"
