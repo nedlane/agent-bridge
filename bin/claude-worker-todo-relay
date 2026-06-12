@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Relay a Claude Code worker's live task checklist to Discord — no Codex, no
-# model calls, no tokens. Registered as a PostToolUse hook on TodoWrite (see
-# docs/agent-control-plane.md), so every time a worker updates its todo list,
-# the checkboxes land in the Discord channel behind the webhook.
+# model calls, no tokens. Registered as a PostToolUse hook on
+# TodoWrite|TaskCreate|TaskUpdate (see docs/agent-control-plane.md), so every
+# todo-list update and every task create/edit/complete/delete lands as
+# checkboxes in the Discord channel behind the webhook.
 #
-# Hook input (JSON on stdin): {session_id, cwd, tool_input: {todos: [...]}}.
+# Hook input (JSON on stdin): {session_id, cwd, tool_name, tool_input}.
+# TodoWrite carries the full list in tool_input.todos; the Task tools only
+# carry a delta, so the full list is re-read from the session's task dir
+# (~/.claude/tasks/<session-id>/, override with $CLAUDE_TASKS_DIR).
 #
 # Behaviour:
 #   - Only fires for orchestrated workers (claude-worker sets $CLAUDE_WORKER);
@@ -34,21 +38,48 @@ hook_json="$(cat 2>/dev/null || true)"
 payload="$(HOOK_JSON="$hook_json" python3 - "$worker" <<'PY' 2>/dev/null
 import json, os, sys
 
+import glob
+
 worker = sys.argv[1] or "session"
 try:
     hook = json.loads(os.environ.get("HOOK_JSON", ""))
 except Exception:
     sys.exit(0)
-todos = (hook.get("tool_input") or {}).get("todos") or []
-if not todos:
+
+items = []  # (status, text)
+if hook.get("tool_name") == "TodoWrite":
+    for t in (hook.get("tool_input") or {}).get("todos") or []:
+        status = t.get("status", "pending")
+        text = t.get("activeForm") if status == "in_progress" else t.get("content")
+        items.append((status, text or "?"))
+else:
+    # TaskCreate/TaskUpdate: the tool input is only a delta, so render the
+    # whole checklist from the session's on-disk task list
+    # (~/.claude/tasks/<session-id>/<n>.json).
+    tasks_dir = os.environ.get("CLAUDE_TASKS_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude", "tasks", hook.get("session_id") or "-")
+    tasks = []
+    for path in glob.glob(os.path.join(tasks_dir, "*.json")):
+        try:
+            with open(path) as fh:
+                tasks.append(json.load(fh))
+        except Exception:
+            pass
+    tasks.sort(key=lambda t: (not str(t.get("id", "")).isdigit(),
+                              int(t["id"]) if str(t.get("id", "")).isdigit() else 0,
+                              str(t.get("id", ""))))
+    for t in tasks:
+        if t.get("status") in ("deleted", "cancelled"):
+            continue
+        items.append((t.get("status", "pending"), t.get("subject") or "?"))
+
+if not items:
     sys.exit(0)
 
 mark = {"completed": "✅", "in_progress": "▶️", "pending": "⬜"}
 lines = [f"**worker:{worker}** — `{os.path.basename(hook.get('cwd') or '') or '?'}`"]
-for t in todos:
-    status = t.get("status", "pending")
-    text = t.get("activeForm") if status == "in_progress" else t.get("content")
-    lines.append(f"{mark.get(status, '⬜')} {text or '?'}")
+for status, text in items:
+    lines.append(f"{mark.get(status, '⬜')} {text}")
 
 content = "\n".join(lines)
 if len(content) > 1900:  # Discord caps messages at 2000 chars
