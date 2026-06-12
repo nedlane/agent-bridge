@@ -180,9 +180,14 @@ def channel_from_chat(chat):
 
 
 def _run(args, timeout=180):
-    return subprocess.run(
-        args, capture_output=True, text=True, timeout=timeout, check=False
-    )
+    try:
+        return subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        # Surface "claude-worker not on PATH" and hangs as a failed result so
+        # callers report them to the channel instead of dying in on_message.
+        return subprocess.CompletedProcess(args, 127, stdout="", stderr=str(exc))
 
 
 def worker_alive(name):
@@ -230,8 +235,13 @@ def worker_has_state(name, state_root=None):
 
 
 def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
+    import logging
+
     import discord
     from aiohttp import web
+
+    # Without this, exceptions inside discord.py event handlers vanish.
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
     cfg = load_config(config_path)
     secret = read_kv_file(SECRET_FILE).get("BRIDGE_WEBHOOK_SECRET", "")
