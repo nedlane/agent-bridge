@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Send a message to Ned on Discord from any shell or agent session — Claude
+# Code workers use this (via the discord-notify skill) to report progress,
+# blockers, and questions while he is away from the terminal.
+#
+#   discord-notify "tests are green"
+#   discord-notify -t discord:#ops "deploy done"   # explicit channel/thread
+#   some-command | discord-notify -                # body from stdin
+#
+# Transport: prefers the Hermes gateway bot (`hermes send` — reuses the bot
+# token, can address channels and threads, no LLM involved); falls back to
+# the plain webhook file if Hermes isn't installed. Worker sessions (where
+# claude-worker exported $CLAUDE_WORKER) get a "worker:<name>" subject line
+# so it's obvious who is talking. The webhook URL is never printed.
+set -euo pipefail
+
+WEBHOOK_FILE="${CLAUDE_WORKERS_DISCORD_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/discord-webhook}"
+
+die() {
+  echo "discord-notify: $*" >&2
+  exit 1
+}
+
+target="discord"
+args=()
+while (($#)); do
+  case "$1" in
+    -t|--to) target="${2:?-t needs a value}"; shift 2 ;;
+    --)      shift; args+=("$@"); break ;;
+    *)       args+=("$1"); shift ;;
+  esac
+done
+
+message="${args[0]:--}"
+[[ "$message" == "-" ]] && message="$(cat)"
+[[ -n "$message" ]] || die "empty message"
+
+subject=""
+[[ -n "${CLAUDE_WORKER:-}" ]] && subject="worker:$CLAUDE_WORKER"
+
+if command -v hermes >/dev/null 2>&1; then
+  if [[ -n "$subject" ]]; then
+    printf '%s' "$message" | hermes send -q -t "$target" -s "$subject" -f -
+  else
+    printf '%s' "$message" | hermes send -q -t "$target" -f -
+  fi
+  exit
+fi
+
+# Fallback: plain webhook POST (home channel only; -t targets need the bot).
+[[ -r "$WEBHOOK_FILE" ]] || die "no transport: hermes not installed and no webhook file ($WEBHOOK_FILE)"
+webhook="$(head -1 "$WEBHOOK_FILE")"
+[[ -n "$webhook" ]] || die "webhook file is empty"
+[[ -n "$subject" ]] && message="**$subject**
+$message"
+payload="$(MSG="$message" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"][:1990]}))')"
+curl -fsS -m 10 -H 'Content-Type: application/json' -d "$payload" "$webhook" >/dev/null \
+  || die "webhook POST failed"

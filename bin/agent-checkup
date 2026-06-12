@@ -68,8 +68,20 @@ if [[ -n "${OPENAI_API_KEY:-}" ]]; then
   warn "OPENAI_API_KEY is set — Codex may prefer API billing over the ChatGPT subscription; unset it for this setup"
 fi
 
+# --- Hermes gateway (Discord bot planner) -----------------------------------------
+if command -v hermes >/dev/null 2>&1; then
+  pass "hermes installed ($(command -v hermes))"
+  if [[ -f "$HOME/.hermes/auth.json" ]]; then
+    pass "hermes auth store present (verify provider with: hermes auth status openai-codex)"
+  else
+    warn "hermes has no auth store — run \`hermes auth add openai-codex --type oauth\`"
+  fi
+else
+  warn "hermes not installed — the Discord bot planner is unavailable (claude-worker still works directly)"
+fi
+
 # --- worker tooling ----------------------------------------------------------------
-for tool in claude-launch claude-worker claude-worker-todo-relay agent-checkup; do
+for tool in claude-launch claude-worker claude-worker-todo-relay discord-notify agent-checkup; do
   if command -v "$tool" >/dev/null 2>&1; then
     pass "$tool on PATH ($(command -v "$tool"))"
   else
