@@ -18,13 +18,24 @@ From any Claude session or shell on this machine — workers included:
 ```sh
 bridge-ctl addrepo <name> </abs/path>   # creates #<name>, maps it, returns
                                         # {"channel_id": ...}
+bridge-ctl start <name>                 # start that repo's worker via the
+                                        # bridge (protocol injected, resumes)
 bridge-ctl repos                        # list channel -> repo mappings
 discord-notify -t discord:<channel_id> "first message"   # talk into it
 ```
 
 Ned can also type `!addrepo <name> <path>` in Discord. Prefer these tools
 over editing config or calling the Discord REST API by hand; the bridge owns
-channel creation and the mapping file.
+channel creation and the mapping file. To hand a worker a task end-to-end:
+`bridge-ctl start <name>`, then `claude-worker send <name> "the task"`.
+
+## The orchestrator
+
+The worker named `orchestrator` (channel `#orchestrator`) is Ned's
+natural-language remote for all of this — the bridge injects an extra brief
+teaching it the tools above, so "spin up a worker on ghpr and have it triage
+the failing tests" works without bot commands. It is an ordinary worker
+otherwise (idle-reaped, resumed with `--continue`).
 
 ## Operate / debug
 
