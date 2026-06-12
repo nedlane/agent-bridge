@@ -54,10 +54,11 @@ bridge_send() {
   url="$(sed -n 's/^BRIDGE_WEBHOOK_URL=//p' "$BRIDGE_CFG" | head -1)"
   secret="$(sed -n 's/^BRIDGE_WEBHOOK_SECRET=//p' "$BRIDGE_CFG" | head -1)"
   [[ -n "$url" && -n "$secret" ]] || return 1
-  body="$(CHAT="$1" CONTENT="$2" python3 -c '
+  body="$(CHAT="$1" CONTENT="$2" WORKER="${CLAUDE_WORKER:-}" python3 -c '
 import json, os
 print(json.dumps({"event_type": "claude.worker.send",
                   "chat": os.environ["CHAT"],
+                  "worker": os.environ["WORKER"],
                   "content": os.environ["CONTENT"]}))' 2>/dev/null)" || return 1
   [[ -n "$body" ]] || return 1
   sig="$(printf '%s' "$body" | SECRET="$secret" python3 -c '

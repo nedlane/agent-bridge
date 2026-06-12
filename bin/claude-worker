@@ -210,21 +210,34 @@ cmd_wait() {
 
 cmd_send() {
   require_name "${1:-}"
-  local name="$1" text="${2-}"
-  [[ -n "$text" ]] || die "usage: claude-worker send <name> <text|->"
+  local name="$1"
+  shift
+  local typed=0 text=""
+  while (($#)); do
+    case "$1" in
+      --type) typed=1; shift ;;  # typed keystrokes (slash commands), not a paste
+      *)      text="$1"; shift ;;
+    esac
+  done
+  [[ -n "$text" ]] || die "usage: claude-worker send <name> [--type] <text|->"
   alive "$name" || die "worker '$name' is not running"
   [[ "$text" == "-" ]] && text="$(cat)"
   local pane
   pane="$(pane_for "$name")"
   # Stage the message as a bracketed paste so multi-line text stays one
-  # message instead of submitting at the first newline, then press Enter and
-  # VERIFY it submitted: while our text is still sitting in the input box,
-  # the screen's last "❯" line contains it; once submitted, that line is an
-  # empty prompt (the echoed history copy is never the last "❯" line). The
-  # TUI sometimes swallows keys right after a turn ends, so retry a few
-  # times before reporting failure.
-  printf '%s' "$text" | tmux load-buffer -b claude-worker-send -
-  tmux paste-buffer -p -d -b claude-worker-send -t "$pane"
+  # message instead of submitting at the first newline (--type instead sends
+  # literal keystrokes so the TUI sees a typed /slash-command), then press
+  # Enter and VERIFY it submitted: while our text is still sitting in the
+  # input box, the screen's last "❯" line contains it; once submitted, that
+  # line is an empty prompt (the echoed history copy is never the last "❯"
+  # line). The TUI sometimes swallows keys right after a turn ends, so retry
+  # a few times before reporting failure.
+  if (( typed )); then
+    tmux send-keys -t "$pane" -l "$text"
+  else
+    printf '%s' "$text" | tmux load-buffer -b claude-worker-send -
+    tmux paste-buffer -p -d -b claude-worker-send -t "$pane"
+  fi
   local probe attempt last_prompt
   probe="${text%%$'\n'*}"
   probe="${probe:0:40}"

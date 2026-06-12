@@ -55,6 +55,45 @@ SECRET_FILE = os.path.expanduser(
 DISCORD_LIMIT = 2000
 REPLY_CAP = 8000
 
+# Injected into every worker's system prompt: the worker itself is the
+# publisher. It messages Ned through discord-notify (which auto-targets the
+# worker's repo channel); the bridge's transcript extraction is only a
+# fallback for turns where the worker said nothing. This is what makes
+# multi-hour tasks safe: no screen scraping, no per-turn chatter.
+PROTOCOL = """You are running as a Discord-bridged Claude Code worker for Ned.
+Your terminal output is NOT reliably visible to him. The ONLY reliable way to
+message him is the discord-notify CLI, which posts to this conversation's
+Discord channel automatically:
+  discord-notify "short message"        # or pipe a longer body: ... | discord-notify -
+Message him ONLY when one of these happens:
+  1. The task is complete - send a concise result summary.
+  2. You are blocked on a question or decision only Ned can answer - ask it,
+     then stop and wait; his answer arrives as your next user message.
+  3. He explicitly asks for a check-in - send 3-5 lines of progress, then
+     continue working.
+Otherwise work silently. No progress spam. Long tasks (multiple hours) are
+expected - do not stop early to report, do not ask for permission to
+continue.
+You can also operate the bridge with tools (never by reading screens or
+internals): `bridge-ctl addrepo <name> </abs/path>` creates a new repo
+channel/conversation and maps it; `bridge-ctl repos` lists mappings;
+`discord-notify -t discord:<channel_id> "..."` messages a specific channel.
+Your discord-notify and claude-bridge skills document the rest."""
+
+
+def start_args(name, directory, channel_id, resume):
+    """argv for claude-worker start, with the Discord protocol injected."""
+    args = [
+        "claude-worker", "start", name,
+        "--dir", directory,
+        "--chat", f"discord:{channel_id}",
+        "--",
+    ]
+    if resume:
+        args.append("--continue")
+    args += ["--append-system-prompt", PROTOCOL]
+    return args
+
 # --------------------------------------------------------------------------
 # Pure helpers (no I/O beyond explicit paths; covered by the smoke test)
 # --------------------------------------------------------------------------
@@ -243,18 +282,14 @@ def worker_screen(name, lines=40):
 
 
 def worker_start(name, directory, channel_id, resume):
-    args = [
-        "claude-worker", "start", name,
-        "--dir", directory,
-        "--chat", f"discord:{channel_id}",
-    ]
-    if resume:
-        args += ["--", "--continue"]
-    return _run(args, timeout=180)
+    return _run(start_args(name, directory, channel_id, resume), timeout=180)
 
 
-def worker_send(name, text):
-    return _run(["claude-worker", "send", name, text], timeout=30)
+def worker_send(name, text, typed=False):
+    args = ["claude-worker", "send", name]
+    if typed:
+        args.append("--type")
+    return _run(args + [text], timeout=30)
 
 
 def worker_stop(name):
@@ -289,9 +324,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     intents.message_content = True
     client = discord.Client(intents=intents)
 
-    queues = {}         # worker name -> [pending message texts]
     last_activity = {}  # worker name -> epoch seconds
     offsets = {}        # transcript path -> bytes already consumed
+    notified = set()    # workers that messaged Ned themselves this turn
 
     async def settle_file(path, timeout=10):
         """Wait until `path` stops changing (two identical mtimes 0.5s apart)."""
@@ -323,20 +358,19 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         for chunk in split_message(text):
             await channel.send(chunk)
 
-    async def deliver(name, text, message=None):
+    async def deliver(name, text, message=None, typed=False):
+        # Messages go straight in even mid-turn — Claude Code natively queues
+        # typed-while-running input as steering, which is what check-ins and
+        # course corrections need. ⏳ just signals "delivered while working".
         last_activity[name] = time.time()
-        if await asyncio.to_thread(worker_busy, name):
-            queues.setdefault(name, []).append(text)
-            if message:
-                await message.add_reaction("⏳")
-            return
-        r = await asyncio.to_thread(worker_send, name, text)
+        busy = await asyncio.to_thread(worker_busy, name)
+        r = await asyncio.to_thread(worker_send, name, text, typed)
         if r.returncode != 0:
             if message:
                 await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
             return
         if message:
-            await message.add_reaction("✅")
+            await message.add_reaction("⏳" if busy else "✅")
 
     async def handle_repo_message(message, repo):
         name, directory = repo["name"], repo["dir"]
@@ -351,7 +385,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     f"⚠️ could not start worker `{name}`: {r.stderr.strip()}"
                 )
                 return
-        await deliver(name, message.content, message)
+        # Leading "/" means a Claude Code slash command — type it so the TUI
+        # actually executes it instead of treating it as pasted text.
+        await deliver(name, message.content, message,
+                      typed=message.content.startswith("/"))
 
     async def handle_command(message, cmd, args):
         repo = repo_for_channel(message.channel.id)
@@ -376,6 +413,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         elif cmd == "screen" and name:
             screen = await asyncio.to_thread(worker_screen, name, 40)
             await post(message.channel.id, f"```\n{screen}\n```")
+        elif cmd == "checkin" and name:
+            await deliver(
+                name,
+                "Ned is asking for a check-in right now: send him 3-5 lines "
+                "of progress (current step, what's left, any blockers) via "
+                "discord-notify, then continue the task.",
+                message,
+            )
         elif cmd == "addrepo" and len(args) == 2:
             repo_name, path = args[0], os.path.expanduser(args[1])
             if not os.path.isdir(path):
@@ -392,8 +437,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             )
         else:
             await message.channel.send(
-                "commands: !status · !stop [name] · !restart [name] · "
-                "!screen [name] · !addrepo <name> <path>"
+                "commands: !status · !checkin [name] · !stop [name] · "
+                "!restart [name] · !screen [name] · !addrepo <name> <path>"
             )
 
     @client.event
@@ -429,14 +474,25 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if etype == "claude.worker.turn_ended":
             name = event.get("worker", "")
             channel_id = channel_from_chat(event.get("chat", "")) or channel_for_worker(name)
-            if channel_id:
+            path = event.get("transcript_path", "")
+            last_activity[name] = time.time()
+            # Push-first: if the worker already messaged Ned this turn via
+            # discord-notify, the fallback stays silent — but the transcript
+            # offset is still consumed so a later fallback can't replay this
+            # turn's text.
+            worker_spoke = name in notified
+            notified.discard(name)
+            if channel_id and worker_spoke:
+                _, off = extract_new_reply(path, offsets.get(path, 0))
+                offsets[path] = off
+                print(f"[bridge] {name}: turn ended, worker already notified — fallback silent")
+            elif channel_id:
                 # The Stop hook can fire before Claude Code flushes the final
                 # assistant message, and a stale read returns the PREVIOUS
                 # turn's reply (the one-prompt-behind bug). Known transcripts
                 # are read incrementally from a byte offset so only this
                 # turn's text counts; unseen transcripts (fresh worker or
                 # bridge restart) are read whole after the file settles.
-                path = event.get("transcript_path", "")
                 reply = ""
                 if path in offsets:
                     off = offsets[path]
@@ -457,12 +513,31 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                       f"{len(reply) if reply else 0} chars to {channel_id}")
                 if not reply:
                     reply = "(no new reply text captured — use !screen)"
-                last_activity[name] = time.time()
                 await post(channel_id, reply)
-                pending = queues.get(name) or []
-                if pending:
-                    await deliver(name, pending.pop(0))
+        elif etype == "claude.bridge.addrepo":
+            repo_name = (event.get("name") or "").strip()
+            repo_path = os.path.expanduser(event.get("path") or "")
+            if not repo_name or not os.path.isdir(repo_path):
+                return web.json_response(
+                    {"error": f"invalid name or directory: {repo_name!r} {repo_path!r}"},
+                    status=400,
+                )
+            category = client.get_channel(int(cfg["category_id"]))
+            if category is None:
+                return web.json_response({"error": "Claude category not found"}, status=400)
+            channel = await category.guild.create_text_channel(
+                repo_name, category=category
+            )
+            cfg["repos"][str(channel.id)] = {"name": repo_name, "dir": repo_path}
+            save_config(cfg, config_path)
+            print(f"[bridge] addrepo: #{channel.name} ({channel.id}) -> {repo_path}")
+            return web.json_response(
+                {"status": "ok", "channel_id": str(channel.id), "channel": channel.name}
+            )
         elif etype == "claude.worker.send":
+            worker = event.get("worker", "")
+            if worker:
+                notified.add(worker)
             channel_id = channel_from_chat(event.get("chat", ""))
             if channel_id and event.get("content"):
                 await post(channel_id, event["content"])

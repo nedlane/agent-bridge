@@ -72,7 +72,8 @@ fi
 
 # --- worker tooling ----------------------------------------------------------------
 for tool in claude-launch claude-worker claude-worker-todo-relay \
-            claude-worker-done-relay claude-bridge discord-notify agent-checkup; do
+            claude-worker-done-relay claude-bridge bridge-ctl discord-notify \
+            agent-checkup; do
   if command -v "$tool" >/dev/null 2>&1; then
     pass "$tool on PATH ($(command -v "$tool"))"
   else
