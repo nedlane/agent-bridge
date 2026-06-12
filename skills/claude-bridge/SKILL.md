@@ -11,24 +11,20 @@ channel under the **Claude** category maps to one tmux Claude Code worker
 worker; the worker's replies come back via its Stop hook; idle workers are
 reaped and revived with `claude --continue`.
 
-## Add a repo channel
+## Add a repo channel (create a new chat)
 
-Preferred: Ned types `!addrepo <name> <path>` in any channel the bot can
-see — the bridge creates `#<name>` under the Claude category and saves the
-mapping itself.
-
-From this machine instead: edit `~/.config/claude-bridge/config.json` and add
-`"<channel_id>": {"name": "<worker>", "dir": "<abs path>"}` under `repos`,
-then `systemctl --user restart claude-bridge`. To also create the Discord
-channel from here, POST to the Discord API using the bot token from
-`~/.config/claude-workers/discord-bot-token` (never print it):
+From any Claude session or shell on this machine — workers included:
 
 ```sh
-curl -fsS -X POST "https://discord.com/api/v10/guilds/<guild_id>/channels" \
-  -H "Authorization: Bot $(cat ~/.config/claude-workers/discord-bot-token)" \
-  -H 'Content-Type: application/json' \
-  -d '{"name": "<repo>", "type": 0, "parent_id": "1515015058009231370"}'
+bridge-ctl addrepo <name> </abs/path>   # creates #<name>, maps it, returns
+                                        # {"channel_id": ...}
+bridge-ctl repos                        # list channel -> repo mappings
+discord-notify -t discord:<channel_id> "first message"   # talk into it
 ```
+
+Ned can also type `!addrepo <name> <path>` in Discord. Prefer these tools
+over editing config or calling the Discord REST API by hand; the bridge owns
+channel creation and the mapping file.
 
 ## Operate / debug
 

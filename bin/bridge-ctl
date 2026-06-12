@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Operate the claude-bridge from any shell or Claude session — the
+# tools-based interface workers use instead of reading screens or config
+# internals. Verbs are signed events to the bridge's localhost listener.
+#
+#   bridge-ctl addrepo <name> <path>   # create #<name> under the Claude
+#                                      # category and map it to <path>
+#   bridge-ctl repos                   # list channel -> repo mappings
+#
+# addrepo prints the bridge's JSON response ({"status":"ok","channel_id":..})
+# so callers can address the new channel immediately (e.g. with
+# discord-notify -t discord:<channel_id>).
+set -uo pipefail
+
+BRIDGE_CFG="${CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/bridge-webhook}"
+CONFIG="${CLAUDE_BRIDGE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-bridge/config.json}"
+
+die() {
+  echo "bridge-ctl: $*" >&2
+  exit 1
+}
+
+post_event() { # post_event <json-body>; prints response
+  local url secret sig
+  [[ -r "$BRIDGE_CFG" ]] || die "no bridge credentials ($BRIDGE_CFG)"
+  url="$(sed -n 's/^BRIDGE_WEBHOOK_URL=//p' "$BRIDGE_CFG" | head -1)"
+  secret="$(sed -n 's/^BRIDGE_WEBHOOK_SECRET=//p' "$BRIDGE_CFG" | head -1)"
+  [[ -n "$url" && -n "$secret" ]] || die "bridge credentials incomplete"
+  sig="$(printf '%s' "$1" | SECRET="$secret" python3 -c '
+import hashlib, hmac, os, sys
+print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
+               hashlib.sha256).hexdigest())')" || die "signing failed"
+  curl -fsS -m 30 -H 'Content-Type: application/json' \
+    -H "X-Webhook-Signature: $sig" -d "$1" "$url" \
+    || die "bridge did not accept the request (is the service running?)"
+  echo
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  addrepo)
+    name="${2:-}"
+    path="${3:-}"
+    [[ -n "$name" && -n "$path" ]] || die "usage: bridge-ctl addrepo <name> <path>"
+    path="$(cd "${path/#\~/$HOME}" 2>/dev/null && pwd)" || die "no such directory: ${3}"
+    body="$(NAME="$name" REPO="$path" python3 -c '
+import json, os
+print(json.dumps({"event_type": "claude.bridge.addrepo",
+                  "name": os.environ["NAME"],
+                  "path": os.environ["REPO"]}))')" || die "could not build request"
+    post_event "$body"
+    ;;
+  repos)
+    [[ -r "$CONFIG" ]] || die "no bridge config ($CONFIG)"
+    python3 -c '
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+repos = cfg.get("repos", {})
+if not repos:
+    print("(no repo channels mapped)")
+for cid, repo in repos.items():
+    name, rdir = repo["name"], repo["dir"]
+    print(f"{name:<20} discord:{cid}  {rdir}")' "$CONFIG"
+    ;;
+  ''|-h|--help|help)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    die "unknown command '$cmd' (addrepo, repos)"
+    ;;
+esac
