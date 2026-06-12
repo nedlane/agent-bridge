@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Readiness check for the local agent control plane:
+#   Discord/OpenClaw/Hermes -> Codex (planner) -> claude-worker -> tmux ->
+#   claude-launch -> interactive Claude Code.
+#
+# Verifies the pieces that can be checked from this machine — both CLIs
+# installed, both on their *subscription* auth paths (never API-key/provider
+# billing), tmux present, worker tooling linked, state dir writable — and
+# prints explicit manual checks for everything that can't (Discord/OpenClaw/
+# Hermes wiring, live auth). Reads auth files for shape only; never prints
+# their values. Exits 1 if anything FAILs.
+set -uo pipefail
+
+pass_n=0 warn_n=0 fail_n=0
+pass() { echo "PASS  $*"; ((pass_n++)) || true; }
+warn() { echo "WARN  $*"; ((warn_n++)) || true; }
+fail() { echo "FAIL  $*"; ((fail_n++)) || true; }
+
+echo "== agent control plane checkup =="
+
+# --- tmux ---------------------------------------------------------------------
+if command -v tmux >/dev/null 2>&1; then
+  pass "tmux installed ($(command -v tmux))"
+else
+  fail "tmux not found — workers cannot run (install tmux)"
+fi
+
+# --- Claude Code ----------------------------------------------------------------
+if command -v claude >/dev/null 2>&1; then
+  pass "claude installed ($(claude --version 2>/dev/null | head -1 || echo 'version unknown'))"
+  if [[ -f "$HOME/.claude/.credentials.json" ]] \
+     || grep -q '"oauthAccount"' "$HOME/.claude.json" 2>/dev/null; then
+    pass "claude interactive (subscription) credentials present"
+  else
+    warn "claude has no interactive credentials — run \`claude\` once and /login with your Claude subscription"
+  fi
+else
+  fail "claude not found — install Claude Code and run \`claude\` to log in"
+fi
+
+# --- forbidden API/provider env --------------------------------------------------
+for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
+           CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX; do
+  if [[ -n "${!var:-}" ]]; then
+    warn "$var is set — would push Claude Code onto API/provider billing (claude-launch strips it, but find and remove the source)"
+  fi
+done
+
+# --- Codex ------------------------------------------------------------------------
+codex_auth="$HOME/.codex/auth.json"
+if command -v codex >/dev/null 2>&1; then
+  pass "codex installed ($(codex --version 2>/dev/null | head -1 || echo 'version unknown'))"
+  if [[ -f "$codex_auth" ]]; then
+    if grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$codex_auth"; then
+      pass "codex auth_mode is chatgpt (subscription OAuth, not API billing)"
+    elif grep -q '"auth_mode"' "$codex_auth"; then
+      warn "codex auth_mode is not chatgpt — run \`codex login\` and sign in with ChatGPT, not an API key"
+    else
+      warn "codex auth.json has no auth_mode field — verify with \`codex login status\`"
+    fi
+  else
+    warn "codex has no auth.json — run \`codex login\` and sign in with ChatGPT"
+  fi
+else
+  fail "codex not found — install the Codex CLI and run \`codex login\`"
+fi
+if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  warn "OPENAI_API_KEY is set — Codex may prefer API billing over the ChatGPT subscription; unset it for this setup"
+fi
+
+# --- worker tooling ----------------------------------------------------------------
+for tool in claude-launch claude-worker claude-worker-todo-relay agent-checkup; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    pass "$tool on PATH ($(command -v "$tool"))"
+  else
+    fail "$tool not on PATH — run scripts/link.sh (links it into ~/.local/bin)"
+  fi
+done
+
+state_root="${CLAUDE_WORKERS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-workers}"
+if mkdir -p "$state_root" 2>/dev/null && [[ -w "$state_root" ]]; then
+  pass "worker state dir writable ($state_root)"
+else
+  fail "worker state dir not writable ($state_root)"
+fi
+
+webhook_file="${CLAUDE_WORKERS_DISCORD_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/discord-webhook}"
+if [[ -r "$webhook_file" ]]; then
+  pass "Discord todo-relay webhook file present ($webhook_file)"
+else
+  warn "no Discord webhook file ($webhook_file) — the todo relay will stay silent until you create it (see docs/agent-control-plane.md)"
+fi
+
+# --- manual checks ------------------------------------------------------------------
+cat <<'MANUAL'
+
+== manual checks (cannot be verified automatically) ==
+ - Codex subscription path: run `codex login status` — it should report you
+   are signed in with ChatGPT, with no API key configured.
+ - Claude subscription path: inside a `claude` session run /status — the
+   account line should show your Claude subscription, not an API key.
+ - Discord: create a channel + webhook (channel settings -> Integrations ->
+   Webhooks) and store the URL in the webhook file above (chmod 600).
+ - OpenClaw/Hermes: point its Codex/agent integration at this machine and
+   confirm it can execute `claude-worker list` in a shell.
+ - Todo relay hook: confirm ~/.claude/settings.json registers
+   claude-worker-todo-relay as a PostToolUse hook for TodoWrite
+   (snippet in docs/agent-control-plane.md).
+ - First smoke test: claude-worker start scratch --dir /tmp;
+   claude-worker send scratch "say hi"; claude-worker read scratch;
+   claude-worker stop scratch.
+MANUAL
+
+echo
+echo "== summary: $pass_n passed, $warn_n warnings, $fail_n failures =="
+(( fail_n == 0 )) || exit 1
