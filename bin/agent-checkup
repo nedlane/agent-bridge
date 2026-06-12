@@ -81,7 +81,8 @@ else
 fi
 
 # --- worker tooling ----------------------------------------------------------------
-for tool in claude-launch claude-worker claude-worker-todo-relay discord-notify agent-checkup; do
+for tool in claude-launch claude-worker claude-worker-todo-relay \
+            claude-worker-done-relay discord-notify agent-checkup; do
   if command -v "$tool" >/dev/null 2>&1; then
     pass "$tool on PATH ($(command -v "$tool"))"
   else
@@ -101,6 +102,13 @@ if [[ -r "$webhook_file" ]]; then
   pass "Discord todo-relay webhook file present ($webhook_file)"
 else
   warn "no Discord webhook file ($webhook_file) — the todo relay will stay silent until you create it (see docs/agent-control-plane.md)"
+fi
+
+hermes_webhook_file="${CLAUDE_WORKERS_HERMES_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/hermes-webhook}"
+if [[ -r "$hermes_webhook_file" ]]; then
+  pass "Hermes worker-events webhook file present ($hermes_webhook_file)"
+else
+  warn "no Hermes webhook file ($hermes_webhook_file) — push-on-done is off; workers need polling (see docs/agent-control-plane.md)"
 fi
 
 # --- manual checks ------------------------------------------------------------------

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Wake the Hermes planner when a Claude Code worker finishes a turn.
+# Registered as a Stop hook (see docs/agent-control-plane.md): a worker turn
+# ends exactly when its task is done or it has stopped to ask a question, so
+# this is the push that makes fire-and-forget orchestration work — Hermes
+# starts a worker, ends its own turn, and gets woken here instead of polling.
+#
+# Only fires for thread-affine workers (started with `claude-worker start
+# --chat ...`); plain workers and manual sessions stay silent. The event is
+# an HMAC-SHA256-signed POST to the local Hermes webhook route, which runs an
+# agent turn that reads the worker and reports into the originating thread.
+#
+# Endpoint + secret live in a chmod-600 file (never in env, never logged):
+#   ~/.config/claude-workers/hermes-webhook
+#     HERMES_WEBHOOK_URL=http://127.0.0.1:8644/webhooks/claude-worker-events
+#     HERMES_WEBHOOK_SECRET=...
+# Override path with $CLAUDE_WORKERS_HERMES_WEBHOOK_FILE.
+# Always exits 0: a relay problem must never break the Claude session.
+set -uo pipefail
+
+STATE_ROOT="${CLAUDE_WORKERS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-workers}"
+CFG="${CLAUDE_WORKERS_HERMES_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/hermes-webhook}"
+
+worker="${CLAUDE_WORKER:-}"
+[[ -n "$worker" ]] || exit 0
+[[ -r "$CFG" ]] || exit 0
+
+# Only thread-affine workers push events; --chat is the opt-in.
+chat="$(sed -n 's/^chat=//p' "$STATE_ROOT/$worker/meta" 2>/dev/null | head -1)"
+[[ -n "$chat" ]] || exit 0
+
+dir="$(sed -n 's/^dir=//p' "$STATE_ROOT/$worker/meta" 2>/dev/null | head -1)"
+
+hook_json="$(cat 2>/dev/null || true)"
+# stop_hook_active marks a continuation triggered by a previous Stop hook —
+# relaying those would loop.
+if grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' <<<"$hook_json"; then
+  exit 0
+fi
+
+url="$(sed -n 's/^HERMES_WEBHOOK_URL=//p' "$CFG" | head -1)"
+secret="$(sed -n 's/^HERMES_WEBHOOK_SECRET=//p' "$CFG" | head -1)"
+[[ -n "$url" && -n "$secret" ]] || exit 0
+
+body="$(WORKER="$worker" DIR="$dir" CHAT="$chat" python3 -c '
+import json, os
+print(json.dumps({
+    "event_type": "claude.worker.turn_ended",
+    "worker": os.environ["WORKER"],
+    "dir": os.environ["DIR"],
+    "chat": os.environ["CHAT"],
+}))' 2>/dev/null)"
+[[ -n "$body" ]] || exit 0
+
+sig="$(printf '%s' "$body" | SECRET="$secret" python3 -c '
+import hashlib, hmac, os, sys
+print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
+               hashlib.sha256).hexdigest())' 2>/dev/null)"
+[[ -n "$sig" ]] || exit 0
+
+curl -fsS -m 10 -H 'Content-Type: application/json' \
+  -H "X-Webhook-Signature: $sig" -d "$body" "$url" >/dev/null 2>&1
+exit 0

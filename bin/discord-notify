@@ -15,13 +15,14 @@
 set -euo pipefail
 
 WEBHOOK_FILE="${CLAUDE_WORKERS_DISCORD_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/discord-webhook}"
+STATE_ROOT="${CLAUDE_WORKERS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-workers}"
 
 die() {
   echo "discord-notify: $*" >&2
   exit 1
 }
 
-target="discord"
+target=""
 args=()
 while (($#)); do
   case "$1" in
@@ -30,6 +31,13 @@ while (($#)); do
     *)       args+=("$1"); shift ;;
   esac
 done
+
+# Default target: the worker's originating chat thread (recorded by
+# `claude-worker start --chat`), falling back to the Discord home channel.
+if [[ -z "$target" && -n "${CLAUDE_WORKER:-}" ]]; then
+  target="$(sed -n 's/^chat=//p' "$STATE_ROOT/$CLAUDE_WORKER/meta" 2>/dev/null | head -1)"
+fi
+[[ -n "$target" ]] || target="discord"
 
 message="${args[0]:--}"
 [[ "$message" == "-" ]] && message="$(cat)"
