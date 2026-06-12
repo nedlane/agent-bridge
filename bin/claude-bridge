@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""claude-bridge — deterministic Discord <-> Claude Code worker pipe.
+
+Each Discord channel under the Claude category maps to one tmux-backed
+interactive Claude Code worker (channel-per-repo, one worker per repo, no
+threads). The bridge forwards your channel messages to the worker via
+`claude-worker send`, and posts the worker's replies back when the worker's
+Stop hook (claude-worker-done-relay) reports a finished turn. There is no
+LLM in the bridge: Claude Code, on the Claude subscription, is the only
+intelligence in the loop.
+
+Lifecycle: workers idle longer than idle_minutes are stopped; the next
+message revives them with `claude --continue`, restoring the conversation
+from Claude Code's own session history.
+
+Config:  ~/.config/claude-bridge/config.json
+         {category_id, allowed_users, idle_minutes, listen_port,
+          repos: {"<channel_id>": {"name": ..., "dir": ...}}}
+Secrets: ~/.config/claude-workers/discord-bot-token   (Discord bot token)
+         ~/.config/claude-workers/bridge-webhook      (BRIDGE_WEBHOOK_URL/
+                                                       BRIDGE_WEBHOOK_SECRET,
+                                                       shared with the hooks)
+
+Commands (allowed users, any visible channel):
+  !status / !stop [name] / !restart [name] / !screen [name]
+  !addrepo <name> <path>   create #<name> under the category + map it
+
+Only stdlib is imported at module level so the pure helpers stay testable
+without discord.py installed (tests/claude-bridge-smoke.sh).
+"""
+
+import argparse
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import subprocess
+import time
+
+CONFIG_PATH = os.path.expanduser(
+    os.environ.get("CLAUDE_BRIDGE_CONFIG", "~/.config/claude-bridge/config.json")
+)
+TOKEN_FILE = os.path.expanduser(
+    os.environ.get(
+        "CLAUDE_BRIDGE_TOKEN_FILE", "~/.config/claude-workers/discord-bot-token"
+    )
+)
+SECRET_FILE = os.path.expanduser(
+    os.environ.get(
+        "CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE", "~/.config/claude-workers/bridge-webhook"
+    )
+)
+
+DISCORD_LIMIT = 2000
+REPLY_CAP = 8000
+
+# --------------------------------------------------------------------------
+# Pure helpers (no I/O beyond explicit paths; covered by the smoke test)
+# --------------------------------------------------------------------------
+
+
+def default_config():
+    return {
+        "category_id": 0,
+        "allowed_users": [],
+        "idle_minutes": 45,
+        "listen_port": 8765,
+        "repos": {},
+    }
+
+
+def load_config(path=None):
+    path = path or CONFIG_PATH
+    cfg = default_config()
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def save_config(cfg, path=None):
+    path = path or CONFIG_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def parse_command(text):
+    """'!addrepo ghpr ~/x' -> ('addrepo', ['ghpr', '~/x']); None if not a command."""
+    text = (text or "").strip()
+    if not text.startswith("!"):
+        return None
+    parts = text[1:].split()
+    if not parts or not parts[0].isalpha():
+        return None
+    return parts[0].lower(), parts[1:]
+
+
+def split_message(text, limit=DISCORD_LIMIT):
+    """Split on line boundaries under Discord's message size limit."""
+    if len(text) > REPLY_CAP:
+        text = text[:REPLY_CAP] + "\n… (truncated — use !screen for the live view)"
+    chunks, current = [], ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:  # single pathological line
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current.strip():
+        chunks.append(current)
+    return [c.rstrip("\n") for c in chunks if c.strip()]
+
+
+def extract_last_reply(transcript_path):
+    """Last assistant text from a Claude Code session transcript (jsonl)."""
+    reply = ""
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("type") != "assistant":
+                    continue
+                blocks = (entry.get("message") or {}).get("content") or []
+                texts = [
+                    b.get("text", "")
+                    for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                if any(t.strip() for t in texts):
+                    reply = "\n".join(t for t in texts if t.strip())
+    except OSError:
+        return ""
+    return reply.strip()
+
+
+def verify_signature(body, header, secret):
+    if not header or not secret:
+        return False
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(header, expected)
+
+
+def read_kv_file(path):
+    kv = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, _, v = line.partition("=")
+                    kv[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return kv
+
+
+def channel_from_chat(chat):
+    """'discord:123' or 'discord:123:456' -> 123 (int) or None."""
+    parts = (chat or "").split(":")
+    if len(parts) >= 2 and parts[0] == "discord" and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
+# --------------------------------------------------------------------------
+# claude-worker subprocess wrappers (sync; called via asyncio.to_thread)
+# --------------------------------------------------------------------------
+
+
+def _run(args, timeout=180):
+    return subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout, check=False
+    )
+
+
+def worker_alive(name):
+    r = _run(["claude-worker", "status", name], timeout=15)
+    return "running: yes" in r.stdout
+
+
+def worker_busy(name):
+    r = _run(["claude-worker", "read", name, "30"], timeout=15)
+    return "esc to interrupt" in r.stdout
+
+
+def worker_screen(name, lines=40):
+    r = _run(["claude-worker", "read", name, str(lines)], timeout=15)
+    return r.stdout if r.returncode == 0 else r.stderr
+
+
+def worker_start(name, directory, channel_id, resume):
+    args = [
+        "claude-worker", "start", name,
+        "--dir", directory,
+        "--chat", f"discord:{channel_id}",
+    ]
+    if resume:
+        args += ["--", "--continue"]
+    return _run(args, timeout=180)
+
+
+def worker_send(name, text):
+    return _run(["claude-worker", "send", name, text], timeout=30)
+
+
+def worker_stop(name):
+    return _run(["claude-worker", "stop", name], timeout=30)
+
+
+def worker_has_state(name, state_root=None):
+    state_root = state_root or os.path.expanduser("~/.local/state/claude-workers")
+    return os.path.isfile(os.path.join(state_root, name, "meta"))
+
+
+# --------------------------------------------------------------------------
+# Runtime (discord.py + aiohttp imported here so tests don't need them)
+# --------------------------------------------------------------------------
+
+
+def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
+    import discord
+    from aiohttp import web
+
+    cfg = load_config(config_path)
+    secret = read_kv_file(SECRET_FILE).get("BRIDGE_WEBHOOK_SECRET", "")
+    with open(TOKEN_FILE) as f:
+        token = f.read().strip()
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    client = discord.Client(intents=intents)
+
+    queues = {}         # worker name -> [pending message texts]
+    last_activity = {}  # worker name -> epoch seconds
+
+    def repo_for_channel(channel_id):
+        return cfg["repos"].get(str(channel_id))
+
+    def channel_for_worker(name):
+        for cid, repo in cfg["repos"].items():
+            if repo["name"] == name:
+                return int(cid)
+        return None
+
+    async def post(channel_id, text):
+        channel = client.get_channel(channel_id)
+        if channel is None:
+            print(f"[bridge] unknown channel {channel_id}, dropping message")
+            return
+        for chunk in split_message(text):
+            await channel.send(chunk)
+
+    async def deliver(name, text, message=None):
+        last_activity[name] = time.time()
+        if await asyncio.to_thread(worker_busy, name):
+            queues.setdefault(name, []).append(text)
+            if message:
+                await message.add_reaction("⏳")
+            return
+        r = await asyncio.to_thread(worker_send, name, text)
+        if r.returncode != 0:
+            if message:
+                await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
+            return
+        if message:
+            await message.add_reaction("✅")
+
+    async def handle_repo_message(message, repo):
+        name, directory = repo["name"], repo["dir"]
+        if not await asyncio.to_thread(worker_alive, name):
+            resume = worker_has_state(name)
+            await message.add_reaction("🚀")
+            r = await asyncio.to_thread(
+                worker_start, name, directory, message.channel.id, resume
+            )
+            if r.returncode != 0:
+                await message.channel.send(
+                    f"⚠️ could not start worker `{name}`: {r.stderr.strip()}"
+                )
+                return
+        await deliver(name, message.content, message)
+
+    async def handle_command(message, cmd, args):
+        repo = repo_for_channel(message.channel.id)
+        name = args[0] if args else (repo["name"] if repo else None)
+        if cmd == "status":
+            r = await asyncio.to_thread(_run, ["claude-worker", "list"], 15)
+            await post(message.channel.id, f"```\n{r.stdout}\n```")
+        elif cmd in ("stop", "restart") and name:
+            await asyncio.to_thread(worker_stop, name)
+            queues.pop(name, None)
+            note = f"🛑 stopped `{name}`"
+            if cmd == "restart" and repo:
+                r = await asyncio.to_thread(
+                    worker_start, name, repo["dir"], message.channel.id, True
+                )
+                note = (
+                    f"🔄 restarted `{name}`"
+                    if r.returncode == 0
+                    else f"⚠️ restart failed: {r.stderr.strip()}"
+                )
+            await message.channel.send(note)
+        elif cmd == "screen" and name:
+            screen = await asyncio.to_thread(worker_screen, name, 40)
+            await post(message.channel.id, f"```\n{screen}\n```")
+        elif cmd == "addrepo" and len(args) == 2:
+            repo_name, path = args[0], os.path.expanduser(args[1])
+            if not os.path.isdir(path):
+                await message.channel.send(f"⚠️ no such directory: {path}")
+                return
+            category = client.get_channel(int(cfg["category_id"]))
+            channel = await message.guild.create_text_channel(
+                repo_name, category=category
+            )
+            cfg["repos"][str(channel.id)] = {"name": repo_name, "dir": path}
+            save_config(cfg, config_path)
+            await message.channel.send(
+                f"✅ created {channel.mention} → `{path}` (worker `{repo_name}`)"
+            )
+        else:
+            await message.channel.send(
+                "commands: !status · !stop [name] · !restart [name] · "
+                "!screen [name] · !addrepo <name> <path>"
+            )
+
+    @client.event
+    async def on_ready():
+        print(f"[bridge] connected to Discord as {client.user} "
+              f"({len(cfg['repos'])} repo channel(s) mapped)")
+
+    @client.event
+    async def on_message(message):
+        if message.author.bot or message.author.id not in cfg["allowed_users"]:
+            return
+        parsed = parse_command(message.content)
+        if parsed:
+            await handle_command(message, *parsed)
+            return
+        repo = repo_for_channel(message.channel.id)
+        if repo:
+            await handle_repo_message(message, repo)
+
+    # ---- localhost event listener (Stop hook + relays post here) ----------
+    async def handle_event(request):
+        body = await request.read()
+        if not verify_signature(
+            body, request.headers.get("X-Webhook-Signature", ""), secret
+        ):
+            return web.json_response({"error": "bad signature"}, status=401)
+        try:
+            event = json.loads(body)
+        except ValueError:
+            return web.json_response({"error": "bad json"}, status=400)
+
+        etype = event.get("event_type", "")
+        if etype == "claude.worker.turn_ended":
+            name = event.get("worker", "")
+            channel_id = channel_from_chat(event.get("chat", "")) or channel_for_worker(name)
+            if channel_id:
+                reply = extract_last_reply(event.get("transcript_path", ""))
+                if not reply:
+                    reply = "(no reply text captured — use !screen)"
+                last_activity[name] = time.time()
+                await post(channel_id, reply)
+                pending = queues.get(name) or []
+                if pending:
+                    await deliver(name, pending.pop(0))
+        elif etype == "claude.worker.send":
+            channel_id = channel_from_chat(event.get("chat", ""))
+            if channel_id and event.get("content"):
+                await post(channel_id, event["content"])
+        return web.json_response({"status": "ok"})
+
+    async def reaper():
+        while True:
+            await asyncio.sleep(60)
+            idle_s = cfg["idle_minutes"] * 60
+            for repo in list(cfg["repos"].values()):
+                name = repo["name"]
+                last = last_activity.get(name)
+                if last is None or time.time() - last < idle_s:
+                    continue
+                if await asyncio.to_thread(worker_alive, name) and not (
+                    await asyncio.to_thread(worker_busy, name)
+                ):
+                    await asyncio.to_thread(worker_stop, name)
+                    last_activity.pop(name, None)
+                    channel_id = channel_for_worker(name)
+                    if channel_id:
+                        await post(
+                            channel_id,
+                            f"💤 `{name}` idle for {cfg['idle_minutes']}m — stopped. "
+                            "Your next message resumes the conversation.",
+                        )
+
+    async def main():
+        app = web.Application()
+        app.router.add_post("/event", handle_event)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", int(cfg["listen_port"]))
+        await site.start()
+        print(f"[bridge] event listener on 127.0.0.1:{cfg['listen_port']}")
+        asyncio.create_task(reaper())
+        await client.start(token)
+
+    asyncio.run(main())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default=CONFIG_PATH)
+    args = parser.parse_args()
+    run_bridge(args.config)

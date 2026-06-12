@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Readiness check for the local agent control plane:
-#   Discord/OpenClaw/Hermes -> Codex (planner) -> claude-worker -> tmux ->
-#   claude-launch -> interactive Claude Code.
+#   Discord -> claude-bridge -> claude-worker -> tmux -> claude-launch ->
+#   interactive Claude Code (Claude subscription; no LLM in the bridge).
 #
-# Verifies the pieces that can be checked from this machine — both CLIs
-# installed, both on their *subscription* auth paths (never API-key/provider
-# billing), tmux present, worker tooling linked, state dir writable — and
-# prints explicit manual checks for everything that can't (Discord/OpenClaw/
-# Hermes wiring, live auth). Reads auth files for shape only; never prints
-# their values. Exits 1 if anything FAILs.
+# Verifies the pieces that can be checked from this machine — Claude Code on
+# its *subscription* auth path (never API-key/provider billing), tmux, the
+# bridge runtime and credentials, worker tooling linked, state dir writable —
+# and prints explicit manual checks for everything that can't (Discord
+# intents, live auth). Reads auth files for shape only; never prints their
+# values. Exits 1 if anything FAILs.
 set -uo pipefail
 
 pass_n=0 warn_n=0 fail_n=0
@@ -46,43 +46,33 @@ for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
   fi
 done
 
-# --- Codex ------------------------------------------------------------------------
-codex_auth="$HOME/.codex/auth.json"
-if command -v codex >/dev/null 2>&1; then
-  pass "codex installed ($(codex --version 2>/dev/null | head -1 || echo 'version unknown'))"
-  if [[ -f "$codex_auth" ]]; then
-    if grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$codex_auth"; then
-      pass "codex auth_mode is chatgpt (subscription OAuth, not API billing)"
-    elif grep -q '"auth_mode"' "$codex_auth"; then
-      warn "codex auth_mode is not chatgpt — run \`codex login\` and sign in with ChatGPT, not an API key"
-    else
-      warn "codex auth.json has no auth_mode field — verify with \`codex login status\`"
-    fi
-  else
-    warn "codex has no auth.json — run \`codex login\` and sign in with ChatGPT"
-  fi
+# --- claude-bridge (Discord <-> worker pipe) ---------------------------------------
+bridge_cfg="${CLAUDE_BRIDGE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-bridge/config.json}"
+token_file="${CLAUDE_BRIDGE_TOKEN_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/discord-bot-token}"
+if python3 -c 'import discord' 2>/dev/null; then
+  pass "discord.py importable (bridge runtime dependency)"
 else
-  fail "codex not found — install the Codex CLI and run \`codex login\`"
+  fail "discord.py not importable — run: pip3 install --user discord.py"
 fi
-if [[ -n "${OPENAI_API_KEY:-}" ]]; then
-  warn "OPENAI_API_KEY is set — Codex may prefer API billing over the ChatGPT subscription; unset it for this setup"
-fi
-
-# --- Hermes gateway (Discord bot planner) -----------------------------------------
-if command -v hermes >/dev/null 2>&1; then
-  pass "hermes installed ($(command -v hermes))"
-  if [[ -f "$HOME/.hermes/auth.json" ]]; then
-    pass "hermes auth store present (verify provider with: hermes auth status openai-codex)"
-  else
-    warn "hermes has no auth store — run \`hermes auth add openai-codex --type oauth\`"
-  fi
+if [[ -s "$token_file" ]]; then
+  pass "Discord bot token file present ($token_file)"
 else
-  warn "hermes not installed — the Discord bot planner is unavailable (claude-worker still works directly)"
+  fail "no Discord bot token ($token_file) — the bridge cannot log in"
+fi
+if [[ -r "$bridge_cfg" ]]; then
+  pass "bridge config present ($bridge_cfg)"
+else
+  warn "no bridge config ($bridge_cfg) — no repo channels are mapped yet (!addrepo, or see the claude-bridge skill)"
+fi
+if systemctl --user is-active claude-bridge >/dev/null 2>&1; then
+  pass "claude-bridge service active"
+else
+  warn "claude-bridge service not active — systemctl --user enable --now claude-bridge"
 fi
 
 # --- worker tooling ----------------------------------------------------------------
 for tool in claude-launch claude-worker claude-worker-todo-relay \
-            claude-worker-done-relay discord-notify agent-checkup; do
+            claude-worker-done-relay claude-bridge discord-notify agent-checkup; do
   if command -v "$tool" >/dev/null 2>&1; then
     pass "$tool on PATH ($(command -v "$tool"))"
   else
@@ -104,31 +94,26 @@ else
   warn "no Discord webhook file ($webhook_file) — the todo relay will stay silent until you create it (see docs/agent-control-plane.md)"
 fi
 
-hermes_webhook_file="${CLAUDE_WORKERS_HERMES_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/hermes-webhook}"
-if [[ -r "$hermes_webhook_file" ]]; then
-  pass "Hermes worker-events webhook file present ($hermes_webhook_file)"
+bridge_webhook_file="${CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/bridge-webhook}"
+if [[ -r "$bridge_webhook_file" ]]; then
+  pass "bridge event-listener credentials present ($bridge_webhook_file)"
 else
-  warn "no Hermes webhook file ($hermes_webhook_file) — push-on-done is off; workers need polling (see docs/agent-control-plane.md)"
+  warn "no bridge webhook file ($bridge_webhook_file) — worker replies cannot reach Discord (see docs/agent-control-plane.md)"
 fi
 
 # --- manual checks ------------------------------------------------------------------
 cat <<'MANUAL'
 
 == manual checks (cannot be verified automatically) ==
- - Codex subscription path: run `codex login status` — it should report you
-   are signed in with ChatGPT, with no API key configured.
  - Claude subscription path: inside a `claude` session run /status — the
    account line should show your Claude subscription, not an API key.
- - Discord: create a channel + webhook (channel settings -> Integrations ->
-   Webhooks) and store the URL in the webhook file above (chmod 600).
- - OpenClaw/Hermes: point its Codex/agent integration at this machine and
-   confirm it can execute `claude-worker list` in a shell.
- - Todo relay hook: confirm ~/.claude/settings.json registers
-   claude-worker-todo-relay as a PostToolUse hook for TodoWrite
-   (snippet in docs/agent-control-plane.md).
- - First smoke test: claude-worker start scratch --dir /tmp;
-   claude-worker send scratch "say hi"; claude-worker read scratch;
-   claude-worker stop scratch.
+ - Hooks: confirm ~/.claude/settings.json registers claude-worker-todo-relay
+   (PostToolUse: TodoWrite|TaskCreate|TaskUpdate) and claude-worker-done-relay
+   (Stop) — snippets in docs/agent-control-plane.md.
+ - Discord intents: the bot needs Message Content (and Manage Channels for
+   !addrepo) in the developer portal.
+ - First smoke test: map a repo with !addrepo, message its channel, and
+   confirm the worker's reply lands back in the same channel.
 MANUAL
 
 echo

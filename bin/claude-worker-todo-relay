@@ -13,9 +13,9 @@
 # Behaviour:
 #   - Only fires for orchestrated workers (claude-worker sets $CLAUDE_WORKER);
 #     manual `cl` sessions stay quiet. CLAUDE_WORKER_TODO_ALL=1 relays all.
-#   - Workers started with --chat post into their originating Discord thread
-#     via the Hermes bot (`hermes send`); others fall back to the webhook,
-#     which can only reach the main channel.
+#   - Workers started with --chat post into their repo channel through the
+#     claude-bridge (a signed localhost event); others fall back to the
+#     plain Discord webhook, which can only reach the main channel.
 #   - Webhook URL is read from a chmod-600 file, never from env, and never
 #     printed or logged: ~/.config/claude-workers/discord-webhook (override
 #     with $CLAUDE_WORKERS_DISCORD_WEBHOOK_FILE).
@@ -24,7 +24,30 @@
 set -uo pipefail
 
 WEBHOOK_FILE="${CLAUDE_WORKERS_DISCORD_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/discord-webhook}"
+BRIDGE_CFG="${CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/bridge-webhook}"
 STATE_ROOT="${CLAUDE_WORKERS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-workers}"
+
+# bridge_send <chat> <content> — signed claude.worker.send event to the
+# local claude-bridge, which posts into the mapped Discord channel.
+bridge_send() {
+  local url secret body sig
+  [[ -r "$BRIDGE_CFG" ]] || return 1
+  url="$(sed -n 's/^BRIDGE_WEBHOOK_URL=//p' "$BRIDGE_CFG" | head -1)"
+  secret="$(sed -n 's/^BRIDGE_WEBHOOK_SECRET=//p' "$BRIDGE_CFG" | head -1)"
+  [[ -n "$url" && -n "$secret" ]] || return 1
+  body="$(CHAT="$1" CONTENT="$2" python3 -c '
+import json, os
+print(json.dumps({"event_type": "claude.worker.send",
+                  "chat": os.environ["CHAT"],
+                  "content": os.environ["CONTENT"]}))' 2>/dev/null)" || return 1
+  [[ -n "$body" ]] || return 1
+  sig="$(printf '%s' "$body" | SECRET="$secret" python3 -c '
+import hashlib, hmac, os, sys
+print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
+               hashlib.sha256).hexdigest())' 2>/dev/null)" || return 1
+  curl -fsS -m 10 -H 'Content-Type: application/json' \
+    -H "X-Webhook-Signature: $sig" -d "$body" "$url" >/dev/null 2>&1
+}
 
 worker="${CLAUDE_WORKER:-}"
 if [[ -z "$worker" && "${CLAUDE_WORKER_TODO_ALL:-0}" != 1 ]]; then
@@ -102,9 +125,9 @@ hash="$(printf '%s' "$content" | cksum)"
 last_file="$state_dir/todo-relay.last"
 [[ -f "$last_file" && "$(cat "$last_file")" == "$hash" ]] && exit 0
 
-# Thread-affine workers post into their originating thread via the bot.
-if [[ -n "$chat" ]] && command -v hermes >/dev/null 2>&1; then
-  if printf '%s' "$content" | hermes send -q -t "$chat" -f - >/dev/null 2>&1; then
+# Chat-bound workers post into their repo channel via the bridge.
+if [[ -n "$chat" ]]; then
+  if bridge_send "$chat" "$content"; then
     printf '%s' "$hash" > "$last_file"
   fi
   exit 0

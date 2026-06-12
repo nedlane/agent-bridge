@@ -1,0 +1,17 @@
+# claude-bridge — Discord <-> Claude Code worker pipe (desktop only).
+# Linked to ~/.config/systemd/user/ by scripts/link.sh; linger keeps it
+# running after logout. Enable with:
+#   systemctl --user enable --now claude-bridge
+[Unit]
+Description=claude-bridge Discord to Claude Code worker pipe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/claude-bridge
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
