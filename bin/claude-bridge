@@ -24,6 +24,8 @@ Secrets: ~/.config/claude-workers/discord-bot-token   (Discord bot token)
 Commands (allowed users, any visible channel):
   !status / !stop [name] / !restart [name] / !screen [name]
   !addrepo <name> <path>   create #<name> under the category + map it
+The worker named "orchestrator" additionally gets the ORCHESTRATOR brief, so
+its channel doubles as a natural-language remote for all of the above.
 
 Only stdlib is imported at module level so the pure helpers stay testable
 without discord.py installed (tests/claude-bridge-smoke.sh).
@@ -80,6 +82,37 @@ channel/conversation and maps it; `bridge-ctl repos` lists mappings;
 `discord-notify -t discord:<channel_id> "..."` messages a specific channel.
 Your discord-notify and claude-bridge skills document the rest."""
 
+# The worker named "orchestrator" is Ned's natural-language remote for the
+# whole control plane: it gets this brief on top of PROTOCOL so "spin up a
+# worker on ghpr and have it triage the failing tests" becomes tool calls
+# instead of Ned typing bot commands. The ! commands keep working everywhere.
+ORCHESTRATOR = """Additionally, you are Ned's ORCHESTRATOR session. He will ask
+you in natural language to run this machine's Claude-worker control plane;
+translate his requests into these tools instead of telling him which bot
+commands to type:
+  bridge-ctl repos                        existing repo channels/workers
+  bridge-ctl addrepo <name> </abs/path>   new repo channel (returns channel_id)
+  bridge-ctl start <name>                 start that repo's worker (it gets
+                                          this same Discord protocol)
+  claude-worker list / status <name> / read <name> [lines]
+  claude-worker send <name> "msg"         instruct a running worker
+                                          (--type for /slash commands)
+  claude-worker stop <name> / restart <name>
+  discord-notify -t discord:<channel_id> "..."   post into any repo channel
+  agent-checkup                           control-plane health report
+  systemctl --user status claude-bridge / journalctl --user -u claude-bridge -n 50
+Hand real repo work to that repo's worker (bridge-ctl start, then
+claude-worker send) — do not do another repo's task yourself in this session.
+Orchestration requests are usually quick: do them, then confirm what you did
+via discord-notify."""
+
+
+def system_prompt(name):
+    """The injected protocol; the orchestrator also gets the control-plane brief."""
+    if name == "orchestrator":
+        return PROTOCOL + "\n\n" + ORCHESTRATOR
+    return PROTOCOL
+
 
 def start_args(name, directory, channel_id, resume):
     """argv for claude-worker start, with the Discord protocol injected."""
@@ -91,7 +124,7 @@ def start_args(name, directory, channel_id, resume):
     ]
     if resume:
         args.append("--continue")
-    args += ["--append-system-prompt", PROTOCOL]
+    args += ["--append-system-prompt", system_prompt(name)]
     return args
 
 # --------------------------------------------------------------------------
@@ -366,6 +399,23 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         busy = await asyncio.to_thread(worker_busy, name)
         r = await asyncio.to_thread(worker_send, name, text, typed)
         if r.returncode != 0:
+            # A send that lands exactly on a turn boundary can wedge in the
+            # TUI's queued-message state (displayed but never submitted, even
+            # with Enter retries). Recover deterministically: restart the
+            # worker with --continue and re-send once.
+            repo = next(
+                (x for x in cfg["repos"].values() if x["name"] == name), None
+            )
+            channel_id = channel_for_worker(name)
+            if repo and channel_id:
+                print(f"[bridge] {name}: send wedged, restarting worker to recover")
+                await asyncio.to_thread(worker_stop, name)
+                r2 = await asyncio.to_thread(
+                    worker_start, name, repo["dir"], channel_id, True
+                )
+                if r2.returncode == 0:
+                    r = await asyncio.to_thread(worker_send, name, text, typed)
+        if r.returncode != 0:
             if message:
                 await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
             return
@@ -398,7 +448,6 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             await post(message.channel.id, f"```\n{r.stdout}\n```")
         elif cmd in ("stop", "restart") and name:
             await asyncio.to_thread(worker_stop, name)
-            queues.pop(name, None)
             note = f"🛑 stopped `{name}`"
             if cmd == "restart" and repo:
                 r = await asyncio.to_thread(
@@ -534,6 +583,30 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return web.json_response(
                 {"status": "ok", "channel_id": str(channel.id), "channel": channel.name}
             )
+        elif etype == "claude.bridge.start":
+            # Tools-based worker start (bridge-ctl start) — same path as a
+            # channel message, so the worker gets the injected protocol and
+            # --continue resume, unlike a bare `claude-worker start`.
+            name = (event.get("name") or "").strip()
+            repo = next(
+                (r for r in cfg["repos"].values() if r["name"] == name), None
+            )
+            channel_id = channel_for_worker(name)
+            if not repo or not channel_id:
+                return web.json_response(
+                    {"error": f"no repo channel mapped for worker {name!r}"},
+                    status=400,
+                )
+            if await asyncio.to_thread(worker_alive, name):
+                last_activity[name] = time.time()
+                return web.json_response({"status": "ok", "note": "already running"})
+            r = await asyncio.to_thread(
+                worker_start, name, repo["dir"], channel_id, worker_has_state(name)
+            )
+            if r.returncode != 0:
+                return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)
+            last_activity[name] = time.time()
+            print(f"[bridge] start event: worker {name} running")
         elif etype == "claude.worker.send":
             worker = event.get("worker", "")
             if worker:

@@ -5,11 +5,14 @@
 #
 #   bridge-ctl addrepo <name> <path>   # create #<name> under the Claude
 #                                      # category and map it to <path>
+#   bridge-ctl start <name>            # start that repo's worker via the
+#                                      # bridge (protocol injected, resumes)
 #   bridge-ctl repos                   # list channel -> repo mappings
 #
 # addrepo prints the bridge's JSON response ({"status":"ok","channel_id":..})
 # so callers can address the new channel immediately (e.g. with
-# discord-notify -t discord:<channel_id>).
+# discord-notify -t discord:<channel_id>). start blocks until the worker is
+# ready to receive claude-worker send.
 set -uo pipefail
 
 BRIDGE_CFG="${CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/bridge-webhook}"
@@ -30,7 +33,8 @@ post_event() { # post_event <json-body>; prints response
 import hashlib, hmac, os, sys
 print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
                hashlib.sha256).hexdigest())')" || die "signing failed"
-  curl -fsS -m 30 -H 'Content-Type: application/json' \
+  # -m 240: `start` holds the connection while the worker boots (up to ~3 min)
+  curl -fsS -m 240 -H 'Content-Type: application/json' \
     -H "X-Webhook-Signature: $sig" -d "$1" "$url" \
     || die "bridge did not accept the request (is the service running?)"
   echo
@@ -50,6 +54,15 @@ print(json.dumps({"event_type": "claude.bridge.addrepo",
                   "path": os.environ["REPO"]}))')" || die "could not build request"
     post_event "$body"
     ;;
+  start)
+    name="${2:-}"
+    [[ -n "$name" ]] || die "usage: bridge-ctl start <name>"
+    body="$(NAME="$name" python3 -c '
+import json, os
+print(json.dumps({"event_type": "claude.bridge.start",
+                  "name": os.environ["NAME"]}))')" || die "could not build request"
+    post_event "$body"
+    ;;
   repos)
     [[ -r "$CONFIG" ]] || die "no bridge config ($CONFIG)"
     python3 -c '
@@ -63,9 +76,9 @@ for cid, repo in repos.items():
     print(f"{name:<20} discord:{cid}  {rdir}")' "$CONFIG"
     ;;
   ''|-h|--help|help)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    die "unknown command '$cmd' (addrepo, repos)"
+    die "unknown command '$cmd' (addrepo, start, repos)"
     ;;
 esac
