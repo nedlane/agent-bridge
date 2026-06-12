@@ -146,6 +146,43 @@ def extract_last_reply(transcript_path):
     return reply.strip()
 
 
+def extract_new_reply(transcript_path, offset=0):
+    """Last assistant text appended after byte `offset`.
+
+    Returns (reply, new_offset). Only complete lines are consumed, so a
+    mid-write trailing line is left for the next attempt. This is what makes
+    reply delivery immune to the Stop-hook/transcript-flush race: each turn
+    event only ever reads content written since the previous turn, so a
+    stale read returns "" (retry) instead of the previous turn's reply.
+    """
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(offset)
+            buf = f.read()
+    except OSError:
+        return "", offset
+    end = buf.rfind(b"\n")
+    if end < 0:
+        return "", offset
+    reply = ""
+    for line in buf[: end + 1].splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        blocks = (entry.get("message") or {}).get("content") or []
+        texts = [
+            b.get("text", "")
+            for b in blocks
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        if any(t.strip() for t in texts):
+            reply = "\n".join(t for t in texts if t.strip())
+    return reply.strip(), offset + end + 1
+
+
 def verify_signature(body, header, secret):
     if not header or not secret:
         return False
@@ -254,6 +291,20 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     queues = {}         # worker name -> [pending message texts]
     last_activity = {}  # worker name -> epoch seconds
+    offsets = {}        # transcript path -> bytes already consumed
+
+    async def settle_file(path, timeout=10):
+        """Wait until `path` stops changing (two identical mtimes 0.5s apart)."""
+        last = -1
+        for _ in range(int(timeout * 2)):
+            try:
+                now = os.stat(path).st_mtime_ns
+            except OSError:
+                now = -1
+            if now == last and now != -1:
+                return
+            last = now
+            await asyncio.sleep(0.5)
 
     def repo_for_channel(channel_id):
         return cfg["repos"].get(str(channel_id))
@@ -379,9 +430,33 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             name = event.get("worker", "")
             channel_id = channel_from_chat(event.get("chat", "")) or channel_for_worker(name)
             if channel_id:
-                reply = extract_last_reply(event.get("transcript_path", ""))
+                # The Stop hook can fire before Claude Code flushes the final
+                # assistant message, and a stale read returns the PREVIOUS
+                # turn's reply (the one-prompt-behind bug). Known transcripts
+                # are read incrementally from a byte offset so only this
+                # turn's text counts; unseen transcripts (fresh worker or
+                # bridge restart) are read whole after the file settles.
+                path = event.get("transcript_path", "")
+                reply = ""
+                if path in offsets:
+                    off = offsets[path]
+                    for _ in range(10):
+                        reply, off = extract_new_reply(path, off)
+                        if reply:
+                            break
+                        await asyncio.sleep(1)
+                    offsets[path] = off
+                elif path:
+                    await settle_file(path)
+                    reply = extract_last_reply(path)
+                    try:
+                        offsets[path] = os.path.getsize(path)
+                    except OSError:
+                        pass
+                print(f"[bridge] {name}: turn ended, posting "
+                      f"{len(reply) if reply else 0} chars to {channel_id}")
                 if not reply:
-                    reply = "(no reply text captured — use !screen)"
+                    reply = "(no new reply text captured — use !screen)"
                 last_activity[name] = time.time()
                 await post(channel_id, reply)
                 pending = queues.get(name) or []

@@ -217,17 +217,25 @@ cmd_send() {
   local pane
   pane="$(pane_for "$name")"
   # Stage the message as a bracketed paste so multi-line text stays one
-  # message instead of submitting at the first newline, then press Enter.
-  # Enter is sent twice with a delay: if the TUI was still registering the
-  # paste the first one is swallowed, and on an already-submitted (empty)
-  # input the second is a no-op. This is what makes send reliable right
-  # after startup.
+  # message instead of submitting at the first newline, then press Enter and
+  # VERIFY it submitted: while our text is still sitting in the input box,
+  # the screen's last "❯" line contains it; once submitted, that line is an
+  # empty prompt (the echoed history copy is never the last "❯" line). The
+  # TUI sometimes swallows keys right after a turn ends, so retry a few
+  # times before reporting failure.
   printf '%s' "$text" | tmux load-buffer -b claude-worker-send -
   tmux paste-buffer -p -d -b claude-worker-send -t "$pane"
-  sleep "$SEND_DELAY"
-  tmux send-keys -t "$pane" Enter
-  sleep "$SEND_DELAY"
-  tmux send-keys -t "$pane" Enter
+  local probe attempt last_prompt
+  probe="${text%%$'\n'*}"
+  probe="${probe:0:40}"
+  for attempt in 1 2 3 4; do
+    sleep "$SEND_DELAY"
+    tmux send-keys -t "$pane" Enter
+    sleep "$SEND_DELAY"
+    last_prompt="$(screen_of "$name" | grep '^❯' | tail -1)"
+    [[ "$last_prompt" == *"$probe"* ]] || return 0
+  done
+  die "message did not submit to worker '$name' after $attempt attempts (claude-worker read $name to inspect)"
 }
 
 cmd_read() {
