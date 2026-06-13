@@ -46,7 +46,10 @@ ss -tln | grep 8765                        # event listener up?
 agent-checkup                              # full readiness report
 ```
 
-In Discord: `!status`, `!stop [name]`, `!restart [name]`, `!screen [name]`.
+In Discord: `!status`, `!stop [name]`, `!restart [name]`, `!screen [name]`,
+`!model <model> [name]`, `!clear [name]` (fresh context via restart without
+`--continue`), `!compact [name]` — and any `/slash-command` message is typed
+straight into the worker.
 
 Common failures: worker replies not arriving → check the Stop hook chain
 (`~/.claude/settings.json` registers `claude-worker-done-relay`;
