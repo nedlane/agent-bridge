@@ -66,8 +66,11 @@ meta_get() { # meta_get <name> <key>
 
 screen_of() { tmux capture-pane -p -t "$(pane_for "$1")" -S -50 2>/dev/null || true; }
 
-# Claude Code shows "esc to interrupt" the whole time it is working.
-is_busy() { grep -q "esc to interrupt" <<<"$1"; }
+# Claude Code shows "esc to interrupt" the whole time a turn is working;
+# a --continue resume can auto-compact, which shows "Compacting" (often
+# without that hint). Treat both as busy so readiness checks never fire
+# while the worker is mid-turn or mid-compaction.
+is_busy() { grep -qE "esc to interrupt|Compacting" <<<"$1"; }
 # First boot in a new directory stops at the folder-trust dialog.
 is_trust_dialog() { grep -qE "trust this folder|Do you trust" <<<"$1"; }
 # Idle: the input prompt is on screen and nothing is running or blocking.
@@ -226,26 +229,33 @@ cmd_send() {
   pane="$(pane_for "$name")"
   # Stage the message as a bracketed paste so multi-line text stays one
   # message instead of submitting at the first newline (--type instead sends
-  # literal keystrokes so the TUI sees a typed /slash-command), then press
-  # Enter and VERIFY it submitted: while our text is still sitting in the
-  # input box, the screen's last "❯" line contains it; once submitted, that
-  # line is an empty prompt (the echoed history copy is never the last "❯"
-  # line). The TUI sometimes swallows keys right after a turn ends, so retry
-  # a few times before reporting failure.
+  # literal keystrokes so the TUI sees a typed /slash-command). Submission is
+  # then verified in two phases against the input box (the last "❯" line; the
+  # echoed history copy never starts with "❯"):
+  #   Phase 1 — confirm the text actually LANDED: its probe must appear in the
+  #             input box. A booting/compacting TUI silently drops input, so an
+  #             empty/absent prompt here means NOT submitted — never a success.
+  #   Phase 2 — submit and confirm it LEFT the box. The TUI sometimes swallows
+  #             keys right after a turn ends, so retry Enter a few times.
   if (( typed )); then
     tmux send-keys -t "$pane" -l "$text"
   else
     printf '%s' "$text" | tmux load-buffer -b claude-worker-send -
     tmux paste-buffer -p -d -b claude-worker-send -t "$pane"
   fi
-  local probe attempt last_prompt
+  local probe attempt last_prompt landed=0
   probe="${text%%$'\n'*}"
   probe="${probe:0:40}"
-  for attempt in 1 2 3 4; do
+  for attempt in 1 2 3 4 5 6; do
     sleep "$SEND_DELAY"
+    last_prompt="$(screen_of "$name" | grep '^❯' | tail -1 || true)"
+    [[ -n "$probe" && "$last_prompt" == *"$probe"* ]] && { landed=1; break; }
+  done
+  (( landed )) || die "message never reached the input box of worker '$name' (still booting/compacting? claude-worker read $name)"
+  for attempt in 1 2 3 4; do
     tmux send-keys -t "$pane" Enter
     sleep "$SEND_DELAY"
-    last_prompt="$(screen_of "$name" | grep '^❯' | tail -1)"
+    last_prompt="$(screen_of "$name" | grep '^❯' | tail -1 || true)"
     [[ "$last_prompt" == *"$probe"* ]] || return 0
   done
   die "message did not submit to worker '$name' after $attempt attempts (claude-worker read $name to inspect)"
