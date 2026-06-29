@@ -319,13 +319,17 @@ def screen_is_ready(screen):
 
     The readiness counterpart to worker_busy, used to gate cold-start
     delivery: false during boot, while a turn runs ("esc to interrupt"),
-    while a --continue resume auto-compacts ("Compacting"), or at the
-    folder-trust dialog — so the bridge never pastes the waking message into a
-    TUI that is still loading and would silently discard it.
+    while a --continue resume auto-compacts ("Compacting"), at the folder-trust
+    dialog, or at the resume-mode dialog (whose menu cursor is also a "❯") — so
+    the bridge never pastes the waking message into a TUI that is still loading
+    or showing a blocking dialog and would silently discard it.
     """
     if "❯" not in screen:
         return False
-    blockers = ("esc to interrupt", "Compacting", "Do you trust", "trust this folder")
+    blockers = (
+        "esc to interrupt", "Compacting", "Do you trust", "trust this folder",
+        "Resume from summary", "Resume full session",
+    )
     return not any(b in screen for b in blockers)
 
 

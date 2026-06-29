@@ -73,14 +73,21 @@ screen_of() { tmux capture-pane -p -t "$(pane_for "$1")" -S -50 2>/dev/null || t
 is_busy() { grep -qE "esc to interrupt|Compacting" <<<"$1"; }
 # First boot in a new directory stops at the folder-trust dialog.
 is_trust_dialog() { grep -qE "trust this folder|Do you trust" <<<"$1"; }
+# A large session resumed with --continue first asks how to resume (summary
+# vs full); its menu cursor is also a "❯", so it must not be mistaken for the
+# idle input prompt — it's a blocking dialog to dismiss.
+is_resume_dialog() { grep -qE "Resume from summary|Resume full session" <<<"$1"; }
 # Idle: the input prompt is on screen and nothing is running or blocking.
 is_ready() {
-  grep -q "❯" <<<"$1" && ! is_busy "$1" && ! is_trust_dialog "$1"
+  grep -q "❯" <<<"$1" \
+    && ! is_busy "$1" && ! is_trust_dialog "$1" && ! is_resume_dialog "$1"
 }
 
 # wait_until <name> <timeout> [text] — poll the worker's screen until it is
-# idle at its prompt (or [text] appears). Auto-accepts the folder-trust dialog
-# (the orchestrator chose the directory deliberately via --dir).
+# idle at its prompt (or [text] appears). Auto-dismisses the startup dialogs
+# that gate the prompt: the folder-trust dialog (the orchestrator chose the
+# directory deliberately via --dir) and the resume-mode dialog on a large
+# --continue (Enter takes the pre-highlighted "Resume from summary" default).
 #
 # The done-condition must hold on TWO consecutive polls: right after a send
 # there is a short window where the message is echoed (marker visible) but
@@ -94,7 +101,7 @@ wait_until() {
     alive "$name" || { echo "claude-worker: worker '$name' died while waiting" >&2; return 1; }
     screen="$(screen_of "$name")"
     done_now=0
-    if is_trust_dialog "$screen"; then
+    if is_trust_dialog "$screen" || is_resume_dialog "$screen"; then
       tmux send-keys -t "$(pane_for "$name")" Enter
     elif [[ -n "$for_text" ]]; then
       if ! is_busy "$screen" && grep -qF -- "$for_text" <<<"$screen"; then
