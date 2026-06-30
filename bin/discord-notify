@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Send a message to Ned on Discord from any shell or agent session — Claude
-# Code workers use this (via the discord-notify skill) to report progress,
-# blockers, and questions while he is away from the terminal.
+# Send a message (and optional image/file attachments) to Ned on Discord from
+# any shell or agent session — Claude Code workers use this (via the
+# discord-notify skill) to report progress, blockers, and questions while he
+# is away from the terminal.
 #
 #   discord-notify "tests are green"
 #   discord-notify -t discord:1234567890 "deploy done"  # explicit channel id
+#   discord-notify -i chart.png "coverage chart"        # attach an image/file
+#   discord-notify -i a.png -i b.png "before / after"   # several attachments
 #   some-command | discord-notify -                     # body from stdin
+#   discord-notify --help                               # usage, sends nothing
 #
 # Routing: a worker started with --chat (or an explicit -t discord:<id>)
 # goes through the local claude-bridge into that repo channel; everything
@@ -23,14 +27,49 @@ die() {
   exit 1
 }
 
+usage() {
+  cat <<'EOF'
+discord-notify — message Ned on Discord (with optional attachments)
+
+Usage:
+  discord-notify [options] [message]
+  some-command | discord-notify [options] -
+
+Options:
+  -t, --to TARGET    deliver to an explicit chat (e.g. discord:1234567890);
+                     defaults to the worker's repo channel, else the main one
+  -i, --image FILE   attach a file (repeatable); images render inline in
+                     Discord, any other file is posted as a download
+  -h, --help         show this help and exit WITHOUT sending anything
+
+Notes:
+  - The message is optional when at least one -i/--image is given.
+  - A literal "-" as the message reads the body from stdin.
+  - Keep it short — it lands as a phone notification, not a report.
+EOF
+}
+
 target=""
+attachments=()
 args=()
 while (($#)); do
   case "$1" in
-    -t|--to) target="${2:?-t needs a value}"; shift 2 ;;
-    --)      shift; args+=("$@"); break ;;
-    *)       args+=("$1"); shift ;;
+    -h|--help) usage; exit 0 ;;
+    -t|--to)    target="${2:?-t needs a value}"; shift 2 ;;
+    -i|--image) [[ -n "${2:-}" ]] || die "-i needs a file path"
+                attachments+=("$2"); shift 2 ;;
+    --)         shift; args+=("$@"); break ;;
+    *)          args+=("$1"); shift ;;
   esac
+done
+
+# Resolve and validate attachments up front so failures are clear and we never
+# half-post. Absolute paths so the bridge (which reads the file itself) and
+# curl agree regardless of cwd.
+abs_attachments=()
+for f in "${attachments[@]+"${attachments[@]}"}"; do
+  [[ -f "$f" ]] || die "attachment not found: $f"
+  abs_attachments+=("$(realpath -- "$f")")
 done
 
 # Default target: the worker's repo channel (recorded by `claude-worker
@@ -39,15 +78,32 @@ if [[ -z "$target" && -n "${CLAUDE_WORKER:-}" ]]; then
   target="$(sed -n 's/^chat=//p' "$STATE_ROOT/$CLAUDE_WORKER/meta" 2>/dev/null | head -1)"
 fi
 
-message="${args[0]:--}"
+# Pick the message body. An explicit positional wins (a literal "-" reads
+# stdin). With no positional we only fall back to stdin when there are no
+# attachments — otherwise an image-only send would block forever on `cat`.
+if [[ ${#args[@]} -gt 0 ]]; then
+  message="${args[0]}"
+elif [[ ${#abs_attachments[@]} -gt 0 ]]; then
+  message=""
+else
+  message="-"
+fi
 [[ "$message" == "-" ]] && message="$(cat)"
-[[ -n "$message" ]] || die "empty message"
+# A message is required unless we're sending at least one attachment.
+if [[ -z "$message" && ${#abs_attachments[@]} -eq 0 ]]; then
+  die "empty message"
+fi
 
-[[ -n "${CLAUDE_WORKER:-}" ]] && message="**worker:$CLAUDE_WORKER**
+if [[ -n "${CLAUDE_WORKER:-}" && -n "$message" ]]; then
+  message="**worker:$CLAUDE_WORKER**
 $message"
+elif [[ -n "${CLAUDE_WORKER:-}" ]]; then
+  message="**worker:$CLAUDE_WORKER**"
+fi
 
-# bridge_send <chat> <content> — signed claude.worker.send event to the
-# local claude-bridge, which posts into the mapped Discord channel.
+# bridge_send <chat> <content> — signed claude.worker.send event to the local
+# claude-bridge, which posts into the mapped Discord channel. Attachment file
+# paths ride along in the event; the bridge reads them off the local disk.
 bridge_send() {
   local url secret body sig
   [[ -r "$BRIDGE_CFG" ]] || return 1
@@ -55,17 +111,18 @@ bridge_send() {
   secret="$(sed -n 's/^BRIDGE_WEBHOOK_SECRET=//p' "$BRIDGE_CFG" | head -1)"
   [[ -n "$url" && -n "$secret" ]] || return 1
   body="$(CHAT="$1" CONTENT="$2" WORKER="${CLAUDE_WORKER:-}" python3 -c '
-import json, os
+import json, os, sys
 print(json.dumps({"event_type": "claude.worker.send",
                   "chat": os.environ["CHAT"],
                   "worker": os.environ["WORKER"],
-                  "content": os.environ["CONTENT"]}))' 2>/dev/null)" || return 1
+                  "content": os.environ["CONTENT"],
+                  "attachments": sys.argv[1:]}))' "${abs_attachments[@]+"${abs_attachments[@]}"}" 2>/dev/null)" || return 1
   [[ -n "$body" ]] || return 1
   sig="$(printf '%s' "$body" | SECRET="$secret" python3 -c '
 import hashlib, hmac, os, sys
 print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
                hashlib.sha256).hexdigest())' 2>/dev/null)" || return 1
-  curl -fsS -m 10 -H 'Content-Type: application/json' \
+  curl -fsS -m 30 -H 'Content-Type: application/json' \
     -H "X-Webhook-Signature: $sig" -d "$body" "$url" >/dev/null 2>&1
 }
 
@@ -73,10 +130,24 @@ if [[ "$target" == discord:* ]] && bridge_send "$target" "$message"; then
   exit 0
 fi
 
-# Fallback: plain webhook POST (main channel only).
+# Fallback: direct Discord webhook POST (main channel only). With attachments
+# this is a multipart upload (payload_json + files[n]); without, a plain JSON
+# body as before.
 [[ -r "$WEBHOOK_FILE" ]] || die "no transport: bridge unreachable and no webhook file ($WEBHOOK_FILE)"
 webhook="$(head -1 "$WEBHOOK_FILE")"
 [[ -n "$webhook" ]] || die "webhook file is empty"
-payload="$(MSG="$message" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"][:1990]}))')"
-curl -fsS -m 10 -H 'Content-Type: application/json' -d "$payload" "$webhook" >/dev/null \
-  || die "webhook POST failed"
+
+if [[ ${#abs_attachments[@]} -gt 0 ]]; then
+  payload="$(MSG="$message" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"][:1990]}))')"
+  curl_args=(-fsS -m 60 -F "payload_json=$payload")
+  i=0
+  for f in "${abs_attachments[@]}"; do
+    curl_args+=(-F "files[$i]=@$f")
+    i=$((i + 1))
+  done
+  curl "${curl_args[@]}" "$webhook" >/dev/null || die "webhook upload failed"
+else
+  payload="$(MSG="$message" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"][:1990]}))')"
+  curl -fsS -m 10 -H 'Content-Type: application/json' -d "$payload" "$webhook" >/dev/null \
+    || die "webhook POST failed"
+fi
