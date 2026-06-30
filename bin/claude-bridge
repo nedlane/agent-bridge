@@ -115,6 +115,14 @@ claude-worker send) — do not do another repo's task yourself in this session.
 Orchestration requests are usually quick: do them, then confirm what you did
 via discord-notify."""
 
+# Prefixed onto every chat message relayed from Discord into a worker. Over a
+# long session a worker drifts back to plain terminal replies (which Ned never
+# sees); stamping each inbound turn keeps "answer on Discord" in front of it.
+DISCORD_TAG = (
+    "[Discord message from Ned — reply with `discord-notify` so he sees it; "
+    "your terminal output is not visible to him.]"
+)
+
 
 def system_prompt(name):
     """The injected protocol; the orchestrator also gets the control-plane brief."""
@@ -292,6 +300,18 @@ def channel_from_chat(chat):
     return None
 
 
+def tag_inbound(text, typed=False):
+    """Stamp a relayed Discord message so the worker keeps replying on Discord.
+
+    Slash commands (typed) and empty bodies pass through untouched — a command
+    must reach the TUI verbatim, and there's nothing to remind about an empty
+    turn.
+    """
+    if typed or not (text or "").strip():
+        return text
+    return f"{DISCORD_TAG}\n\n{text}"
+
+
 # --------------------------------------------------------------------------
 # claude-worker subprocess wrappers (sync; called via asyncio.to_thread)
 # --------------------------------------------------------------------------
@@ -465,6 +485,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # course corrections need. ⏳ just signals "delivered while working".
         last_activity[name] = time.time()
         busy = await asyncio.to_thread(worker_busy, name)
+        text = tag_inbound(text, typed)
         r = await asyncio.to_thread(worker_send, name, text, typed)
         if r.returncode != 0:
             # A send that lands exactly on a turn boundary can wedge in the
