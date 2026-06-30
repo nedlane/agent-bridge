@@ -64,14 +64,18 @@ REPLY_CAP = 8000
 
 # Injected into every worker's system prompt: the worker itself is the
 # publisher. It messages Ned through discord-notify (which auto-targets the
-# worker's repo channel); the bridge's transcript extraction is only a
-# fallback for turns where the worker said nothing. This is what makes
-# multi-hour tasks safe: no screen scraping, no per-turn chatter.
+# worker's repo channel, and can attach images/files with -i); the bridge's
+# transcript extraction is only a fallback for turns where the worker said
+# nothing. This is what makes multi-hour tasks safe: no screen scraping, no
+# per-turn chatter.
 PROTOCOL = """You are running as a Discord-bridged Claude Code worker for Ned.
 Your terminal output is NOT reliably visible to him. The ONLY reliable way to
 message him is the discord-notify CLI, which posts to this conversation's
 Discord channel automatically:
   discord-notify "short message"        # or pipe a longer body: ... | discord-notify -
+  discord-notify -i screenshot.png "caption"   # attach an image/file (repeatable)
+Do NOT run `discord-notify --help` just to inspect it (it prints usage and
+sends nothing, but the syntax you need is right here).
 Message him ONLY when one of these happens:
   1. The task is complete - send a concise result summary.
   2. You are blocked on a question or decision only Ned can answer - ask it,
@@ -432,13 +436,28 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 return int(cid)
         return None
 
-    async def post(channel_id, text):
+    async def post(channel_id, text, attachments=None):
         channel = client.get_channel(channel_id)
         if channel is None:
             print(f"[bridge] unknown channel {channel_id}, dropping message")
             return
-        for chunk in split_message(text):
-            await channel.send(chunk)
+        files = []
+        for path in attachments or []:
+            if isinstance(path, str) and os.path.isfile(path):
+                files.append(discord.File(path))
+            else:
+                print(f"[bridge] attachment not found, skipping: {path!r}")
+        chunks = split_message(text) if text else []
+        # Send the files alongside the final text chunk so an image and its
+        # caption arrive together; if there's no text, post the files alone.
+        if not chunks and files:
+            await channel.send(files=files)
+            return
+        for i, chunk in enumerate(chunks):
+            if files and i == len(chunks) - 1:
+                await channel.send(chunk, files=files)
+            else:
+                await channel.send(chunk)
 
     async def deliver(name, text, message=None, typed=False):
         # Messages go straight in even mid-turn — Claude Code natively queues
@@ -705,8 +724,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if worker:
                 notified.add(worker)
             channel_id = channel_from_chat(event.get("chat", ""))
-            if channel_id and event.get("content"):
-                await post(channel_id, event["content"])
+            attachments = event.get("attachments") or []
+            if channel_id and (event.get("content") or attachments):
+                await post(channel_id, event.get("content") or "", attachments)
         return web.json_response({"status": "ok"})
 
     async def reaper():
