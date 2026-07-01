@@ -16,8 +16,17 @@ coordinated disclosure once a fix is available.
 
 ## Security model & limitations
 
-agent-bridge drives interactive Claude Code **workers** on the host. Understand
-these trust boundaries before exposing it to anyone you don't trust.
+agent-bridge drives interactive Claude Code **workers** on the host. There are
+two trust tiers, and they are deliberately different:
+
+- **Owner-approved workers** (`owner` / `collab` / `utility`) only ever run for
+  people you have explicitly authorized — you map the channel and grant the
+  access yourself. These are meant to be *capable*; the guardrails guard against
+  mistakes, not against a person you chose to trust.
+- **The public `#welcome` greeter** is the only surface any server member can
+  reach without your approval, so it is the one that is locked down hard.
+
+Understand these boundaries before exposing the bridge.
 
 ### Workers run as the host user
 
@@ -33,19 +42,22 @@ agent through Claude Code's own permission system (allow/deny lists, tool
 restrictions) — they are **policy enforcement inside the agent, not an
 OS-level sandbox**.
 
-In particular, the **`collab`** profile grants the **Bash** tool. Its
+The **`collab`** profile is intentionally powerful: it grants **Bash** and the
+normal dev tools so an approved collaborator can do real work in a repo. Its
 `Read`/`Edit` path deny-lists (e.g. `~/.ssh`, `~/.aws`, `~/.config/gh`,
-`~/.config/claude-workers`, `~/.claude`, the dotfiles tree) and its
-command-prefix denies (`sudo`, `su`, `curl`, `wget`) raise the bar but do
-**not** stop a determined guest: arbitrary Bash can read files and exfiltrate
-data through countless paths those prefix/path filters don't cover. The
-`collab` worker also runs in a dedicated checkout
-(`~/guest-workspaces/<channel>`) rather than the owner's primary tree, which is
-the real containment for accidents.
+`~/.config/claude-workers`, `~/.claude`, the dotfiles tree) and command-prefix
+denies (`sudo`, `su`, `curl`, `wget`) are **guardrails against mistakes, not a
+sandbox** — a determined user with Bash can read or exfiltrate around
+pattern-matched filters. That is by design.
 
-Treat `collab` guests as **trusted collaborators** — the model defends against
-accidents, not attackers. **Untrusted** guests require OS-level isolation
-(a separate Unix user or a container), which is **out of scope** for this tool.
+Because `collab` is only ever granted by an explicit owner action (you run
+`/addguest`, or approve a request card yourself), **granting it is equivalent
+to giving that person shell access as the host user** — grant it only to people
+you'd trust with that. Optionally point the channel at a dedicated checkout
+(`~/guest-workspaces/<channel>`) to keep a collaborator out of your primary
+tree. **Untrusted** users must never receive `collab`; isolate them at the OS
+level (separate Unix user or container), which is **out of scope** for this
+tool.
 
 ### The public `#welcome` greeter is a soft boundary
 

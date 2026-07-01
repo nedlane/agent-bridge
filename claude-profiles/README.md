@@ -9,8 +9,8 @@ Each Discord channel maps to a worker launched with one of these **profiles**
 |-----------|--------------|-----------------------|
 | `owner`   | You          | Everything. Full trust, primary tree. Default; adds no flags. |
 | `utility` | any guest    | **Only** the profile's MCP server(s). No built-in tools at all. |
-| `collab`  | collaborator | Normal dev tools, confined to a dedicated checkout, with deny guardrails. |
-| `greeter` | public       | Front-desk only: converse in `#welcome` and file access requests. |
+| `collab`  | trusted collaborator | Full dev tools + shell to work in a repo; deny-list guards mistakes, not the person. |
+| `greeter` | **public**   | Locked down: converse in `#welcome` and file access requests, nothing else. |
 
 > **These profiles require `claude-launch`.** The flags below
 > (`--enforce-perms`, `--tools`, `--mcp-config`, `--strict-mcp-config`,
@@ -61,29 +61,34 @@ MCP server named `gcal` and its OAuth credentials. Both `utility.mcp.json` and
 `utility.settings.json` are placeholders today, so until then a `utility` worker
 has no tools.
 
-## `collab` (a shared repo)
+## `collab` (a trusted collaborator on a repo)
 
-Runs in a **dedicated checkout** (convention: `~/guest-workspaces/<channel>`),
-not your primary tree — that separate checkout is the real containment.
-`collab.settings.json` allows the normal dev tools (`Read`, `Edit`, `Write`,
-`Glob`, `Grep`, `Bash`) with `defaultMode: acceptEdits` so the guest isn't
-blocked on prompts they can't answer, while denying `sudo`/`su`, network fetches
+`collab` is meant to be **powerful** — an approved collaborator gets the normal
+dev toolset and a shell so they can actually do the work.
+`collab.settings.json` allows `Read`, `Edit`, `Write`, `Glob`, `Grep`, and
+`Bash` with `defaultMode: acceptEdits` (so the guest isn't blocked on prompts
+they can't answer over Discord), while denying `sudo`/`su`, network fetches
 (`curl`, `wget`), and reads/edits of `~/.ssh`, `~/.aws`, `gh` config, the
 `claude-workers`/`claude-bridge` config dirs, `~/.claude`, and the dotfiles tree.
 
-Be honest about what this is:
+Be clear about what this is — by design:
 
-- It is a **policy jail, not a kernel jail** — a deliberate trade-off for
-  *trusted* collaborators (guarding against accidents, not attackers).
-- `collab` **grants `Bash`**, so the deny-list is a policy layer on top of a
-  general-purpose shell, **not a hard credential boundary.** A determined user
-  with Bash has many ways around a pattern-matched deny-list. Treat it as
-  guardrails, not a sandbox.
-- For **untrusted** guests, move to OS-level isolation — a separate Unix user or
-  a container. That's out of scope for these profiles.
-- If you point a `collab` channel at a directory that is *not* under
-  `~/guest-workspaces`, the bridge warns when you add an editing guest, because
-  that guest's dev tools then run against a real tree.
+- It is a **policy jail, not a kernel jail**: the deny-list guards against
+  *mistakes*, not against the person you granted access to. Because `collab`
+  grants `Bash`, a determined user has many ways around a pattern-matched
+  deny-list — so it is **guardrails, not a sandbox or a credential boundary.**
+- That's intended. `collab` is only handed out by an explicit owner action
+  (`/addguest`, or approving a request card), so **granting it is like giving
+  that person shell access as your user** — grant it accordingly, to people you
+  trust to work in the repo.
+- Optionally point the channel at a dedicated checkout
+  (`~/guest-workspaces/<channel>`) to keep a collaborator out of your primary
+  tree; the bridge warns when you add an editing guest to a channel whose `dir`
+  isn't under `~/guest-workspaces`, as a reminder that their tools run against a
+  real tree.
+- For **untrusted** people, don't use `collab` at all — isolate them at the OS
+  level (a separate Unix user or a container). That's out of scope for these
+  profiles.
 
 ## `greeter` (the public front desk)
 
