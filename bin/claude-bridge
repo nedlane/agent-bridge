@@ -361,10 +361,11 @@ def reply_preview(body, limit=200):
 # --------------------------------------------------------------------------
 
 
-def _run(args, timeout=180):
+def _run(args, timeout=180, input_text=None):
     try:
         return subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout, check=False
+            args, capture_output=True, text=True, timeout=timeout, check=False,
+            input=input_text,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         # Surface "claude-worker not on PATH" and hangs as a failed result so
@@ -404,6 +405,14 @@ def screen_is_ready(screen):
 def worker_screen(name, lines=40):
     r = _run(["claude-worker", "read", name, str(lines)], timeout=15)
     return r.stdout if r.returncode == 0 else r.stderr
+
+
+def render_screen_png(text, path):
+    """Render a captured screen to a PNG via term-shot. True on success — a
+    wide TUI capture is unreadable as a mobile code block, legible as an image.
+    """
+    r = _run(["term-shot", path], timeout=20, input_text=text)
+    return r.returncode == 0 and os.path.isfile(path)
 
 
 def worker_start(name, directory, channel_id, resume):
@@ -535,6 +544,19 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     except discord.HTTPException:
                         pass
 
+    async def peek_screen(channel_id, name):
+        """Post a worker's live screen as an image (falls back to a code
+        block if rendering is unavailable) — shared by 👀 and !screen."""
+        if not await asyncio.to_thread(worker_alive, name):
+            await post(channel_id, f"👀 `{name}` isn't running right now.")
+            return
+        screen = await asyncio.to_thread(worker_screen, name, 40)
+        png = os.path.join(STATE_ROOT, name, "peek.png")
+        if await asyncio.to_thread(render_screen_png, screen, png):
+            await post(channel_id, f"👀 `{name}` — live screen", [png])
+        else:
+            await post(channel_id, f"👀 `{name}` live screen:\n```\n{screen}\n```")
+
     async def deliver(name, text, message=None, typed=False):
         # Messages go straight in even mid-turn — Claude Code natively queues
         # typed-while-running input as steering, which is what check-ins and
@@ -659,8 +681,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 )
             await message.channel.send(note)
         elif cmd == "screen" and name:
-            screen = await asyncio.to_thread(worker_screen, name, 40)
-            await post(message.channel.id, f"```\n{screen}\n```")
+            await peek_screen(message.channel.id, name)
         elif cmd == "checkin" and name:
             await deliver(
                 name,
@@ -770,12 +791,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         repo = repo_for_channel(payload.channel_id)
         if not repo:
             return
-        name = repo["name"]
-        if not await asyncio.to_thread(worker_alive, name):
-            await post(payload.channel_id, f"👀 `{name}` isn't running right now.")
-            return
-        screen = await asyncio.to_thread(worker_screen, name, 40)
-        await post(payload.channel_id, f"👀 `{name}` live screen:\n```\n{screen}\n```")
+        await peek_screen(payload.channel_id, repo["name"])
 
     # ---- localhost event listener (Stop hook + relays post here) ----------
     async def handle_event(request):
