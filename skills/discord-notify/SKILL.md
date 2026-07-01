@@ -25,6 +25,12 @@ else lands in the main channel. Channel ids for `-t` are in
 Flags: `-t/--to <target>`, `-i/--image <file>` (repeatable; images render
 inline in Discord, any other file posts as a download), `-h/--help`.
 
+Long messages are split into ≤2000-char posts automatically. Attachments are
+size-checked before upload (default cap 25 MiB, override with
+`DISCORD_NOTIFY_MAX_BYTES`). A chat-bound send whose bridge is unreachable
+falls back to the main channel but prepends a ⚠️ banner naming the intended
+channel, so a misrouted reply is never silent.
+
 **Don't run `discord-notify --help` to "see what it does"** — `--help` prints
 usage and exits without sending, but everything you need is on this page, so
 just use it directly. (Earlier agents spammed the channel by passing `--help`

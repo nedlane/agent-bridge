@@ -65,10 +65,15 @@ done
 
 # Resolve and validate attachments up front so failures are clear and we never
 # half-post. Absolute paths so the bridge (which reads the file itself) and
-# curl agree regardless of cwd.
+# curl agree regardless of cwd. Guard the size so an oversized file fails with
+# a clear message here instead of a cryptic rejection from Discord.
+MAX_ATTACH_BYTES="${DISCORD_NOTIFY_MAX_BYTES:-26214400}"  # 25 MiB, Discord's non-Nitro cap
 abs_attachments=()
 for f in "${attachments[@]+"${attachments[@]}"}"; do
   [[ -f "$f" ]] || die "attachment not found: $f"
+  sz="$(stat -c %s -- "$f" 2>/dev/null || echo 0)"
+  (( sz <= MAX_ATTACH_BYTES )) \
+    || die "attachment too large: $f ($sz bytes > $MAX_ATTACH_BYTES; set DISCORD_NOTIFY_MAX_BYTES to override)"
   abs_attachments+=("$(realpath -- "$f")")
 done
 
@@ -126,20 +131,60 @@ print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
     -H "X-Webhook-Signature: $sig" -d "$body" "$url" >/dev/null 2>&1
 }
 
-if [[ "$target" == discord:* ]] && bridge_send "$target" "$message"; then
-  exit 0
+if [[ "$target" == discord:* ]]; then
+  bridge_send "$target" "$message" && exit 0
+  # The bridge is unreachable. Falling back to the main webhook would post this
+  # into the wrong channel — so at least make the misdelivery loud instead of
+  # silent by flagging where it was headed.
+  message="⚠️ [bridge unreachable — this was meant for $target]
+$message"
 fi
 
-# Fallback: direct Discord webhook POST (main channel only). With attachments
-# this is a multipart upload (payload_json + files[n]); without, a plain JSON
-# body as before.
+# Fallback: direct Discord webhook POST (main channel only). Long bodies are
+# split into <=2000-char messages (the courtesy the bridge path already gets);
+# with attachments the final chunk rides along as a multipart upload.
 [[ -r "$WEBHOOK_FILE" ]] || die "no transport: bridge unreachable and no webhook file ($WEBHOOK_FILE)"
 webhook="$(head -1 "$WEBHOOK_FILE")"
 [[ -n "$webhook" ]] || die "webhook file is empty"
 
+# split_chunks <text>: NUL-separated <=2000-char pieces, preferring line breaks.
+split_chunks() {
+  MSG="$1" python3 -c '
+import os, sys
+msg = os.environ["MSG"]; LIMIT = 2000
+chunks, cur = [], ""
+for line in msg.split("\n"):
+    while len(line) > LIMIT:
+        if cur:
+            chunks.append(cur); cur = ""
+        chunks.append(line[:LIMIT]); line = line[LIMIT:]
+    cand = cur + "\n" + line if cur else line
+    if len(cand) > LIMIT:
+        if cur:
+            chunks.append(cur)
+        cur = line
+    else:
+        cur = cand
+if cur:
+    chunks.append(cur)
+sys.stdout.write("\0".join(chunks))
+'
+}
+json_content() { MSG="$1" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"]}))'; }
+post_text() {
+  curl -fsS -m 10 -H 'Content-Type: application/json' \
+    -d "$(json_content "$1")" "$webhook" >/dev/null || die "webhook POST failed"
+}
+
+mapfile -d '' -t chunks < <(split_chunks "$message")
+(( ${#chunks[@]} )) || chunks=("")  # empty body (attachment-only) -> one empty caption
+
 if [[ ${#abs_attachments[@]} -gt 0 ]]; then
-  payload="$(MSG="$message" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"][:1990]}))')"
-  curl_args=(-fsS -m 60 -F "payload_json=$payload")
+  last=$(( ${#chunks[@]} - 1 ))
+  for idx in "${!chunks[@]}"; do
+    (( idx < last )) && post_text "${chunks[idx]}"
+  done
+  curl_args=(-fsS -m 60 -F "payload_json=$(json_content "${chunks[last]}")")
   i=0
   for f in "${abs_attachments[@]}"; do
     curl_args+=(-F "files[$i]=@$f")
@@ -147,7 +192,7 @@ if [[ ${#abs_attachments[@]} -gt 0 ]]; then
   done
   curl "${curl_args[@]}" "$webhook" >/dev/null || die "webhook upload failed"
 else
-  payload="$(MSG="$message" python3 -c 'import json,os; print(json.dumps({"content": os.environ["MSG"][:1990]}))')"
-  curl -fsS -m 10 -H 'Content-Type: application/json' -d "$payload" "$webhook" >/dev/null \
-    || die "webhook POST failed"
+  for chunk in "${chunks[@]}"; do
+    post_text "$chunk"
+  done
 fi
