@@ -8,6 +8,12 @@
 #   bridge-ctl start <name>            # start that repo's worker via the
 #                                      # bridge (protocol injected, resumes)
 #   bridge-ctl repos                   # list channel -> repo mappings
+#   bridge-ctl addguest <name> <discord_id> [utility|collab]
+#                                      # grant a guest scoped access to #<name>
+#                                      # with a capability profile (default
+#                                      # utility). Creates/assigns the role,
+#                                      # sets the channel overwrite, records it.
+#   bridge-ctl guests                  # list guest access (channel/profile)
 #
 # addrepo prints the bridge's JSON response ({"status":"ok","channel_id":..})
 # so callers can address the new channel immediately (e.g. with
@@ -63,6 +69,36 @@ print(json.dumps({"event_type": "claude.bridge.start",
                   "name": os.environ["NAME"]}))')" || die "could not build request"
     post_event "$body"
     ;;
+  addguest)
+    name="${2:-}"
+    discord_id="${3:-}"
+    profile="${4:-utility}"
+    [[ -n "$name" && -n "$discord_id" ]] \
+      || die "usage: bridge-ctl addguest <name> <discord_id> [utility|collab]"
+    [[ "$discord_id" =~ ^[0-9]+$ ]] || die "discord_id must be numeric"
+    [[ "$profile" == utility || "$profile" == collab ]] \
+      || die "profile must be 'utility' or 'collab'"
+    body="$(NAME="$name" DID="$discord_id" PROF="$profile" python3 -c '
+import json, os
+print(json.dumps({"event_type": "claude.bridge.addguest",
+                  "name": os.environ["NAME"],
+                  "discord_id": os.environ["DID"],
+                  "profile": os.environ["PROF"]}))')" || die "could not build request"
+    post_event "$body"
+    ;;
+  guests)
+    [[ -r "$CONFIG" ]] || die "no bridge config ($CONFIG)"
+    python3 -c '
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+rows = [(r["name"], r.get("profile", "owner"), r.get("guests", []))
+        for r in cfg.get("repos", {}).values() if r.get("guests")]
+if not rows:
+    print("(no guest access granted)")
+for name, profile, guests in rows:
+    ids = ", ".join(str(g) for g in guests)
+    print(f"{name:<20} {profile:<8} {ids}")' "$CONFIG"
+    ;;
   repos)
     [[ -r "$CONFIG" ]] || die "no bridge config ($CONFIG)"
     python3 -c '
@@ -76,9 +112,9 @@ for cid, repo in repos.items():
     print(f"{name:<20} discord:{cid}  {rdir}")' "$CONFIG"
     ;;
   ''|-h|--help|help)
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    die "unknown command '$cmd' (addrepo, start, repos)"
+    die "unknown command '$cmd' (addrepo, start, repos, addguest, guests)"
     ;;
 esac

@@ -145,8 +145,9 @@ def system_prompt(name):
     return PROTOCOL
 
 
-def start_args(name, directory, channel_id, resume):
-    """argv for claude-worker start, with the Discord protocol injected."""
+def start_args(name, directory, channel_id, resume, profile="owner"):
+    """argv for claude-worker start, with the Discord protocol injected and the
+    channel's capability profile applied (owner = full trust, unchanged)."""
     args = [
         "claude-worker", "start", name,
         "--dir", directory,
@@ -155,8 +156,58 @@ def start_args(name, directory, channel_id, resume):
     ]
     if resume:
         args.append("--continue")
+    args += profile_args(profile)
     args += ["--append-system-prompt", system_prompt(name)]
     return args
+
+
+# Where versioned capability profiles live (settings + restricted MCP sets).
+PROFILE_DIR = os.path.expanduser(
+    os.environ.get(
+        "CLAUDE_PROFILES_DIR",
+        os.path.join(os.environ.get("DOTFILES_DIR", "~/dotfiles"),
+                     "hosts/wsl-desktop/claude-profiles"),
+    )
+)
+
+
+def profile_args(profile, profile_dir=None):
+    """Extra `claude` flags implementing a channel's capability profile.
+
+    owner   -> none (full trust, today's behavior).
+    utility -> no built-in tools at all, and only the profile's MCP server(s);
+               its tools are pre-approved so a guest never hits a permission
+               prompt they can't answer over Discord. A calendar-only assistant
+               with nowhere to wander.
+    collab  -> normal dev tools, but a settings file adds deny-guardrails
+               (no sudo, no ~/.ssh, no bridge/creds dirs). Confinement is the
+               dedicated checkout the worker runs in (repo dir), not a jail.
+    """
+    profile_dir = profile_dir or PROFILE_DIR
+    if not profile or profile == "owner":
+        return []
+    settings = os.path.join(profile_dir, f"{profile}.settings.json")
+    if profile == "utility":
+        return [
+            "--tools", "",
+            "--mcp-config", os.path.join(profile_dir, "utility.mcp.json"),
+            "--strict-mcp-config",
+            "--allowedTools", "mcp__gcal",
+            "--settings", settings,
+        ]
+    if profile == "collab":
+        return ["--settings", settings]
+    return []
+
+
+def channel_allows(cfg, channel_id, user_id):
+    """Authorization for a plain channel message. The owner (global
+    allowed_users) may talk in any channel; a channel's `guests` may talk only
+    in that one channel. Slash commands stay owner-only (checked separately)."""
+    if user_id in cfg.get("allowed_users", []):
+        return True
+    repo = cfg.get("repos", {}).get(str(channel_id))
+    return bool(repo) and user_id in (repo.get("guests") or [])
 
 # --------------------------------------------------------------------------
 # Pure helpers (no I/O beyond explicit paths; covered by the smoke test)
@@ -423,8 +474,10 @@ def render_screen_png(text, path):
     return r.returncode == 0 and os.path.isfile(path)
 
 
-def worker_start(name, directory, channel_id, resume):
-    return _run(start_args(name, directory, channel_id, resume), timeout=180)
+def worker_start(name, directory, channel_id, resume, profile="owner"):
+    return _run(
+        start_args(name, directory, channel_id, resume, profile), timeout=180
+    )
 
 
 def worker_send(name, text, typed=False):
@@ -709,7 +762,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             resume = should_resume(worker_has_state(name), fresh_pending(name))
             await message.add_reaction("🚀" if resume else "🧼")
             r = await asyncio.to_thread(
-                worker_start, name, directory, message.channel.id, resume
+                worker_start, name, directory, message.channel.id, resume,
+                repo.get("profile", "owner"),
             )
             if r.returncode != 0:
                 await message.channel.send(
@@ -771,7 +825,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return f"⚠️ no repo channel mapped for `{name}`", None
         await asyncio.to_thread(worker_stop, name)
         r = await asyncio.to_thread(
-            worker_start, name, repo["dir"], channel_for_worker(name), True
+            worker_start, name, repo["dir"], channel_for_worker(name), True,
+            repo.get("profile", "owner"),
         )
         # Explicit resume: cancel any armed fresh so it can't re-fire.
         await asyncio.to_thread(disarm_fresh, name)
@@ -790,7 +845,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         channel_id = channel_for_worker(name)
         await asyncio.to_thread(worker_stop, name)
         r = await asyncio.to_thread(
-            worker_start, name, repo["dir"], channel_id, False
+            worker_start, name, repo["dir"], channel_id, False,
+            repo.get("profile", "owner"),
         )
         await asyncio.to_thread(disarm_fresh, name)
         if r.returncode != 0:
@@ -798,6 +854,63 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # Wiped the worker's context — wipe the channel's clutter to match.
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
+
+    async def do_addguest(guild, name, discord_id, profile):
+        """Wire all three layers for one guest on one channel: a `g-<name>`
+        Discord role granting View+Send on just that channel, the role assigned
+        to the guest, and the channel's `guests`/`profile` recorded in config.
+        Idempotent — safe to re-run (e.g. to assign the role once the user has
+        finally joined the server)."""
+        if profile not in ("utility", "collab", "owner"):
+            return False, f"⚠️ unknown profile `{profile}` (use utility or collab)"
+        item = next(
+            ((cid, r) for cid, r in cfg["repos"].items() if r["name"] == name), None
+        )
+        if not item:
+            return False, f"⚠️ no channel mapped for `{name}` — run addrepo first"
+        channel_id, repo = item
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            return False, f"⚠️ channel {channel_id} for `{name}` not found"
+
+        role_name = f"g-{name}"
+        role = discord.utils.get(guild.roles, name=role_name) or await guild.create_role(
+            name=role_name, permissions=discord.Permissions.none(),
+            mentionable=False, reason="guest channel access",
+        )
+        await channel.set_permissions(
+            role, view_channel=True, send_messages=True, read_message_history=True,
+            reason="guest channel access",
+        )
+
+        warn = ""
+        member = guild.get_member(discord_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(discord_id)
+            except discord.HTTPException:
+                member = None
+        if member is not None:
+            await member.add_roles(role, reason="guest channel access")
+        else:
+            warn = ("\n⚠️ that user isn't in the server yet — invite them, then "
+                    "re-run addguest to assign the role. Access is otherwise wired.")
+
+        guests = repo.setdefault("guests", [])
+        if discord_id not in guests:
+            guests.append(discord_id)
+        repo["profile"] = profile
+        save_config(cfg, config_path)
+
+        note = ""
+        if profile == "collab":
+            d = repo.get("dir", "")
+            if not d.startswith(os.path.expanduser("~/guest-workspaces")):
+                note = (f"\n⚠️ `{name}` is mapped to `{d}`, not under "
+                        "~/guest-workspaces — a collab guest runs dev tools there. "
+                        "Point it at a dedicated checkout if that's a real tree.")
+        print(f"[bridge] addguest: {discord_id} -> #{name} (profile {profile})")
+        return True, f"✅ `{discord_id}` can now use #{name} (profile `{profile}`){warn}{note}"
 
     # --- native Discord slash commands --------------------------------------
     # Registered as application commands (synced per-guild in on_ready), so
@@ -929,6 +1042,24 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             f"✅ created {channel.mention} → `{directory}` (worker `{name}`)"
         )
 
+    @tree.command(name="addguest", description="Grant a guest scoped access to one channel")
+    @describe(name="Channel/worker name", discord_id="Guest's Discord user id",
+              profile="utility (locked) or collab (repo)")
+    async def slash_addguest(interaction, name: str, discord_id: str, profile: str = "utility"):
+        if interaction.user.id not in cfg["allowed_users"]:
+            await interaction.response.send_message("⛔ not authorized", ephemeral=True)
+            return
+        try:
+            uid = int(discord_id)
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ discord_id must be a numeric user id", ephemeral=True
+            )
+            return
+        await interaction.response.defer(thinking=True)
+        ok, msg = await do_addguest(interaction.guild, name, uid, profile)
+        await interaction.followup.send(msg)
+
     @client.event
     async def on_ready():
         # Copy the globally-defined commands into each guild and sync there:
@@ -947,11 +1078,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @client.event
     async def on_message(message):
         # Control verbs are native slash commands (interactions, handled by the
-        # command tree) — plain messages are always worker input.
-        if message.author.bot or message.author.id not in cfg["allowed_users"]:
+        # command tree) — plain messages are always worker input. Authorization
+        # is per-channel: the owner talks everywhere, a guest only in the
+        # channel(s) they were added to.
+        if message.author.bot:
             return
         repo = repo_for_channel(message.channel.id)
-        if repo:
+        if repo and channel_allows(cfg, message.channel.id, message.author.id):
             await handle_repo_message(message, repo)
 
     @client.event
@@ -960,14 +1093,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # instead of acting on stale text. Ignore no-op edits (Discord fires
         # this when it attaches a link embed) and edits to a stopped worker —
         # the next fresh message resumes that conversation anyway.
-        if after.author.bot or after.author.id not in cfg["allowed_users"]:
+        if after.author.bot:
             return
         if before.content == after.content or not after.content.strip():
             return
         if after.content.startswith("/"):
             return
         repo = repo_for_channel(after.channel.id)
-        if not repo:
+        if not repo or not channel_allows(cfg, after.channel.id, after.author.id):
             return
         name = repo["name"]
         if not await asyncio.to_thread(worker_alive, name):
@@ -1065,6 +1198,23 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return web.json_response(
                 {"status": "ok", "channel_id": str(channel.id), "channel": channel.name}
             )
+        elif etype == "claude.bridge.addguest":
+            name = (event.get("name") or "").strip()
+            profile = (event.get("profile") or "utility").strip()
+            try:
+                discord_id = int(event.get("discord_id"))
+            except (TypeError, ValueError):
+                return web.json_response(
+                    {"error": "discord_id must be a numeric user id"}, status=400
+                )
+            category = client.get_channel(int(cfg["category_id"]))
+            if category is None:
+                return web.json_response({"error": "Claude category not found"}, status=400)
+            ok, msg = await do_addguest(category.guild, name, discord_id, profile)
+            return web.json_response(
+                {"status": "ok" if ok else "error", "message": msg},
+                status=200 if ok else 400,
+            )
         elif etype == "claude.bridge.start":
             # Tools-based worker start (bridge-ctl start) — same path as a
             # channel message, so the worker gets the injected protocol and
@@ -1084,7 +1234,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 return web.json_response({"status": "ok", "note": "already running"})
             resume = should_resume(worker_has_state(name), fresh_pending(name))
             r = await asyncio.to_thread(
-                worker_start, name, repo["dir"], channel_id, resume
+                worker_start, name, repo["dir"], channel_id, resume,
+                repo.get("profile", "owner"),
             )
             if r.returncode != 0:
                 return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)

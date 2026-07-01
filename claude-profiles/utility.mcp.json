@@ -1,0 +1,4 @@
+{
+  "_comment": "PLACEHOLDER — the utility (calendar) profile loads ONLY the MCP servers listed here (claude --strict-mcp-config). Filled in when the Google Calendar MCP is wired up (needs Ned's Google OAuth). Until then a utility worker has no tools at all. The profile pre-approves tools named mcp__gcal (see profile_args in claude-bridge), so name the calendar server 'gcal'.",
+  "mcpServers": {}
+}
