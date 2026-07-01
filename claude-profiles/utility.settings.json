@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": ["mcp__gcal"],
+    "deny": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch",
+      "Task"
+    ],
+    "defaultMode": "default"
+  }
+}
