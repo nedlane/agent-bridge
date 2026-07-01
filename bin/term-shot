@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Render monospaced terminal text (stdin) to a PNG (argv[1]).
+
+claude-bridge's 👀 peek uses this so a worker's live TUI screen lands as a
+crisp image that scales to fit a phone, instead of a ~180-column code block
+that horizontally scrolls into unreadability on mobile. Reads the captured
+screen on stdin, writes a dark-terminal PNG to the path in argv[1]. Exits
+non-zero (and prints why) if Pillow is unavailable, so the caller can fall
+back to text.
+
+  claude-worker read foo 40 | term-shot /tmp/foo.png
+"""
+import sys
+
+FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+]
+FG = (201, 209, 217)   # GitHub-dark foreground
+BG = (13, 17, 23)      # GitHub-dark background
+FONT_SIZE = 18
+PAD = 16
+
+
+def load_font():
+    from PIL import ImageFont
+    for path in FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, FONT_SIZE)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: term-shot <output.png>  (text on stdin)")
+    out = sys.argv[1]
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as e:
+        sys.exit(f"term-shot: Pillow not available: {e}")
+
+    text = sys.stdin.read().replace("\t", "    ")
+    lines = [ln.rstrip() for ln in text.split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    if not lines:
+        lines = ["(blank screen)"]
+
+    font = load_font()
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    bbox = probe.textbbox((0, 0), "M" * 10, font=font)
+    cell_w = (bbox[2] - bbox[0]) / 10.0
+    ascent, descent = font.getmetrics()
+    line_h = ascent + descent + 3
+
+    cols = max(len(ln) for ln in lines)
+    width = int(PAD * 2 + cell_w * cols) + 2
+    height = int(PAD * 2 + line_h * len(lines))
+    img = Image.new("RGB", (width, height), BG)
+    draw = ImageDraw.Draw(img)
+    y = PAD
+    for ln in lines:
+        draw.text((PAD, y), ln, font=font, fill=FG)
+        y += line_h
+    img.save(out)
+
+
+if __name__ == "__main__":
+    main()
