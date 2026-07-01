@@ -10,6 +10,8 @@ Wants=network-online.target
 [Service]
 ExecStart=%h/.local/bin/claude-bridge
 Environment=PYTHONUNBUFFERED=1
+# Don't scatter .pyc files beside the tools in the checkout.
+Environment=PYTHONDONTWRITEBYTECODE=1
 # The user manager's default PATH lacks ~/.local/bin, where claude-worker
 # and claude itself live — without this the bridge can't spawn workers.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin

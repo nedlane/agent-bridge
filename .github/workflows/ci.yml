@@ -40,3 +40,16 @@ jobs:
           for f in claude-profiles/*.json; do
             jq empty "$f"
           done
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Ruff (Python error lint)
+        run: |
+          pip install ruff
+          # Pass bin/claude-bridge explicitly: ruff lints files given by path
+          # regardless of extension, so the extensionless script is covered.
+          # E9/F63/F7/F82 catch real errors (syntax, undefined names,
+          # f-string/assert bugs) only — no style noise, so CI never reddens
+          # over formatting.
+          ruff check --select E9,F63,F7,F82 bin/claude-bridge tests

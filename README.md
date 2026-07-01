@@ -3,11 +3,18 @@
 A Discord-driven control plane for interactive Claude Code workers.
 
 `claude-bridge` maps each Discord channel (under a **Claude** category) 1:1 to a
-persistent tmux Claude Code worker, with hook-driven reply/checklist relays,
-per-channel capability profiles (owner / collab / utility / greeter), and a
-readiness check. It is desktop-only tooling extracted from
-[nedlane/dotfiles](https://github.com/nedlane/dotfiles), where it lives as a
-git submodule under `hosts/wsl-desktop/agent-bridge/`.
+persistent tmux-backed Claude Code worker: one channel per repo, one worker per
+repo, no threads. Your channel messages are forwarded into the worker; the
+worker's replies and live task checklists are relayed back out through Claude
+Code hooks; each channel runs under a per-channel capability profile
+(`owner` / `collab` / `utility` / `greeter`). **There is no LLM inside the
+bridge** — Claude Code, running on your Claude subscription, is the only
+intelligence in the loop. The bridge is deterministic plumbing around it.
+
+It is desktop-only tooling, originally extracted from
+[nedlane/dotfiles](https://github.com/nedlane/dotfiles) (where it lives as a git
+submodule under `hosts/wsl-desktop/agent-bridge/`) and now runnable standalone.
+MIT-licensed — see [`LICENSE`](LICENSE).
 
 ## Layout
 
@@ -20,28 +27,311 @@ git submodule under `hosts/wsl-desktop/agent-bridge/`.
 | `bin/claude-worker-todo-relay` | PostToolUse/TodoWrite hook → live task checkboxes to Discord |
 | `bin/claude-worker-done-relay` | Stop hook → completion push to Discord |
 | `bin/agent-checkup` | Readiness / auth-mode report |
-| `bin/term-shot` | Captured terminal → text/image |
+| `bin/term-shot` | Captured terminal → text/image (needs Pillow) |
 | `claude-profiles/` | Per-channel capability profiles (`*.settings.json`, `*.mcp.json`) |
 | `skills/` | Claude Code skills: `claude-bridge`, `discord-notify` |
 | `systemd/claude-bridge.service` | User service for the daemon |
+| `scripts/link.sh` | Symlinks `bin/*`, `skills/*`, and the systemd unit into place |
 
-## How it's wired (in dotfiles)
+## Requirements
 
-`scripts/link.sh` in the parent dotfiles repo symlinks `bin/*` into
-`~/.local/bin`, `skills/*` into `~/.claude/skills`, and the systemd unit into
-`~/.config/systemd/user`. The service runs the daemon from the stable
-`~/.local/bin/claude-bridge` symlink.
+The host that runs the bridge needs:
+
+- **Python 3** with **[discord.py](https://discordpy.readthedocs.io/)**
+  (`pip3 install --user discord.py`) — the daemon's runtime.
+- **[Pillow](https://python-pillow.org/)** (`pip3 install --user Pillow`) — used
+  by `bin/term-shot` to render a worker's live screen as an image for the 👀
+  peek and `/screen`. Without it, peeks fall back to a text code block.
+- **tmux** — every worker is a detached `cw-<name>` tmux session.
+- **jq** — used by CI and handy for validating config/profile JSON.
+- **curl** — the signed-event clients (`bridge-ctl`, `discord-notify`) POST with it.
+- The **`claude` CLI** ([Claude Code](https://docs.claude.com/en/docs/claude-code)),
+  logged in interactively on a **Claude subscription** (not an API key, not
+  Bedrock/Vertex). Run `claude` once and `/login` first.
+- **`claude-launch`** — a launcher wrapper that this repo does **not** include.
+
+### About `claude-launch` (external dependency)
+
+`claude-worker` starts every worker through a wrapper called `claude-launch`,
+resolved from `PATH` or `$DOTFILES_DIR/shared/bin/claude-launch`. It lives in
+the **private [nedlane/dotfiles](https://github.com/nedlane/dotfiles) repo and
+is not bundled here.** Be aware, honestly:
+
+- **Without `claude-launch` on PATH, workers cannot start.** `claude-worker
+  start` fails fast with `claude-launch not found`.
+- The non-owner capability profiles pass `claude-launch`-specific flags that
+  stock `claude` does **not** accept — `--enforce-perms`, `--tools`,
+  `--mcp-config`, `--strict-mcp-config`, `--allowedTools`, `--settings`, and
+  `--append-system-prompt`. So the `collab`, `utility`, and `greeter` profiles
+  **require `claude-launch`**; only the `owner` profile (which adds no flags)
+  could work against a stock `claude` binary via a shim, and even then the
+  Discord protocol is injected with `--append-system-prompt`.
+
+If you don't have `claude-launch`, you'll need to supply your own wrapper on
+PATH that accepts those flags (or restrict yourself to owner channels and adapt
+`start_args()`/`profile_args()` accordingly). This is the one piece a stranger
+cannot get purely from this repo.
+
+## Standalone install
+
+This installs the bridge directly on a host, without the dotfiles submodule.
+
+1. **Install dependencies** (see [Requirements](#requirements)): Python 3,
+   discord.py, Pillow, tmux, jq, curl, the `claude` CLI (logged in), and a
+   `claude-launch` wrapper on PATH.
+
+2. **Link the tools into place.** Run the bundled linker:
+
+   ```bash
+   scripts/link.sh
+   ```
+
+   It symlinks `bin/*` into `~/.local/bin`, `skills/*` into `~/.claude/skills`,
+   and `systemd/claude-bridge.service` into `~/.config/systemd/user`. To do it
+   by hand instead, create those symlinks yourself. Make sure `~/.local/bin` is
+   on your `PATH`.
+
+3. **Create the config and secrets** — see
+   [Configuration](#configuration) and [Secrets](#secrets) below.
+
+4. **Register the Claude Code hooks** so worker replies and live checklists get
+   relayed back to Discord. `claude-worker-done-relay` runs on the **Stop** hook
+   and `claude-worker-todo-relay` on the **PostToolUse** hook
+   (`TodoWrite|TaskCreate|TaskUpdate`). See
+   [`docs/agent-control-plane.md`](docs/agent-control-plane.md) for the exact
+   `~/.claude/settings.json` snippets.
+
+5. **Enable the service:**
+
+   ```bash
+   systemctl --user enable --now claude-bridge
+   ```
+
+   (Consider `loginctl enable-linger $USER` so it survives logout.)
+
+6. **Verify** the whole plane with:
+
+   ```bash
+   agent-checkup
+   ```
+
+   It reports on tmux, the `claude` subscription auth path, discord.py, the
+   config and secret files, the linked tools, and prints the manual checks it
+   can't automate (Discord intents, live auth, hook registration).
+
+### Running the daemon standalone (debugging)
+
+You don't need the service to run it. For a foreground session with logs on
+your terminal:
+
+```bash
+python3 bin/claude-bridge --config ~/.config/claude-bridge/config.json
+```
+
+The config path defaults to `~/.config/claude-bridge/config.json` and can also
+be set with the `CLAUDE_BRIDGE_CONFIG` environment variable.
+
+## Discord bot setup
+
+1. In the [Discord developer portal](https://discord.com/developers/applications)
+   create an **application**, then add a **bot** to it.
+2. Under the bot settings, enable the **Message Content** privileged intent —
+   the bridge sets `intents.message_content` and `intents.reactions`, and
+   without Message Content it can't read what you type.
+3. Invite the bot to your server with **both** OAuth2 scopes: **`bot`** and
+   **`applications.commands`**. The slash commands will **not** register without
+   `applications.commands`.
+4. Grant the bot these permissions:
+   - **Manage Channels** — create and delete repo channels (`/addrepo`, `/close`).
+   - **Manage Messages** — `/clear` and `/fresh` purge the channel's history.
+   - **Send Messages** — post worker replies.
+   - **Read Message History** — relay context and purge old messages.
+   - **Add Reactions** — pre-seed the 👁️ / ✏️ / ❌ decision reactions on request cards.
+   - **Manage Roles** — set the per-member channel permission overwrites that
+     grant guests view/edit access (`do_addguest`).
+5. Create a category (e.g. named **Claude**) to hold your repo channels. Copy
+   its channel id into `category_id`.
+6. Copy **your own** Discord user id into `allowed_users` (owner). Enable
+   Developer Mode in Discord to right-click → *Copy ID*.
 
 ## Configuration
 
-- Profiles resolve relative to this checkout (`claude-profiles/` beside `bin/`);
-  override with `CLAUDE_PROFILES_DIR`.
-- `claude-worker` locates the shared `claude-launch` via `$DOTFILES_DIR`/`PATH`
-  (it lives in the parent dotfiles repo, not here).
+The bridge reads a single JSON file at `~/.config/claude-bridge/config.json`
+(override with the `CLAUDE_BRIDGE_CONFIG` environment variable). Fields
+(defaults come from `default_config()`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `category_id` | int | Channel id of the **Claude** category new repo channels are created under. |
+| `allowed_users` | int[] | Owner Discord user ids. Gate every slash command and every owner-only action (reaction decisions, guest management). |
+| `idle_minutes` | int | Idle workers are stopped after this many minutes (default `45`). The next message revives them with `--continue`. |
+| `listen_port` | int | Port of the localhost signed-event listener (default `8765`). Must match the port in `bridge-webhook`. |
+| `repos` | object | Map of **channel id (string)** → repo object (below). |
+| `welcome_channel` | int \| null | Channel id of the public `#welcome` greeter (open to any member). `null` disables it. |
+| `requests_channel` | int \| null | Channel id where guest-access approval cards are posted. `null` disables it. |
+
+Each entry in `repos` is keyed by the Discord channel id (as a string) and holds:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | Worker/channel name (tmux session `cw-<name>`, state dir). |
+| `dir` | string | Absolute path to the repo the worker runs in. |
+| `profile` | string | Capability profile: `owner` (default), `collab`, `utility`, or `greeter`. |
+| `guests` | int[] | Editor guest ids (View + Send — can drive the worker). Optional. |
+| `viewers` | int[] | View-only guest ids (can watch, can't drive). Optional. |
+
+Repos are normally created with the `/addrepo` slash command (which needs the
+bot already running and writes the entry for you), so a first-run config can
+start with an empty `repos` object. A complete example:
+
+```json
+{
+  "category_id": 111111111111111111,
+  "allowed_users": [222222222222222222],
+  "idle_minutes": 45,
+  "listen_port": 8765,
+  "welcome_channel": 333333333333333333,
+  "requests_channel": 444444444444444444,
+  "repos": {
+    "555555555555555555": {
+      "name": "myrepo",
+      "dir": "/home/you/projects/myrepo",
+      "profile": "owner"
+    },
+    "666666666666666666": {
+      "name": "shared-thing",
+      "dir": "/home/you/guest-workspaces/shared-thing",
+      "profile": "collab",
+      "guests": [777777777777777777],
+      "viewers": [888888888888888888]
+    }
+  }
+}
+```
+
+## Secrets
+
+Three files live under `~/.config/claude-workers/`. Create the directory, write
+each file, and `chmod 600` all of them:
+
+### `discord-bot-token`
+
+The raw Discord bot token, on a single line (read with `f.read().strip()`).
+Copy it from your application's **Bot** page in the developer portal.
+
+```
+MTIzNDU2Nzg5...your.bot.token...
+```
+
+### `bridge-webhook`
+
+`key=value` lines giving the URL and shared secret of the bridge's localhost
+event listener:
+
+```
+BRIDGE_WEBHOOK_URL=http://127.0.0.1:8765/event
+BRIDGE_WEBHOOK_SECRET=<random hex>
+```
+
+- The **same `BRIDGE_WEBHOOK_SECRET`** must be used by the bridge and by every
+  client that posts to it — `bridge-ctl`, `discord-notify`, and the hook relays
+  all HMAC-sign their events with it. Generate one with, e.g.,
+  `openssl rand -hex 32`.
+- The URL's port must match `listen_port` in the config (`8765` by default).
+
+### `discord-webhook`
+
+A plain Discord channel **webhook URL** on one line (create it in the channel's
+*Integrations → Webhooks* settings). It's the **main-channel fallback**: when a
+message isn't bound to a repo channel, `discord-notify` and the todo relay post
+here instead.
+
+```
+https://discord.com/api/webhooks/1234567890/abcdef...
+```
+
+## Slash commands
+
+Control verbs are native Discord **application (slash) commands**, synced
+per-guild when the bot connects. They're restricted to `allowed_users` (owner).
+On every command the `worker` option defaults to the worker mapped to the
+channel you run it in.
+
+| Command | What it does |
+|---|---|
+| `/status` | List all workers and their running state. |
+| `/stop [worker]` | Stop a worker (state kept; a message revives it). |
+| `/restart [worker]` | Restart a worker, resuming its conversation. |
+| `/screen [worker]` | Post the worker's live TUI screen (image, or a code-block fallback). |
+| `/model <model> [worker]` | Switch the worker's model (e.g. `opus`, `sonnet`, `haiku`). |
+| `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
+| `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
+| `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
+| `/checkin [worker]` | Ask a running worker to send a 3–5 line progress update. |
+| `/addrepo <name> <path>` | Create `#<name>` under the category and map it to a repo directory. |
+| `/close [worker] confirm:<name>` | **Irreversible teardown** — stop the worker, wipe its saved state, and delete its channel. Requires retyping the worker name in `confirm`. |
+| `/addguest <name> <discord_id> [edit\|view]` | Grant a guest edit (View+Send) or view (read-only) access to one channel. |
+| `/lockdown` | Drop **all** guests everywhere to view-only in one shot (leaves the owner untouched). |
+
+Notes:
+
+- `/clear` and `/fresh` purge the channel and therefore need the bot's **Manage
+  Messages** permission.
+- `/close` deletes the channel and its whole history — it needs **Manage
+  Channels** and won't proceed unless `confirm` exactly matches the worker name.
+- Any **other** message beginning with `/` (i.e. not one of the commands above)
+  is typed straight into the worker as keystrokes, so any Claude Code slash
+  command (`/help`, `/context`, …) still works from Discord.
+
+## Guest access & the public front desk
+
+The bridge has a lightweight "front desk" for letting other server members work
+on a project without giving them owner rights:
+
+- A public **`#welcome`** greeter channel (config `welcome_channel`) is open to
+  anyone in the server. A `greeter`-profile worker there helps a visitor pick a
+  project and files an access request.
+- Requests land as **approval cards** in a **requests channel** (config
+  `requests_channel`). The owner reacts to decide: 👁️ grants view-only, ✏️
+  grants edit, ❌ denies. Granting sets a per-member Discord permission
+  overwrite on that project's channel and records the guest in `guests`
+  (editors) or `viewers`.
+- The owner can revoke or clamp access at any time — `/lockdown` (or
+  `bridge-ctl viewonly --all`) drops every editor to view-only instantly.
+
+See [`claude-profiles/README.md`](claude-profiles/README.md) for the profile
+capabilities and the full front-desk flow.
+
+## How it's wired (in dotfiles)
+
+When used as the dotfiles submodule, the parent repo's own `scripts/link.sh`
+performs the same symlinking, and the service runs the daemon from the stable
+`~/.local/bin/claude-bridge` symlink. Profiles resolve relative to this checkout
+(`claude-profiles/` beside `bin/`); override with `CLAUDE_PROFILES_DIR`.
 
 ## Development
 
-`bin/` mixes Bash and Python; `claude-bridge` is Python 3 (discord.py). CI runs
-ShellCheck over the shell tools, `py_compile` over the daemon, and validates the
-profile JSON. Behavioral smoke tests live in the dotfiles repo (`tests/`), where
-the shared `claude-launch` dependency is present.
+`bin/` mixes Bash and Python; `claude-bridge` is Python 3 (discord.py). Only the
+standard library is imported at module level, so the pure helpers (config
+loading, message splitting, transcript extraction, signature verification, state
+markers, …) are unit-testable without discord.py installed — this repo ships a
+**stdlib-only unit-test suite under `tests/`** covering them (the daemon has no
+`.py` extension, so the tests load it via `importlib`). Run it with:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+CI (`.github/workflows/ci.yml`) runs, on every push and pull request:
+
+- `bash -n` syntax checks over the shell tools,
+- **ShellCheck** over the shell tools,
+- `py_compile` over `bin/claude-bridge`,
+- `jq` validation of every `claude-profiles/*.json`,
+- the **`tests/` unit suite** (`python3 -m unittest discover -s tests`),
+- **Ruff** error-lint (`E9,F63,F7,F82`) over the daemon and tests — real-error
+  rules only, so it never reddens CI over formatting.
+
+Everything that CI checks is self-contained in this repo. Behavioral,
+end-to-end tests that exercise a live worker still require the external
+`claude-launch` dependency and are not part of this repo's CI.
