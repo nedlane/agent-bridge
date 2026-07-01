@@ -50,9 +50,12 @@ In Discord these are native slash commands (synced per-guild on connect; the
 `worker` option defaults to the channel's worker): `/status`, `/stop`,
 `/restart`, `/screen`, `/model <model>`, `/clear` (fresh context via restart
 without `--continue`), `/fresh` (shut down + fresh next start, no resume),
-`/compact`, `/checkin`, `/addrepo <name> <path>`. Any *other* `/slash-command`
-message (not one of these) is typed straight into the worker. The bot must be
-invited with the `applications.commands` scope for these to register.
+`/compact`, `/checkin`, `/addrepo <name> <path>`. `/clear` and `/fresh` also
+purge the channel's messages (Ned's and the bot's) to clear clutter — this
+needs the bot's **Manage Messages** permission in the Claude category. Any
+*other* `/slash-command` message (not one of these) is typed straight into the
+worker. The bot must be invited with the `applications.commands` scope for
+these to register.
 
 Common failures: worker replies not arriving → check the Stop hook chain
 (`~/.claude/settings.json` registers `claude-worker-done-relay`;
