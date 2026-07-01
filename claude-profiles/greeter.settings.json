@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bridge-ctl repos)",
+      "Bash(bridge-ctl request:*)"
+    ],
+    "deny": [
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch",
+      "Task",
+      "Read(//home/nedlane/.ssh/**)",
+      "Read(//home/nedlane/.config/**)",
+      "Read(//home/nedlane/.claude/**)",
+      "Read(//home/nedlane/dotfiles/**)"
+    ],
+    "defaultMode": "default"
+  }
+}

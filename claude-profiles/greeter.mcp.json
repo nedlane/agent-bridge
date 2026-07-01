@@ -1,0 +1,4 @@
+{
+  "_comment": "The public greeter loads NO MCP servers (claude --strict-mcp-config). It only needs the two allowed bridge-ctl commands; keeping this empty means a stranger can never reach Ned's MCP tools through it.",
+  "mcpServers": {}
+}
