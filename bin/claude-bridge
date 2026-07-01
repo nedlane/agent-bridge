@@ -198,11 +198,17 @@ def start_args(name, directory, channel_id, resume, profile="owner"):
 
 
 # Where versioned capability profiles live (settings + restricted MCP sets).
+# Self-locating: claude-profiles/ sits beside bin/ in this repo, so resolve it
+# relative to the real script path — realpath() follows the ~/.local/bin symlink
+# into the checkout, so this works wherever the repo is mounted. Override with
+# CLAUDE_PROFILES_DIR.
 PROFILE_DIR = os.path.expanduser(
     os.environ.get(
         "CLAUDE_PROFILES_DIR",
-        os.path.join(os.environ.get("DOTFILES_DIR", "~/dotfiles"),
-                     "hosts/wsl-desktop/claude-profiles"),
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+            "claude-profiles",
+        ),
     )
 )
 

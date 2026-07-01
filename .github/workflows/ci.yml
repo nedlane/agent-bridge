@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq shellcheck
+
+      - name: Validate Bash syntax
+        run: |
+          for f in bin/*; do
+            head -1 "$f" | grep -qE 'python' && continue
+            bash -n "$f"
+          done
+
+      - name: ShellCheck (shell tools only)
+        run: |
+          for f in bin/*; do
+            head -1 "$f" | grep -qE 'zsh|python' && continue
+            shellcheck "$f"
+          done
+
+      - name: Validate claude-bridge Python syntax
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bin/claude-bridge
+
+      - name: Validate profile JSON
+        run: |
+          for f in claude-profiles/*.json; do
+            jq empty "$f"
+          done
