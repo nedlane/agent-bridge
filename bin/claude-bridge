@@ -33,13 +33,19 @@ on connect). The `worker` option defaults to the channel's mapped worker:
   /compact [focus] [worker] compact the worker's context
   /checkin [worker]        ask a running worker for a progress update
   /addrepo <name> <path>   create #<name> under the category + map it
+  /close [worker] confirm:<name>
+                           retire a worker: stop it, wipe its saved state, and
+                           delete its channel (irreversible; confirm required)
+  /addguest <name> <discord_id> [edit|view]   grant a guest channel access
+  /lockdown                drop ALL guests everywhere to view-only
 A plain message starting with "/" that is NOT one of the above is typed into
 the worker as keystrokes, so any other Claude Code slash command still works.
 The worker named "orchestrator" additionally gets the ORCHESTRATOR brief, so
 its channel doubles as a natural-language remote for all of the above.
 
 Only stdlib is imported at module level so the pure helpers stay testable
-without discord.py installed (tests/claude-bridge-smoke.sh).
+without discord.py installed (see tests/ — loaded via importlib since this
+file has no .py extension).
 """
 
 import argparse
@@ -49,6 +55,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 
@@ -80,6 +87,10 @@ DENY_EMOJI = "❌"
 
 DISCORD_LIMIT = 2000
 REPLY_CAP = 8000
+
+# Downloaded Discord attachments pile up in each worker's inbox (every file
+# gets a unique name); prune anything older than this on the next download.
+INBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 # Injected into every worker's system prompt: the worker itself is the
 # publisher. It messages Ned through discord-notify (which auto-targets the
@@ -298,7 +309,7 @@ def parse_request_marker(text):
     return (int(m.group(1)), m.group(2)) if m else None
 
 # --------------------------------------------------------------------------
-# Pure helpers (no I/O beyond explicit paths; covered by the smoke test)
+# Pure helpers (no I/O beyond explicit paths; covered by tests/)
 # --------------------------------------------------------------------------
 
 
@@ -622,6 +633,42 @@ def should_resume(has_state, fresh):
     return has_state and not fresh
 
 
+def remove_worker_state(name, state_root=None):
+    """Delete a worker's entire state dir — meta, logs, inbox, and any /fresh
+    marker — so /close leaves nothing behind. A missing dir (already-clean or
+    never-started worker) is a no-op. `name` is used as a single path component
+    only; a traversal-looking name is refused so this can never rmtree outside
+    the state root. Returns True when a directory was actually removed."""
+    if os.path.basename(name) != name or name in ("", ".", ".."):
+        return False
+    path = os.path.join(state_root or STATE_ROOT, name)
+    if not os.path.isdir(path):
+        return False
+    shutil.rmtree(path, ignore_errors=True)
+    return True
+
+
+def prune_old_files(directory, max_age_seconds, now=None):
+    """Delete regular files in `directory` older than max_age_seconds. Keeps a
+    worker's attachment inbox bounded. Best-effort — never raises; a missing
+    dir is a no-op. Returns the count removed."""
+    now = time.time() if now is None else now
+    removed = 0
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return 0
+    for entry in entries:
+        path = os.path.join(directory, entry)
+        try:
+            if os.path.isfile(path) and now - os.path.getmtime(path) > max_age_seconds:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 # --------------------------------------------------------------------------
 # Runtime (discord.py + aiohttp imported here so tests don't need them)
 # --------------------------------------------------------------------------
@@ -649,6 +696,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     last_activity = {}  # worker name -> epoch seconds
     offsets = {}        # transcript path -> bytes already consumed
     notified = set()    # workers that messaged Ned themselves this turn
+    turn_locks = {}     # transcript key -> asyncio.Lock (serialize turn_ended)
 
     async def settle_file(path, timeout=10):
         """Wait until `path` stops changing (two identical mtimes 0.5s apart)."""
@@ -723,13 +771,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     await channel.send(chunk)
         except discord.HTTPException as e:
             print(f"[bridge] channel {channel_id} send failed: {e}")
-            if files:
-                # Salvage the text so the caption isn't lost with the upload.
-                for chunk in chunks:
-                    try:
-                        await channel.send(chunk)
-                    except discord.HTTPException:
-                        pass
+            # Only the final chunk carries the files; every earlier chunk was
+            # already delivered before this raised, so re-sending them all would
+            # duplicate text. Salvage just the caption that rode with the
+            # rejected upload.
+            if files and chunks:
+                try:
+                    await channel.send(chunks[-1])
+                except discord.HTTPException:
+                    pass
 
     async def purge_channel(channel_id):
         """Delete a worker channel's messages (Ned's and the bot's) to clear
@@ -796,8 +846,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if repo and channel_id:
                 print(f"[bridge] {name}: send wedged, restarting worker to recover")
                 await asyncio.to_thread(worker_stop, name)
+                # Carry the channel's capability profile through the restart —
+                # omitting it would silently relaunch a restricted (collab /
+                # utility / greeter) worker as full-trust owner.
                 r2 = await asyncio.to_thread(
-                    worker_start, name, repo["dir"], channel_id, True
+                    worker_start, name, repo["dir"], channel_id, True,
+                    repo.get("profile", "owner"),
                 )
                 if r2.returncode == 0:
                     # The restart resumes with --continue and may auto-compact;
@@ -823,6 +877,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         except OSError as e:
             print(f"[bridge] {name}: cannot create inbox {inbox}: {e}")
             return []
+        prune_old_files(inbox, INBOX_MAX_AGE_SECONDS)
         paths = []
         for att in message.attachments:
             safe = os.path.basename(att.filename or "").strip() or "file"
@@ -955,6 +1010,31 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # Wiped the worker's context — wipe the channel's clutter to match.
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
+
+    async def do_close(name):
+        # Fully retire a worker: stop it, wipe its saved state, and drop its
+        # repo mapping. The caller deletes the Discord channel afterwards — so
+        # this still runs cleanly when the command was invoked from that very
+        # channel, and the config/state are already gone if the delete fails.
+        # Returns (summary, channel_id); channel_id is None when unmapped.
+        item = next(
+            ((cid, r) for cid, r in cfg["repos"].items() if r["name"] == name), None
+        )
+        if not item:
+            return f"⚠️ no repo channel mapped for `{name}`", None
+        cid, _ = item
+        await asyncio.to_thread(worker_stop, name)
+        wiped = await asyncio.to_thread(remove_worker_state, name)
+        del cfg["repos"][cid]
+        save_config(cfg, config_path)
+        last_activity.pop(name, None)
+        notified.discard(name)
+        print(f"[bridge] close: retired worker {name} (channel {cid})")
+        summary = (
+            f"🗑️ Closed `{name}` — worker stopped, "
+            f"{'state wiped, ' if wiped else ''}mapping removed"
+        )
+        return summary, int(cid)
 
     def the_guild():
         """The single guild the bridge serves (via the Claude category)."""
@@ -1254,6 +1334,58 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             f"✅ created {channel.mention} → `{directory}` (worker `{name}`)"
         )
 
+    @tree.command(name="close", description="Retire a worker: stop it, wipe its state, and DELETE its channel (irreversible)")
+    @describe(worker="Worker name (defaults to this channel's worker)",
+              confirm="Retype the worker's name to confirm this irreversible teardown")
+    async def slash_close(interaction, worker: str = None, confirm: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        # Deleting a channel destroys its history, so gate the teardown behind
+        # retyping the worker name — a fat-fingered /close can't nuke the wrong
+        # channel. guard() already restricts this to allowed_users (owner).
+        if confirm != name:
+            await interaction.response.send_message(
+                f"⚠️ `/close` permanently **stops `{name}`, wipes its saved "
+                "conversation state, and deletes its channel** (history and all) "
+                f"— this can't be undone. Re-run with `confirm:{name}` to proceed.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(thinking=True)
+        summary, channel_id = await do_close(name)
+        deleted_ok, err = True, None
+        if channel_id is not None:
+            # Fall back to a fetch when the channel isn't in cache — otherwise a
+            # skipped delete would still report success, leaving an orphaned
+            # channel while telling the owner the teardown was complete.
+            channel = client.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await client.fetch_channel(channel_id)
+                except discord.HTTPException:
+                    channel = None
+            if channel is not None:
+                try:
+                    await channel.delete(reason=f"/close retired worker {name}")
+                except discord.HTTPException as e:
+                    deleted_ok, err = False, str(e)
+            else:
+                deleted_ok, err = False, "channel not found (delete it by hand)"
+        # Report last. If the channel we just deleted was this one, the followup
+        # 404s harmlessly — the vanished channel is its own confirmation.
+        if not deleted_ok:
+            msg = (f"⚠️ stopped and unmapped `{name}`, but its channel couldn't "
+                   f"be deleted ({err}) — remove it by hand, or grant the bot the "
+                   "**Manage Channels** permission.")
+        elif channel_id is not None:
+            msg = f"{summary}, channel deleted."
+        else:
+            msg = summary  # unmapped: do_close returned a warning
+        try:
+            await interaction.followup.send(msg)
+        except discord.HTTPException:
+            pass
+
     @tree.command(name="lockdown", description="Drop ALL guests everywhere to view-only (leaves you untouched)")
     async def slash_lockdown(interaction):
         if interaction.user.id not in cfg["allowed_users"]:
@@ -1374,44 +1506,49 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             channel_id = channel_from_chat(event.get("chat", "")) or channel_for_worker(name)
             path = event.get("transcript_path", "")
             last_activity[name] = time.time()
-            # Push-first: if the worker already messaged Ned this turn via
-            # discord-notify, the fallback stays silent — but the transcript
-            # offset is still consumed so a later fallback can't replay this
-            # turn's text.
-            worker_spoke = name in notified
-            notified.discard(name)
-            if channel_id and worker_spoke:
-                _, off = extract_new_reply(path, offsets.get(path, 0))
-                offsets[path] = off
-                print(f"[bridge] {name}: turn ended, worker already notified — fallback silent")
-            elif channel_id:
-                # The Stop hook can fire before Claude Code flushes the final
-                # assistant message, and a stale read returns the PREVIOUS
-                # turn's reply (the one-prompt-behind bug). Known transcripts
-                # are read incrementally from a byte offset so only this
-                # turn's text counts; unseen transcripts (fresh worker or
-                # bridge restart) are read whole after the file settles.
-                reply = ""
-                if path in offsets:
-                    off = offsets[path]
-                    for _ in range(10):
-                        reply, off = extract_new_reply(path, off)
-                        if reply:
-                            break
-                        await asyncio.sleep(1)
+            # Serialize per transcript: two Stop-hook events for one worker can
+            # land within the retry window below, and without the lock both read
+            # the same pre-advance offset and post the reply twice.
+            lock = turn_locks.setdefault(path or name, asyncio.Lock())
+            async with lock:
+                # Push-first: if the worker already messaged Ned this turn via
+                # discord-notify, the fallback stays silent — but the transcript
+                # offset is still consumed so a later fallback can't replay this
+                # turn's text.
+                worker_spoke = name in notified
+                notified.discard(name)
+                if channel_id and worker_spoke:
+                    _, off = extract_new_reply(path, offsets.get(path, 0))
                     offsets[path] = off
-                elif path:
-                    await settle_file(path)
-                    reply = extract_last_reply(path)
-                    try:
-                        offsets[path] = os.path.getsize(path)
-                    except OSError:
-                        pass
-                print(f"[bridge] {name}: turn ended, posting "
-                      f"{len(reply) if reply else 0} chars to {channel_id}")
-                if not reply:
-                    reply = "(no new reply text captured — use /screen)"
-                await post(channel_id, reply)
+                    print(f"[bridge] {name}: turn ended, worker already notified — fallback silent")
+                elif channel_id:
+                    # The Stop hook can fire before Claude Code flushes the final
+                    # assistant message, and a stale read returns the PREVIOUS
+                    # turn's reply (the one-prompt-behind bug). Known transcripts
+                    # are read incrementally from a byte offset so only this
+                    # turn's text counts; unseen transcripts (fresh worker or
+                    # bridge restart) are read whole after the file settles.
+                    reply = ""
+                    if path in offsets:
+                        off = offsets[path]
+                        for _ in range(10):
+                            reply, off = extract_new_reply(path, off)
+                            if reply:
+                                break
+                            await asyncio.sleep(1)
+                        offsets[path] = off
+                    elif path:
+                        await settle_file(path)
+                        reply = extract_last_reply(path)
+                        try:
+                            offsets[path] = os.path.getsize(path)
+                        except OSError:
+                            pass
+                    print(f"[bridge] {name}: turn ended, posting "
+                          f"{len(reply) if reply else 0} chars to {channel_id}")
+                    if not reply:
+                        reply = "(no new reply text captured — use /screen)"
+                    await post(channel_id, reply)
         elif etype == "claude.bridge.addrepo":
             repo_name = (event.get("name") or "").strip()
             repo_path = os.path.expanduser(event.get("path") or "")
@@ -1545,6 +1682,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     async def reaper():
         while True:
             await asyncio.sleep(60)
+            # Prune bookkeeping for transcripts that no longer exist — /clear,
+            # /fresh and /close all leave their old path's entry stranded (the
+            # dicts are keyed by transcript path, not worker name), an otherwise
+            # unbounded leak in a long-lived daemon.
+            for path in [p for p in offsets if p and not os.path.exists(p)]:
+                offsets.pop(path, None)
+                turn_locks.pop(path, None)
             idle_s = cfg["idle_minutes"] * 60
             for repo in list(cfg["repos"].values()):
                 name = repo["name"]
