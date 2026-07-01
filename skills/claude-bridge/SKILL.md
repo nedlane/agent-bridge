@@ -24,7 +24,7 @@ bridge-ctl repos                        # list channel -> repo mappings
 discord-notify -t discord:<channel_id> "first message"   # talk into it
 ```
 
-Ned can also type `!addrepo <name> <path>` in Discord. Prefer these tools
+Ned can also run the `/addrepo <name> <path>` slash command in Discord. Prefer these tools
 over editing config or calling the Discord REST API by hand; the bridge owns
 channel creation and the mapping file. To hand a worker a task end-to-end:
 `bridge-ctl start <name>`, then `claude-worker send <name> "the task"`.
@@ -46,10 +46,13 @@ ss -tln | grep 8765                        # event listener up?
 agent-checkup                              # full readiness report
 ```
 
-In Discord: `!status`, `!stop [name]`, `!restart [name]`, `!screen [name]`,
-`!model <model> [name]`, `!clear [name]` (fresh context via restart without
-`--continue`), `!compact [name]` — and any `/slash-command` message is typed
-straight into the worker.
+In Discord these are native slash commands (synced per-guild on connect; the
+`worker` option defaults to the channel's worker): `/status`, `/stop`,
+`/restart`, `/screen`, `/model <model>`, `/clear` (fresh context via restart
+without `--continue`), `/fresh` (shut down + fresh next start, no resume),
+`/compact`, `/checkin`, `/addrepo <name> <path>`. Any *other* `/slash-command`
+message (not one of these) is typed straight into the worker. The bot must be
+invited with the `applications.commands` scope for these to register.
 
 Common failures: worker replies not arriving → check the Stop hook chain
 (`~/.claude/settings.json` registers `claude-worker-done-relay`;

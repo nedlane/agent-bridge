@@ -21,15 +21,18 @@ Secrets: ~/.config/claude-workers/discord-bot-token   (Discord bot token)
                                                        BRIDGE_WEBHOOK_SECRET,
                                                        shared with the hooks)
 
-Commands (allowed users, any visible channel):
-  !status / !stop [name] / !restart [name] / !screen [name]
-  !model <model> [name]    switch the worker's model (typed /model)
-  !clear [name]            fresh context now: restart without --continue
-  !fresh [name]            shut down + fresh next start (no resume, lazy)
-  !compact [name]          compact the worker's context (typed /compact)
-  !addrepo <name> <path>   create #<name> under the category + map it
-Any message starting with "/" is typed into the worker as keystrokes, so
-every Claude Code slash command works from Discord directly.
+Commands are native Discord slash commands (allowed users; synced per guild
+on connect). The `worker` option defaults to the channel's mapped worker:
+  /status                  list all workers and their state
+  /stop /restart /screen [worker]
+  /model <model> [worker]  switch the worker's model
+  /clear [worker]          fresh context now: restart without --continue
+  /fresh [worker]          shut down + fresh next start (no resume, lazy)
+  /compact [focus] [worker] compact the worker's context
+  /checkin [worker]        ask a running worker for a progress update
+  /addrepo <name> <path>   create #<name> under the category + map it
+A plain message starting with "/" that is NOT one of the above is typed into
+the worker as keystrokes, so any other Claude Code slash command still works.
 The worker named "orchestrator" additionally gets the ORCHESTRATOR brief, so
 its channel doubles as a natural-language remote for all of the above.
 
@@ -103,7 +106,7 @@ Your discord-notify and claude-bridge skills document the rest."""
 # The worker named "orchestrator" is Ned's natural-language remote for the
 # whole control plane: it gets this brief on top of PROTOCOL so "spin up a
 # worker on ghpr and have it triage the failing tests" becomes tool calls
-# instead of Ned typing bot commands. The ! commands keep working everywhere.
+# instead of Ned typing bot commands. The `/` slash commands work everywhere.
 ORCHESTRATOR = """Additionally, you are Ned's ORCHESTRATOR session. He will ask
 you in natural language to run this machine's Claude-worker control plane;
 translate his requests into these tools instead of telling him which bot
@@ -189,21 +192,10 @@ def save_config(cfg, path=None):
     os.replace(tmp, path)
 
 
-def parse_command(text):
-    """'!addrepo ghpr ~/x' -> ('addrepo', ['ghpr', '~/x']); None if not a command."""
-    text = (text or "").strip()
-    if not text.startswith("!"):
-        return None
-    parts = text[1:].split()
-    if not parts or not parts[0].isalpha():
-        return None
-    return parts[0].lower(), parts[1:]
-
-
 def split_message(text, limit=DISCORD_LIMIT):
     """Split on line boundaries under Discord's message size limit."""
     if len(text) > REPLY_CAP:
-        text = text[:REPLY_CAP] + "\n… (truncated — use !screen for the live view)"
+        text = text[:REPLY_CAP] + "\n… (truncated — use /screen for the live view)"
     chunks, current = [], ""
     for line in text.splitlines(keepends=True):
         while len(line) > limit:  # single pathological line
@@ -441,7 +433,7 @@ def fresh_marker_path(name, state_root=None):
 
 
 def fresh_pending(name, state_root=None):
-    """True when a !fresh was armed: the worker was shut down and its next
+    """True when /fresh was armed: the worker was shut down and its next
     start must begin a brand-new session instead of --continue-resuming the
     old conversation."""
     return os.path.isfile(fresh_marker_path(name, state_root))
@@ -458,7 +450,7 @@ def arm_fresh(name, state_root=None):
 
 def disarm_fresh(name, state_root=None):
     """Consume the fresh marker — called once the worker has (re)started, so a
-    one-shot !fresh doesn't wipe every subsequent revive."""
+    one-shot /fresh doesn't wipe every subsequent revive."""
     try:
         os.remove(fresh_marker_path(name, state_root))
     except FileNotFoundError:
@@ -580,18 +572,22 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     except discord.HTTPException:
                         pass
 
-    async def peek_screen(channel_id, name):
-        """Post a worker's live screen as an image (falls back to a code
-        block if rendering is unavailable) — shared by 👀 and !screen."""
+    async def render_peek(name):
+        """Build a worker's live-screen payload as (text, attachments): an
+        image (falls back to a code block if rendering is unavailable). Shared
+        by the 👀 reaction and the /screen command."""
         if not await asyncio.to_thread(worker_alive, name):
-            await post(channel_id, f"👀 `{name}` isn't running right now.")
-            return
+            return f"👀 `{name}` isn't running right now.", None
         screen = await asyncio.to_thread(worker_screen, name, 40)
         png = os.path.join(STATE_ROOT, name, "peek.png")
         if await asyncio.to_thread(render_screen_png, screen, png):
-            await post(channel_id, f"👀 `{name}` — live screen", [png])
-        else:
-            await post(channel_id, f"👀 `{name}` live screen:\n```\n{screen}\n```")
+            return f"👀 `{name}` — live screen", [png]
+        return f"👀 `{name}` live screen:\n```\n{screen}\n```", None
+
+    async def peek_screen(channel_id, name):
+        """Post a worker's live screen to a channel — used by the 👀 reaction."""
+        text, attachments = await render_peek(name)
+        await post(channel_id, text, attachments)
 
     async def deliver(name, text, message=None, typed=False):
         # Messages go straight in even mid-turn — Claude Code natively queues
@@ -677,7 +673,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     f"⚠️ could not start worker `{name}`: {r.stderr.strip()}"
                 )
                 return
-            # Started — consume any armed !fresh so it only skips resume once.
+            # Started — consume any armed /fresh so it only skips resume once.
             await asyncio.to_thread(disarm_fresh, name)
             # The resume can auto-compact; wait for a genuinely input-ready
             # prompt before pasting, or this waking message is discarded when
@@ -699,111 +695,213 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         composed = compose_inbound(message.content, paths, quote)
         await deliver(name, composed, message, typed=False)
 
-    async def handle_command(message, cmd, args):
-        repo = repo_for_channel(message.channel.id)
-        name = args[0] if args else (repo["name"] if repo else None)
-        if cmd == "status":
-            r = await asyncio.to_thread(_run, ["claude-worker", "list"], 15)
-            await post(message.channel.id, f"```\n{r.stdout}\n```")
-        elif cmd == "fresh" and name:
-            # Shut down now and arm a fresh start: the next message (or start)
-            # begins a brand-new session with no --continue, without having to
-            # resume the old conversation first. The marker survives the stop.
-            await asyncio.to_thread(worker_stop, name)
-            await asyncio.to_thread(arm_fresh, name)
-            await message.channel.send(
-                f"🧼 `{name}` shut down — your next message starts a fresh "
-                "context (no resume)."
+    def repo_by_name(name):
+        return next((x for x in cfg["repos"].values() if x["name"] == name), None)
+
+    # --- command actions (shared by the slash commands below) ---------------
+    # Each returns (text, attachments) so the caller can respond however it
+    # likes; worker restarts block, so their callers defer the interaction.
+    async def do_status():
+        r = await asyncio.to_thread(_run, ["claude-worker", "list"], 15)
+        return f"```\n{r.stdout}\n```", None
+
+    async def do_fresh(name):
+        # Shut down now and arm a fresh start: the next message begins a
+        # brand-new session with no --continue, without resuming first. The
+        # marker survives the stop.
+        await asyncio.to_thread(worker_stop, name)
+        await asyncio.to_thread(arm_fresh, name)
+        return (
+            f"🧼 `{name}` shut down — your next message starts a fresh "
+            "context (no resume).", None,
+        )
+
+    async def do_stop(name):
+        await asyncio.to_thread(worker_stop, name)
+        return f"🛑 stopped `{name}`", None
+
+    async def do_restart(name):
+        repo = repo_by_name(name)
+        if not repo:
+            return f"⚠️ no repo channel mapped for `{name}`", None
+        await asyncio.to_thread(worker_stop, name)
+        r = await asyncio.to_thread(
+            worker_start, name, repo["dir"], channel_for_worker(name), True
+        )
+        # Explicit resume: cancel any armed fresh so it can't re-fire.
+        await asyncio.to_thread(disarm_fresh, name)
+        return (
+            f"🔄 restarted `{name}`" if r.returncode == 0
+            else f"⚠️ restart failed: {r.stderr.strip()}", None,
+        )
+
+    async def do_clear(name):
+        # Deterministic context wipe: a fresh session (no --continue) instead
+        # of the /clear TUI command, so it works regardless of worker state
+        # and re-injects the Discord protocol.
+        repo = repo_by_name(name)
+        if not repo:
+            return f"⚠️ no repo channel mapped for `{name}`", None
+        await asyncio.to_thread(worker_stop, name)
+        r = await asyncio.to_thread(
+            worker_start, name, repo["dir"], channel_for_worker(name), False
+        )
+        await asyncio.to_thread(disarm_fresh, name)
+        return (
+            f"🧹 `{name}` restarted with a fresh context" if r.returncode == 0
+            else f"⚠️ clear failed: {r.stderr.strip()}", None,
+        )
+
+    # --- native Discord slash commands --------------------------------------
+    # Registered as application commands (synced per-guild in on_ready), so
+    # they arrive as interactions — no "!" prefix, and no collision with the
+    # "type any /message into the worker" passthrough for Claude Code commands.
+    tree = discord.app_commands.CommandTree(client)
+    describe = discord.app_commands.describe
+
+    async def guard(interaction, worker):
+        """Authorize + resolve the target worker. Returns the worker name, or
+        None after having already replied with an error."""
+        if interaction.user.id not in cfg["allowed_users"]:
+            await interaction.response.send_message("⛔ not authorized", ephemeral=True)
+            return None
+        name = worker or (
+            repo["name"] if (repo := repo_for_channel(interaction.channel_id)) else None
+        )
+        if not name:
+            await interaction.response.send_message(
+                "⚠️ no worker mapped to this channel — pass `worker`", ephemeral=True
             )
-        elif cmd in ("stop", "restart") and name:
-            await asyncio.to_thread(worker_stop, name)
-            note = f"🛑 stopped `{name}`"
-            if cmd == "restart" and repo:
-                r = await asyncio.to_thread(
-                    worker_start, name, repo["dir"], message.channel.id, True
-                )
-                # Explicit resume: cancel any armed !fresh so it can't re-fire.
-                await asyncio.to_thread(disarm_fresh, name)
-                note = (
-                    f"🔄 restarted `{name}`"
-                    if r.returncode == 0
-                    else f"⚠️ restart failed: {r.stderr.strip()}"
-                )
-            await message.channel.send(note)
-        elif cmd == "screen" and name:
-            await peek_screen(message.channel.id, name)
-        elif cmd == "checkin" and name:
-            await deliver(
-                name,
-                "Ned is asking for a check-in right now: send him 3-5 lines "
-                "of progress (current step, what's left, any blockers) via "
-                "discord-notify, then continue the task.",
-                message,
+            return None
+        return name
+
+    async def reply(interaction, text, attachments=None):
+        files = [
+            discord.File(a) for a in (attachments or []) if os.path.isfile(a)
+        ]
+        await interaction.followup.send(text, files=files)
+
+    @tree.command(name="status", description="List all workers and their state")
+    async def slash_status(interaction):
+        if interaction.user.id not in cfg["allowed_users"]:
+            await interaction.response.send_message("⛔ not authorized", ephemeral=True)
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await do_status())
+
+    @tree.command(name="fresh", description="Shut a worker down; next message starts a fresh session (no resume)")
+    @describe(worker="Worker name (defaults to this channel's worker)")
+    async def slash_fresh(interaction, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await do_fresh(name))
+
+    @tree.command(name="clear", description="Fresh context now: restart the worker without --continue")
+    @describe(worker="Worker name (defaults to this channel's worker)")
+    async def slash_clear(interaction, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await do_clear(name))
+
+    @tree.command(name="stop", description="Stop a worker (state kept; a message revives it)")
+    @describe(worker="Worker name (defaults to this channel's worker)")
+    async def slash_stop(interaction, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await do_stop(name))
+
+    @tree.command(name="restart", description="Restart a worker, resuming its conversation")
+    @describe(worker="Worker name (defaults to this channel's worker)")
+    async def slash_restart(interaction, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await do_restart(name))
+
+    @tree.command(name="screen", description="Peek at a worker's live screen")
+    @describe(worker="Worker name (defaults to this channel's worker)")
+    async def slash_screen(interaction, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await render_peek(name))
+
+    @tree.command(name="checkin", description="Ask a running worker for a progress update")
+    @describe(worker="Worker name (defaults to this channel's worker)")
+    async def slash_checkin(interaction, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await deliver(
+            name,
+            "Ned is asking for a check-in right now: send him 3-5 lines of "
+            "progress (current step, what's left, any blockers) via "
+            "discord-notify, then continue the task.",
+        )
+        await interaction.followup.send(f"📨 asked `{name}` for a check-in")
+
+    @tree.command(name="model", description="Switch a worker's model")
+    @describe(model="e.g. opus, sonnet, haiku", worker="Worker (defaults to this channel's worker)")
+    async def slash_model(interaction, model: str, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await deliver(name, f"/model {model}", typed=True)
+        await interaction.followup.send(f"🔧 sent `/model {model}` to `{name}`")
+
+    @tree.command(name="compact", description="Compact a worker's context")
+    @describe(focus="Optional focus for the compaction", worker="Worker (defaults to this channel's worker)")
+    async def slash_compact(interaction, focus: str = None, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await deliver(name, "/compact" + (f" {focus}" if focus else ""), typed=True)
+        await interaction.followup.send(f"🗜️ compacting `{name}`")
+
+    @tree.command(name="addrepo", description="Create a Discord channel and map a repo to a worker")
+    @describe(name="Worker/channel name", path="Absolute path to the repo")
+    async def slash_addrepo(interaction, name: str, path: str):
+        if interaction.user.id not in cfg["allowed_users"]:
+            await interaction.response.send_message("⛔ not authorized", ephemeral=True)
+            return
+        directory = os.path.expanduser(path)
+        if not os.path.isdir(directory):
+            await interaction.response.send_message(
+                f"⚠️ no such directory: {directory}", ephemeral=True
             )
-        elif cmd == "model" and args:
-            # !model <model> [worker] — args[0] is the model, so the generic
-            # name-from-args[0] above doesn't apply here.
-            target = args[1] if len(args) > 1 else (repo["name"] if repo else None)
-            if not target:
-                await message.channel.send("⚠️ usage: !model <model> [worker]")
-                return
-            await deliver(target, f"/model {args[0]}", message, typed=True)
-        elif cmd == "clear" and name:
-            # Deterministic context wipe: a fresh session (no --continue)
-            # instead of the /clear TUI command, so it works regardless of
-            # the worker's state and re-injects the Discord protocol.
-            target_repo = next(
-                (x for x in cfg["repos"].values() if x["name"] == name), None
-            )
-            if not target_repo:
-                await message.channel.send(f"⚠️ no repo channel mapped for `{name}`")
-                return
-            await asyncio.to_thread(worker_stop, name)
-            r = await asyncio.to_thread(
-                worker_start, name, target_repo["dir"], channel_for_worker(name), False
-            )
-            await asyncio.to_thread(disarm_fresh, name)
-            await message.channel.send(
-                f"🧹 `{name}` restarted with a fresh context"
-                if r.returncode == 0
-                else f"⚠️ clear failed: {r.stderr.strip()}"
-            )
-        elif cmd == "compact" and name:
-            await deliver(name, "/compact", message, typed=True)
-        elif cmd == "addrepo" and len(args) == 2:
-            repo_name, path = args[0], os.path.expanduser(args[1])
-            if not os.path.isdir(path):
-                await message.channel.send(f"⚠️ no such directory: {path}")
-                return
-            category = client.get_channel(int(cfg["category_id"]))
-            channel = await message.guild.create_text_channel(
-                repo_name, category=category
-            )
-            cfg["repos"][str(channel.id)] = {"name": repo_name, "dir": path}
-            save_config(cfg, config_path)
-            await message.channel.send(
-                f"✅ created {channel.mention} → `{path}` (worker `{repo_name}`)"
-            )
-        else:
-            await message.channel.send(
-                "commands: !status · !checkin [name] · !model <model> [name] · "
-                "!clear [name] · !fresh [name] · !compact [name] · !stop [name] · "
-                "!restart [name] · !screen [name] · !addrepo <name> <path> — "
-                "or type any /slash-command to run it in the worker"
-            )
+            return
+        await interaction.response.defer(thinking=True)
+        category = client.get_channel(int(cfg["category_id"]))
+        channel = await interaction.guild.create_text_channel(name, category=category)
+        cfg["repos"][str(channel.id)] = {"name": name, "dir": directory}
+        save_config(cfg, config_path)
+        await interaction.followup.send(
+            f"✅ created {channel.mention} → `{directory}` (worker `{name}`)"
+        )
 
     @client.event
     async def on_ready():
+        # Copy the globally-defined commands into each guild and sync there:
+        # guild syncs are instant, so the slash menu is usable right away.
+        synced = 0
+        for guild in client.guilds:
+            try:
+                tree.copy_global_to(guild=guild)
+                synced = len(await tree.sync(guild=guild))
+            except discord.HTTPException as e:
+                print(f"[bridge] slash sync failed for {guild.name} "
+                      f"(bot missing the applications.commands scope?): {e}")
         print(f"[bridge] connected to Discord as {client.user} "
-              f"({len(cfg['repos'])} repo channel(s) mapped)")
+              f"({len(cfg['repos'])} repo channel(s) mapped, {synced} slash command(s))")
 
     @client.event
     async def on_message(message):
+        # Control verbs are native slash commands (interactions, handled by the
+        # command tree) — plain messages are always worker input.
         if message.author.bot or message.author.id not in cfg["allowed_users"]:
-            return
-        parsed = parse_command(message.content)
-        if parsed:
-            await handle_command(message, *parsed)
             return
         repo = repo_for_channel(message.channel.id)
         if repo:
@@ -819,7 +917,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return
         if before.content == after.content or not after.content.strip():
             return
-        if parse_command(after.content) or after.content.startswith("/"):
+        if after.content.startswith("/"):
             return
         repo = repo_for_channel(after.channel.id)
         if not repo:
@@ -898,7 +996,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 print(f"[bridge] {name}: turn ended, posting "
                       f"{len(reply) if reply else 0} chars to {channel_id}")
                 if not reply:
-                    reply = "(no new reply text captured — use !screen)"
+                    reply = "(no new reply text captured — use /screen)"
                 await post(channel_id, reply)
         elif etype == "claude.bridge.addrepo":
             repo_name = (event.get("name") or "").strip()

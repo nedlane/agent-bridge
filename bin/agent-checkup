@@ -62,7 +62,7 @@ fi
 if [[ -r "$bridge_cfg" ]]; then
   pass "bridge config present ($bridge_cfg)"
 else
-  warn "no bridge config ($bridge_cfg) — no repo channels are mapped yet (!addrepo, or see the claude-bridge skill)"
+  warn "no bridge config ($bridge_cfg) — no repo channels are mapped yet (/addrepo, or see the claude-bridge skill)"
 fi
 if systemctl --user is-active claude-bridge >/dev/null 2>&1; then
   pass "claude-bridge service active"
@@ -111,9 +111,9 @@ cat <<'MANUAL'
  - Hooks: confirm ~/.claude/settings.json registers claude-worker-todo-relay
    (PostToolUse: TodoWrite|TaskCreate|TaskUpdate) and claude-worker-done-relay
    (Stop) — snippets in docs/agent-control-plane.md.
- - Discord intents: the bot needs Message Content (and Manage Channels for
-   !addrepo) in the developer portal.
- - First smoke test: map a repo with !addrepo, message its channel, and
+ - Discord intents: the bot needs Message Content (and Manage Channels, and
+   the applications.commands scope for the /addrepo slash command) in the developer portal.
+ - First smoke test: map a repo with /addrepo, message its channel, and
    confirm the worker's reply lands back in the same channel.
 MANUAL
 
