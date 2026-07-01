@@ -83,6 +83,16 @@ is_ready() {
     && ! is_busy "$1" && ! is_trust_dialog "$1" && ! is_resume_dialog "$1"
 }
 
+# The input box is the LAST screen line beginning with the "❯" prompt. A
+# submitted message also echoes as a "❯ ..." history line above it, so tail -1
+# is what isolates the live box.
+input_line() { screen_of "$1" | grep '^❯' | tail -1 || true; }
+# A multi-line (or long) bracketed paste does NOT echo its text into the box —
+# the composer collapses it to a chip like "❯ [Pasted text #1 +17 lines]". So
+# submission has to be judged by the chip's presence/absence, not by matching
+# the message text back on the prompt line.
+is_paste_chip() { grep -qE '\[Pasted text #[0-9]+' <<<"$1"; }
+
 # wait_until <name> <timeout> [text] — poll the worker's screen until it is
 # idle at its prompt (or [text] appears). Auto-dismisses the startup dialogs
 # that gate the prompt: the folder-trust dialog (the orchestrator chose the
@@ -237,35 +247,51 @@ cmd_send() {
   # Stage the message as a bracketed paste so multi-line text stays one
   # message instead of submitting at the first newline (--type instead sends
   # literal keystrokes so the TUI sees a typed /slash-command). Submission is
-  # then verified in two phases against the input box (the last "❯" line; the
-  # echoed history copy never starts with "❯"):
-  #   Phase 1 — confirm the text actually LANDED: its probe must appear in the
-  #             input box. A booting/compacting TUI silently drops input, so an
-  #             empty/absent prompt here means NOT submitted — never a success.
-  #   Phase 2 — submit and confirm it LEFT the box. The TUI sometimes swallows
-  #             keys right after a turn ends, so retry Enter a few times.
+  # then verified in two phases against the input box (input_line):
+  #   Phase 1 — confirm the message LANDED: the box shows the probe text
+  #             (typed / single-line paste) OR a paste chip (multi-line paste,
+  #             whose text never echoes). An empty box means a booting/
+  #             compacting TUI silently dropped the input — never a success.
+  #   Phase 2 — settle, then submit and confirm it LEFT the box (no chip, no
+  #             probe). The TUI can swallow a key at a turn boundary, so retry.
+  local probe attempt line landed=0
+  probe="${text%%$'\n'*}"
+  probe="${probe:0:40}"
   if (( typed )); then
     tmux send-keys -t "$pane" -l "$text"
   else
+    # Clear any leftover paste chip first so a re-send never stacks pastes
+    # ("[Pasted #1][Pasted #2]"). A single Ctrl-C clears a non-empty composer;
+    # it only begins Claude's exit countdown when the box is ALREADY empty, so
+    # gating on a visible chip keeps this safe (never the double Ctrl-C that
+    # quits Claude Code).
+    if is_paste_chip "$(input_line "$name")"; then
+      tmux send-keys -t "$pane" C-c
+      sleep "$SEND_DELAY"
+    fi
     printf '%s' "$text" | tmux load-buffer -b claude-worker-send -
     tmux paste-buffer -p -d -b claude-worker-send -t "$pane"
   fi
-  local probe attempt last_prompt landed=0
-  probe="${text%%$'\n'*}"
-  probe="${probe:0:40}"
   for attempt in 1 2 3 4 5 6; do
     sleep "$SEND_DELAY"
-    last_prompt="$(screen_of "$name" | grep '^❯' | tail -1 || true)"
-    [[ -n "$probe" && "$last_prompt" == *"$probe"* ]] && { landed=1; break; }
+    line="$(input_line "$name")"
+    if is_paste_chip "$line" || { [[ -n "$probe" && "$line" == *"$probe"* ]]; }; then
+      landed=1; break
+    fi
   done
   (( landed )) || die "message never reached the input box of worker '$name' (still booting/compacting? claude-worker read $name)"
-  for attempt in 1 2 3 4; do
+  # Let the bracketed-paste end-sequence settle before the first Enter, or the
+  # TUI can absorb it into the paste and the chip never submits.
+  sleep "$SEND_DELAY"
+  for attempt in 1 2 3 4 5; do
     tmux send-keys -t "$pane" Enter
     sleep "$SEND_DELAY"
-    last_prompt="$(screen_of "$name" | grep '^❯' | tail -1 || true)"
-    [[ "$last_prompt" == *"$probe"* ]] || return 0
+    line="$(input_line "$name")"
+    if ! is_paste_chip "$line" && { [[ -z "$probe" || "$line" != *"$probe"* ]]; }; then
+      return 0
+    fi
   done
-  die "message did not submit to worker '$name' after $attempt attempts (claude-worker read $name to inspect)"
+  die "message did not submit to worker '$name' after $attempt Enter attempts; the input box still holds it (claude-worker read $name to inspect)"
 }
 
 cmd_read() {
