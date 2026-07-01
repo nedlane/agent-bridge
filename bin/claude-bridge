@@ -27,7 +27,9 @@ on connect). The `worker` option defaults to the channel's mapped worker:
   /stop /restart /screen [worker]
   /model <model> [worker]  switch the worker's model
   /clear [worker]          fresh context now: restart without --continue
-  /fresh [worker]          shut down + fresh next start (no resume, lazy)
+                           (also wipes the channel's messages)
+  /fresh [worker]          shut down + fresh next start (no resume, lazy;
+                           also wipes the channel's messages)
   /compact [focus] [worker] compact the worker's context
   /checkin [worker]        ask a running worker for a progress update
   /addrepo <name> <path>   create #<name> under the category + map it
@@ -341,6 +343,19 @@ def compose_edit(content):
     return f"[Ned edited his previous message — it now reads:]\n\n{content}"
 
 
+def purge_suffix(deleted, note=None):
+    """Trailing clause for a /clear or /fresh confirmation describing the
+    channel cleanup: how many messages went, plus any blocker hint. Empty when
+    a clean run deleted nothing (nothing to say)."""
+    if note:
+        if deleted:
+            return f" — cleared {deleted} message{'s' if deleted != 1 else ''}, but {note}"
+        return f" — couldn't clear the channel: {note}"
+    if deleted:
+        return f" — cleared {deleted} message{'s' if deleted != 1 else ''}"
+    return ""
+
+
 def reply_preview(body, limit=200):
     """One-line, length-capped snippet of a replied-to message (or None)."""
     body = (body or "").strip().replace("\n", " ")
@@ -572,6 +587,34 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     except discord.HTTPException:
                         pass
 
+    async def purge_channel(channel_id):
+        """Delete a worker channel's messages (Ned's and the bot's) to clear
+        clutter when the context is wiped (/clear, /fresh). Returns
+        (deleted, note): the count removed and a human hint if something
+        blocked it (None on clean success). Best-effort — needs the bot's
+        Manage Messages permission, and Discord only bulk-deletes messages
+        under 14 days old, so the bulk=False pass sweeps up the rest one at a
+        time. Never raises into the caller; callers run mid-interaction and
+        must not die if a delete is refused."""
+        channel = client.get_channel(channel_id) if channel_id else None
+        if channel is None:
+            return 0, None
+        deleted, note = 0, None
+        for bulk in (True, False):
+            try:
+                # bulk=True clears everything under 14 days in one shot;
+                # bulk=False then removes anything older, one message at a time.
+                deleted += len(await channel.purge(limit=None, bulk=bulk))
+            except discord.Forbidden:
+                note = "bot needs the **Manage Messages** permission to clean up"
+                break
+            except discord.HTTPException as e:
+                print(f"[bridge] purge (bulk={bulk}) failed for {channel_id}: {e}")
+                note = "some messages couldn't be deleted"
+        if deleted:
+            print(f"[bridge] purged {deleted} message(s) from channel {channel_id}")
+        return deleted, note
+
     async def render_peek(name):
         """Build a worker's live-screen payload as (text, attachments): an
         image (falls back to a code block if rendering is unavailable). Shared
@@ -711,9 +754,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # marker survives the stop.
         await asyncio.to_thread(worker_stop, name)
         await asyncio.to_thread(arm_fresh, name)
+        # A fresh context deserves a fresh channel — wipe the old chatter.
+        purged, note = await purge_channel(channel_for_worker(name))
         return (
             f"🧼 `{name}` shut down — your next message starts a fresh "
-            "context (no resume).", None,
+            f"context (no resume).{purge_suffix(purged, note)}", None,
         )
 
     async def do_stop(name):
@@ -742,15 +787,17 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         repo = repo_by_name(name)
         if not repo:
             return f"⚠️ no repo channel mapped for `{name}`", None
+        channel_id = channel_for_worker(name)
         await asyncio.to_thread(worker_stop, name)
         r = await asyncio.to_thread(
-            worker_start, name, repo["dir"], channel_for_worker(name), False
+            worker_start, name, repo["dir"], channel_id, False
         )
         await asyncio.to_thread(disarm_fresh, name)
-        return (
-            f"🧹 `{name}` restarted with a fresh context" if r.returncode == 0
-            else f"⚠️ clear failed: {r.stderr.strip()}", None,
-        )
+        if r.returncode != 0:
+            return f"⚠️ clear failed: {r.stderr.strip()}", None
+        # Wiped the worker's context — wipe the channel's clutter to match.
+        purged, note = await purge_channel(channel_id)
+        return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
 
     # --- native Discord slash commands --------------------------------------
     # Registered as application commands (synced per-guild in on_ready), so
@@ -789,7 +836,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await do_status())
 
-    @tree.command(name="fresh", description="Shut a worker down; next message starts a fresh session (no resume)")
+    @tree.command(name="fresh", description="Shut a worker down + wipe the channel; next message starts fresh (no resume)")
     @describe(worker="Worker name (defaults to this channel's worker)")
     async def slash_fresh(interaction, worker: str = None):
         if not (name := await guard(interaction, worker)):
@@ -797,7 +844,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await do_fresh(name))
 
-    @tree.command(name="clear", description="Fresh context now: restart the worker without --continue")
+    @tree.command(name="clear", description="Fresh context now + wipe the channel: restart the worker without --continue")
     @describe(worker="Worker name (defaults to this channel's worker)")
     async def slash_clear(interaction, worker: str = None):
         if not (name := await guard(interaction, worker)):
