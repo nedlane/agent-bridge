@@ -58,6 +58,13 @@ SECRET_FILE = os.path.expanduser(
         "CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE", "~/.config/claude-workers/bridge-webhook"
     )
 )
+STATE_ROOT = os.path.expanduser(
+    os.environ.get("CLAUDE_WORKERS_STATE", "~/.local/state/claude-workers")
+)
+
+# React with this on any message in a worker channel to have the bridge post
+# that worker's live TUI screen — an eyes-on peek with no command to type.
+PEEK_EMOJI = "👀"
 
 DISCORD_LIMIT = 2000
 REPLY_CAP = 8000
@@ -75,7 +82,8 @@ Discord channel automatically:
   discord-notify "short message"        # or pipe a longer body: ... | discord-notify -
   discord-notify -i screenshot.png "caption"   # attach an image/file (repeatable)
 Do NOT run `discord-notify --help` just to inspect it (it prints usage and
-sends nothing, but the syntax you need is right here).
+sends nothing, but the syntax you need is right here). Files Ned attaches in
+Discord arrive to you as local file paths to read off disk.
 Message him ONLY when one of these happens:
   1. The task is complete - send a concise result summary.
   2. You are blocked on a question or decision only Ned can answer - ask it,
@@ -312,6 +320,42 @@ def tag_inbound(text, typed=False):
     return f"{DISCORD_TAG}\n\n{text}"
 
 
+def compose_inbound(text, attachment_paths=None, reply_quote=None):
+    """Assemble what actually gets delivered to the worker's TUI.
+
+    A quoted snippet of the message being replied to (if any) goes first, then
+    the message text, then a footer listing any downloaded attachment paths so
+    Claude can open them off disk. Any part may be empty.
+    """
+    parts = []
+    if reply_quote:
+        parts.append(f"(replying to: {reply_quote})")
+    if text:
+        parts.append(text)
+    paths = list(attachment_paths or [])
+    if paths:
+        listed = "\n".join(f"  - {p}" for p in paths)
+        noun = "file" if len(paths) == 1 else "files"
+        parts.append(
+            f"[Ned attached {len(paths)} {noun} — read {'it' if len(paths) == 1 else 'them'} "
+            f"from disk:\n{listed}]"
+        )
+    return "\n\n".join(parts)
+
+
+def compose_edit(content):
+    """Frame an edited Discord message as a steering note for a live worker."""
+    return f"[Ned edited his previous message — it now reads:]\n\n{content}"
+
+
+def reply_preview(body, limit=200):
+    """One-line, length-capped snippet of a replied-to message (or None)."""
+    body = (body or "").strip().replace("\n", " ")
+    if not body:
+        return None
+    return body[:limit] + ("…" if len(body) > limit else "")
+
+
 # --------------------------------------------------------------------------
 # claude-worker subprocess wrappers (sync; called via asyncio.to_thread)
 # --------------------------------------------------------------------------
@@ -403,6 +447,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     intents = discord.Intents.default()
     intents.message_content = True
+    intents.reactions = True
     client = discord.Client(intents=intents)
 
     last_activity = {}  # worker name -> epoch seconds
@@ -469,15 +514,26 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 print(f"[bridge] attachment not found, skipping: {path!r}")
         chunks = split_message(text) if text else []
         # Send the files alongside the final text chunk so an image and its
-        # caption arrive together; if there's no text, post the files alone.
-        if not chunks and files:
-            await channel.send(files=files)
-            return
-        for i, chunk in enumerate(chunks):
-            if files and i == len(chunks) - 1:
-                await channel.send(chunk, files=files)
-            else:
-                await channel.send(chunk)
+        # caption arrive together; if there's no text, post the files alone. A
+        # rejected upload (too large, gone) must not crash the event handler.
+        try:
+            if not chunks and files:
+                await channel.send(files=files)
+                return
+            for i, chunk in enumerate(chunks):
+                if files and i == len(chunks) - 1:
+                    await channel.send(chunk, files=files)
+                else:
+                    await channel.send(chunk)
+        except discord.HTTPException as e:
+            print(f"[bridge] channel {channel_id} send failed: {e}")
+            if files:
+                # Salvage the text so the caption isn't lost with the upload.
+                for chunk in chunks:
+                    try:
+                        await channel.send(chunk)
+                    except discord.HTTPException:
+                        pass
 
     async def deliver(name, text, message=None, typed=False):
         # Messages go straight in even mid-turn — Claude Code natively queues
@@ -515,6 +571,41 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if message:
             await message.add_reaction("⏳" if busy else "✅")
 
+    async def save_attachments(name, message):
+        """Download a message's Discord attachments into the worker's inbox
+        dir and return their local paths, so Claude can Read them off disk."""
+        if not message.attachments:
+            return []
+        inbox = os.path.join(STATE_ROOT, name, "inbox")
+        try:
+            os.makedirs(inbox, exist_ok=True)
+        except OSError as e:
+            print(f"[bridge] {name}: cannot create inbox {inbox}: {e}")
+            return []
+        paths = []
+        for att in message.attachments:
+            safe = os.path.basename(att.filename or "").strip() or "file"
+            dest = os.path.join(inbox, f"{message.id}-{safe}")
+            try:
+                await att.save(dest)
+                paths.append(dest)
+            except (discord.HTTPException, OSError) as e:
+                print(f"[bridge] {name}: failed to save {att.filename!r}: {e}")
+        return paths
+
+    async def reply_snippet(message):
+        """A short quote of the message this one is replying to, or None."""
+        ref = message.reference
+        if ref is None:
+            return None
+        src = ref.resolved
+        if src is None and ref.message_id:
+            try:
+                src = await message.channel.fetch_message(ref.message_id)
+            except discord.HTTPException:
+                return None
+        return reply_preview(getattr(src, "content", "") if src else "")
+
     async def handle_repo_message(message, repo):
         name, directory = repo["name"], repo["dir"]
         if not await asyncio.to_thread(worker_alive, name):
@@ -538,9 +629,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 )
                 return
         # Leading "/" means a Claude Code slash command — type it so the TUI
-        # actually executes it instead of treating it as pasted text.
-        await deliver(name, message.content, message,
-                      typed=message.content.startswith("/"))
+        # actually executes it instead of treating it as pasted text. Commands
+        # go verbatim; everything else can carry a reply quote and attachments.
+        if message.content.startswith("/"):
+            await deliver(name, message.content, message, typed=True)
+            return
+        paths = await save_attachments(name, message)
+        quote = await reply_snippet(message)
+        composed = compose_inbound(message.content, paths, quote)
+        await deliver(name, composed, message, typed=False)
 
     async def handle_command(message, cmd, args):
         repo = repo_for_channel(message.channel.id)
@@ -639,6 +736,46 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         repo = repo_for_channel(message.channel.id)
         if repo:
             await handle_repo_message(message, repo)
+
+    @client.event
+    async def on_message_edit(before, after):
+        # Relay an edit as a steering note so a live worker sees the correction
+        # instead of acting on stale text. Ignore no-op edits (Discord fires
+        # this when it attaches a link embed) and edits to a stopped worker —
+        # the next fresh message resumes that conversation anyway.
+        if after.author.bot or after.author.id not in cfg["allowed_users"]:
+            return
+        if before.content == after.content or not after.content.strip():
+            return
+        if parse_command(after.content) or after.content.startswith("/"):
+            return
+        repo = repo_for_channel(after.channel.id)
+        if not repo:
+            return
+        name = repo["name"]
+        if not await asyncio.to_thread(worker_alive, name):
+            return
+        await deliver(name, compose_edit(after.content), after, typed=False)
+
+    @client.event
+    async def on_raw_reaction_add(payload):
+        # React with 👀 on any message in a worker channel to peek at that
+        # worker's live screen — observability with no command to type.
+        if payload.user_id not in cfg["allowed_users"]:
+            return
+        if payload.member and payload.member.bot:
+            return
+        if str(payload.emoji) != PEEK_EMOJI:
+            return
+        repo = repo_for_channel(payload.channel_id)
+        if not repo:
+            return
+        name = repo["name"]
+        if not await asyncio.to_thread(worker_alive, name):
+            await post(payload.channel_id, f"👀 `{name}` isn't running right now.")
+            return
+        screen = await asyncio.to_thread(worker_screen, name, 40)
+        await post(payload.channel_id, f"👀 `{name}` live screen:\n```\n{screen}\n```")
 
     # ---- localhost event listener (Stop hook + relays post here) ----------
     async def handle_event(request):
