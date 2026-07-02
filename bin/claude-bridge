@@ -1470,17 +1470,20 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     @client.event
     async def on_raw_reaction_add(payload):
-        # Owner-only: 👀 peeks at a worker's screen; 👁️/✏️/❌ on a #requests
-        # card decides an access request.
-        if payload.user_id not in cfg["allowed_users"]:
-            return
+        # 👀 peeks at a worker's screen; 👁️/✏️/❌ on a #requests card decides an
+        # access request. Peek is scoped like a normal message (owner anywhere,
+        # a channel's collaborators in their own channel); request-card
+        # decisions stay owner-only.
         if payload.member and payload.member.bot:
             return
         if str(payload.channel_id) == str(cfg.get("requests_channel")) and \
                 str(payload.emoji) in (VIEW_EMOJI, EDIT_EMOJI, DENY_EMOJI):
-            await handle_request_reaction(payload)
+            if payload.user_id in cfg.get("allowed_users", []):
+                await handle_request_reaction(payload)
             return
         if str(payload.emoji) != PEEK_EMOJI:
+            return
+        if not channel_allows(cfg, payload.channel_id, payload.user_id):
             return
         repo = repo_for_channel(payload.channel_id)
         if not repo:
