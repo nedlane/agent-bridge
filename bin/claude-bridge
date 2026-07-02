@@ -232,12 +232,17 @@ def profile_args(profile, profile_dir=None):
                its tools are pre-approved so a guest never hits a permission
                prompt they can't answer over Discord. A calendar-only assistant
                with nowhere to wander.
-    collab  -> normal dev tools, but a settings file adds deny-guardrails
-               (no sudo, no ~/.ssh, no bridge/creds dirs). Confinement is the
-               dedicated checkout the worker runs in (repo dir), not a jail.
+    collab  -> full trust, same as owner. A collab worker is a *trusted*
+               collaborator driving Claude over Discord, where nobody can
+               answer an interactive permission dialog — so it bypasses prompts
+               (claude-launch's default --dangerously-skip-permissions) rather
+               than wedging on one. Granting collab is equivalent to giving
+               that person shell access as the host user; confinement, if you
+               want it, is the dedicated checkout the worker runs in, not a
+               permission jail.
     """
     profile_dir = profile_dir or PROFILE_DIR
-    if not profile or profile == "owner":
+    if not profile or profile in ("owner", "collab"):
         return []
     settings = os.path.join(profile_dir, f"{profile}.settings.json")
     # --enforce-perms turns OFF --dangerously-skip-permissions in claude-launch
@@ -263,12 +268,6 @@ def profile_args(profile, profile_dir=None):
             "--mcp-config", os.path.join(profile_dir, "greeter.mcp.json"),
             "--strict-mcp-config",
             "--permission-mode", "default",
-            "--settings", settings,
-        ]
-    if profile == "collab":
-        return [
-            "--enforce-perms",
-            "--permission-mode", "acceptEdits",
             "--settings", settings,
         ]
     return []
@@ -847,8 +846,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 print(f"[bridge] {name}: send wedged, restarting worker to recover")
                 await asyncio.to_thread(worker_stop, name)
                 # Carry the channel's capability profile through the restart —
-                # omitting it would silently relaunch a restricted (collab /
-                # utility / greeter) worker as full-trust owner.
+                # omitting it would silently relaunch a restricted (utility /
+                # greeter) worker as full-trust owner.
                 r2 = await asyncio.to_thread(
                     worker_start, name, repo["dir"], channel_id, True,
                     repo.get("profile", "owner"),

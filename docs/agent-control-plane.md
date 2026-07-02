@@ -177,7 +177,7 @@ cloud-provider billing.
 
 | Flag | Meaning |
 |---|---|
-| `--enforce-perms` | Turns **off** `--dangerously-skip-permissions`, so the settings-file allow/deny rules actually apply. Every non-owner profile sets this; without it, bypass mode would ignore every guardrail. |
+| `--enforce-perms` | Turns **off** `--dangerously-skip-permissions`, so the settings-file allow/deny rules actually apply. The `utility` and `greeter` profiles set this; `owner` and `collab` do not (both are full trust and bypass prompts). |
 | `--tools <list>` | Restrict which built-in tools are available (empty string = none). |
 | `--mcp-config <file>` | Load a specific MCP server config for the profile. |
 | `--strict-mcp-config` | Use only the given MCP config, ignoring any others. |
@@ -186,10 +186,10 @@ cloud-provider billing.
 | `--permission-mode <mode>` | Set the permission mode (`default`, `acceptEdits`, …). |
 
 These map directly onto the profiles in `claude-profiles/` (owner / collab /
-utility / greeter): `owner` passes no extra flags (full trust); the others
-combine `--enforce-perms`, `--settings`, `--permission-mode`, and — for the
-sandboxed profiles — `--mcp-config`/`--strict-mcp-config`/`--allowedTools`/
-`--tools`.
+utility / greeter): `owner` and `collab` pass no extra flags (both full trust);
+the restricted profiles (`utility`, `greeter`) combine `--enforce-perms`,
+`--settings`, `--permission-mode`, and `--mcp-config`/`--strict-mcp-config`/
+`--allowedTools`/`--tools`.
 
 ## 5. Verify
 
