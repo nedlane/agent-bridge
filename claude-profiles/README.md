@@ -9,7 +9,7 @@ Each Discord channel maps to a worker launched with one of these **profiles**
 |-----------|--------------|-----------------------|
 | `owner`   | You          | Everything. Full trust, primary tree. Default; adds no flags. |
 | `utility` | any guest    | **Only** the profile's MCP server(s). No built-in tools at all. |
-| `collab`  | trusted collaborator | Full dev tools + shell to work in a repo; deny-list guards mistakes, not the person. |
+| `collab`  | trusted collaborator | Full trust, same as `owner` — bypasses permission prompts so it never wedges. Grant only to people you'd give shell access. |
 | `greeter` | **public**   | Locked down: converse in `#welcome` and file access requests, nothing else. |
 
 > **These profiles require `claude-launch`.** The flags below
@@ -20,9 +20,9 @@ Each Discord channel maps to a worker launched with one of these **profiles**
 > allow/deny rules actually take effect. See the top-level README's
 > "About `claude-launch`" section.
 
-## ⚠️ You MUST rewrite the deny-list paths before enabling a guest profile
+## ⚠️ You MUST rewrite the deny-list paths before enabling the greeter
 
-The `deny` rules in `collab.settings.json` and `greeter.settings.json` are
+The `deny` rules in `greeter.settings.json` are
 **absolute paths into the original maintainer's home directory**, e.g.:
 
 ```json
@@ -35,10 +35,10 @@ worker's working directory). Those paths point at `/home/nedlane/...`.
 
 **If you clone this and don't change them, the deny rules match nothing on your
 machine.** They silently become a no-op, and the (already policy-only)
-guardrails protect nothing. Before you enable a `collab` or `greeter` guest,
-rewrite every `//home/nedlane/...` path to your own `$HOME` (keep the leading
-`//`). Double-check with `jq '.permissions.deny' collab.settings.json` that the
-paths name *your* `.ssh`, credential stores, `~/.claude`, and any tree you want
+guardrails protect nothing. Before you enable the public `greeter`, rewrite
+every `//home/nedlane/...` path to your own `$HOME` (keep the leading `//`).
+Double-check with `jq '.permissions.deny' greeter.settings.json` that the paths
+name *your* `.ssh`, credential stores, `~/.claude`, and any tree you want
 off-limits.
 
 ## `owner`
@@ -63,33 +63,24 @@ has no tools.
 
 ## `collab` (a trusted collaborator on a repo)
 
-`collab` is meant to be **powerful** — an approved collaborator gets the normal
-dev toolset and a shell so they can actually do the work.
-`collab.settings.json` allows `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Bash`,
-`WebSearch`, `WebFetch`, and `Task` (subagents) with `defaultMode: acceptEdits`,
-while denying `sudo`/`su`, raw-shell network fetches (`curl`, `wget`), and
-reads/edits of `~/.ssh`, `~/.aws`, `gh` config, the
-`claude-workers`/`claude-bridge` config dirs, `~/.claude`, and the dotfiles tree.
-
-> **Why the allow-list must cover everything a collaborator uses.** A
-> Discord-driven worker can't answer an interactive permission dialog, and
-> `acceptEdits` only auto-approves *edits* — so any tool that is neither
-> explicitly allowed nor denied stalls the worker on a "Do you want to proceed?"
-> prompt nobody can answer. That is why the research tools (`WebSearch`,
-> `WebFetch`) and `Task` are allowed outright rather than left to prompt. When
-> extending `collab`, add new tools to the allow-list (or the deny-list) — never
-> leave them to a prompt.
+`collab` is **full trust — identical in capability to `owner`.** An approved
+collaborator gets the entire toolset with **no permission prompts at all**: the
+profile adds no flags, so the worker inherits `claude-launch`'s default
+`--dangerously-skip-permissions`. This is deliberate. A `collab` worker is
+driven over Discord, where **nobody can answer an interactive "Do you want to
+proceed?" dialog** — so any prompt would wedge the worker indefinitely. Rather
+than maintain an allow-list that must anticipate every tool a collaborator might
+reach (and wedge the moment it misses one), `collab` simply bypasses prompts.
 
 Be clear about what this is — by design:
 
-- It is a **policy jail, not a kernel jail**: the deny-list guards against
-  *mistakes*, not against the person you granted access to. Because `collab`
-  grants `Bash`, a determined user has many ways around a pattern-matched
-  deny-list — so it is **guardrails, not a sandbox or a credential boundary.**
+- There is **no policy jail** and no deny-list. `collab` has the same
+  filesystem and shell reach as you do; it can read `~/.ssh`, run `sudo`, touch
+  the dotfiles tree — anything the host user can.
 - That's intended. `collab` is only handed out by an explicit owner action
-  (`/addguest`, or approving a request card), so **granting it is like giving
-  that person shell access as your user** — grant it accordingly, to people you
-  trust to work in the repo.
+  (`/addguest`, or approving a request card), so **granting it is exactly like
+  giving that person a shell as your user** — grant it accordingly, only to
+  people you trust with full access.
 - Optionally point the channel at a dedicated checkout
   (`~/guest-workspaces/<channel>`) to keep a collaborator out of your primary
   tree; the bridge warns when you add an editing guest to a channel whose `dir`

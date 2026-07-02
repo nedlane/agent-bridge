@@ -59,12 +59,13 @@ is not bundled here.** Be aware, honestly:
 
 - **Without `claude-launch` on PATH, workers cannot start.** `claude-worker
   start` fails fast with `claude-launch not found`.
-- The non-owner capability profiles pass `claude-launch`-specific flags that
+- The restricted capability profiles pass `claude-launch`-specific flags that
   stock `claude` does **not** accept — `--enforce-perms`, `--tools`,
   `--mcp-config`, `--strict-mcp-config`, `--allowedTools`, `--settings`, and
-  `--append-system-prompt`. So the `collab`, `utility`, and `greeter` profiles
-  **require `claude-launch`**; only the `owner` profile (which adds no flags)
-  could work against a stock `claude` binary via a shim, and even then the
+  `--append-system-prompt`. So the `utility` and `greeter` profiles
+  **require `claude-launch`**; the `owner` and `collab` profiles (both full
+  trust, adding no flags) could work against a stock `claude` binary via a shim,
+  and even then the
   Discord protocol is injected with `--append-system-prompt`.
 
 If you don't have `claude-launch`, you'll need to supply your own wrapper on

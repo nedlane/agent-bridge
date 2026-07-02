@@ -21,8 +21,9 @@ two trust tiers, and they are deliberately different:
 
 - **Owner-approved workers** (`owner` / `collab` / `utility`) only ever run for
   people you have explicitly authorized — you map the channel and grant the
-  access yourself. These are meant to be *capable*; the guardrails guard against
-  mistakes, not against a person you chose to trust.
+  access yourself. `owner` and `collab` are **full trust** (they bypass
+  permission prompts so a Discord-driven worker never wedges); `utility` is the
+  narrow, MCP-only exception. Grant `collab` only to people you'd give a shell.
 - **The public `#welcome` greeter** is the only surface any server member can
   reach without your approval, so it is the one that is locked down hard.
 
@@ -37,18 +38,19 @@ is as privileged as the person who started the bridge.
 ### Capability profiles are a policy jail, not a kernel jail
 
 Each guest channel maps to a worker launched with a capability profile
-(`owner` / `collab` / `utility` / `greeter`). These profiles constrain the
-agent through Claude Code's own permission system (allow/deny lists, tool
-restrictions) — they are **policy enforcement inside the agent, not an
-OS-level sandbox**.
+(`owner` / `collab` / `utility` / `greeter`). Where a profile *does* constrain
+the agent (`utility`, `greeter`), it does so through Claude Code's own
+permission system (allow/deny lists, tool restrictions) — this is **policy
+enforcement inside the agent, not an OS-level sandbox**. `owner` and `collab`
+are full trust and impose no such limits at all.
 
-The **`collab`** profile is intentionally powerful: it grants **Bash** and the
-normal dev tools so an approved collaborator can do real work in a repo. Its
-`Read`/`Edit` path deny-lists (e.g. `~/.ssh`, `~/.aws`, `~/.config/gh`,
-`~/.config/claude-workers`, `~/.claude`, the dotfiles tree) and command-prefix
-denies (`sudo`, `su`, `curl`, `wget`) are **guardrails against mistakes, not a
-sandbox** — a determined user with Bash can read or exfiltrate around
-pattern-matched filters. That is by design.
+The **`collab`** profile is **full trust — capability-identical to `owner`.**
+It adds no restricting flags, so the worker inherits `claude-launch`'s default
+`--dangerously-skip-permissions` and **bypasses every permission prompt**. This
+is deliberate: a `collab` worker is driven over Discord, where nobody can answer
+an interactive "Do you want to proceed?" dialog, so any prompt would wedge the
+worker. There is **no deny-list and no sandbox** — a `collab` worker can read
+`~/.ssh`, run `sudo`, and touch anything the host user can.
 
 Because `collab` is only ever granted by an explicit owner action (you run
 `/addguest`, or approve a request card yourself), **granting it is equivalent

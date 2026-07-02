@@ -125,12 +125,10 @@ class ProfileArgsTests(unittest.TestCase):
         self.assertIn(os.path.join(self.PDIR, "greeter.settings.json"), args)
 
     def test_collab_flags(self):
-        args = cb.profile_args("collab", self.PDIR)
-        self.assertIn("--enforce-perms", args)
-        self.assertIn("--permission-mode", args)
-        i = args.index("--permission-mode")
-        self.assertEqual(args[i + 1], "acceptEdits")
-        self.assertIn(os.path.join(self.PDIR, "collab.settings.json"), args)
+        # collab is full trust, same as owner: no flags, so it inherits
+        # claude-launch's default --dangerously-skip-permissions and never
+        # wedges on a permission prompt nobody can answer over Discord.
+        self.assertEqual(cb.profile_args("collab", self.PDIR), [])
 
     def test_unknown_profile_empty(self):
         self.assertEqual(cb.profile_args("bogus", self.PDIR), [])
