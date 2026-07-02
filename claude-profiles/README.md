@@ -65,11 +65,20 @@ has no tools.
 
 `collab` is meant to be **powerful** — an approved collaborator gets the normal
 dev toolset and a shell so they can actually do the work.
-`collab.settings.json` allows `Read`, `Edit`, `Write`, `Glob`, `Grep`, and
-`Bash` with `defaultMode: acceptEdits` (so the guest isn't blocked on prompts
-they can't answer over Discord), while denying `sudo`/`su`, network fetches
-(`curl`, `wget`), and reads/edits of `~/.ssh`, `~/.aws`, `gh` config, the
+`collab.settings.json` allows `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Bash`,
+`WebSearch`, `WebFetch`, and `Task` (subagents) with `defaultMode: acceptEdits`,
+while denying `sudo`/`su`, raw-shell network fetches (`curl`, `wget`), and
+reads/edits of `~/.ssh`, `~/.aws`, `gh` config, the
 `claude-workers`/`claude-bridge` config dirs, `~/.claude`, and the dotfiles tree.
+
+> **Why the allow-list must cover everything a collaborator uses.** A
+> Discord-driven worker can't answer an interactive permission dialog, and
+> `acceptEdits` only auto-approves *edits* — so any tool that is neither
+> explicitly allowed nor denied stalls the worker on a "Do you want to proceed?"
+> prompt nobody can answer. That is why the research tools (`WebSearch`,
+> `WebFetch`) and `Task` are allowed outright rather than left to prompt. When
+> extending `collab`, add new tools to the allow-list (or the deny-list) — never
+> leave them to a prompt.
 
 Be clear about what this is — by design:
 
