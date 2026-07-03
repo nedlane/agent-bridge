@@ -1671,6 +1671,17 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             await asyncio.to_thread(disarm_fresh, name)
             last_activity[name] = time.time()
             print(f"[bridge] start event: worker {name} running")
+        elif etype == "claude.bridge.peek":
+            # Tools-based peek (bridge-ctl peek) — post the worker's live screen
+            # into its channel, the same payload the 👀 reaction produces.
+            name = (event.get("name") or "").strip()
+            channel_id = channel_for_worker(name)
+            if not channel_id:
+                return web.json_response(
+                    {"error": f"no repo channel mapped for worker {name!r}"},
+                    status=400,
+                )
+            await peek_screen(channel_id, name)
         elif etype == "claude.worker.send":
             worker = event.get("worker", "")
             if worker:
