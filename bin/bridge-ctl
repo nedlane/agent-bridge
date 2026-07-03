@@ -9,6 +9,8 @@
 #                                      # bridge (protocol injected, resumes)
 #   bridge-ctl peek <name>             # post that worker's live screen into
 #                                      # its channel (same as the 👀 reaction)
+#   bridge-ctl rename <name> <label>   # rename that worker's Discord channel
+#                                      # (display label only; mapping unchanged)
 #   bridge-ctl repos                   # list channel -> repo mappings
 #   bridge-ctl addguest <name> <discord_id> [edit|view]
 #                                      # grant a guest edit (View+Send) or view
@@ -82,6 +84,18 @@ print(json.dumps({"event_type": "claude.bridge.start",
 import json, os
 print(json.dumps({"event_type": "claude.bridge.peek",
                   "name": os.environ["NAME"]}))')" || die "could not build request"
+    post_event "$body"
+    ;;
+  rename)
+    name="${2:-}"
+    newname="${3:-}"
+    [[ -n "$name" && -n "$newname" ]] \
+      || die "usage: bridge-ctl rename <name> <new-channel-label>"
+    body="$(NAME="$name" NEW="$newname" python3 -c '
+import json, os
+print(json.dumps({"event_type": "claude.bridge.rename",
+                  "name": os.environ["NAME"],
+                  "new_name": os.environ["NEW"]}))')" || die "could not build request"
     post_event "$body"
     ;;
   addguest)
@@ -170,9 +184,9 @@ for cid, repo in repos.items():
     print(f"{name:<20} discord:{cid}  {rdir}")' "$CONFIG"
     ;;
   ''|-h|--help|help)
-    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    die "unknown command '$cmd' (addrepo, start, peek, repos, addguest, request, viewonly, revoke, guests)"
+    die "unknown command '$cmd' (addrepo, start, peek, rename, repos, addguest, request, viewonly, revoke, guests)"
     ;;
 esac

@@ -22,6 +22,8 @@ bridge-ctl start <name>                 # start that repo's worker via the
                                         # bridge (protocol injected, resumes)
 bridge-ctl peek <name>                  # post that worker's live screen into
                                         # its channel (like the 👀 reaction)
+bridge-ctl rename <name> <label>        # rename that worker's Discord channel
+                                        # (display label only; mapping unchanged)
 bridge-ctl repos                        # list channel -> repo mappings
 discord-notify -t discord:<channel_id> "first message"   # talk into it
 ```

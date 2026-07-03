@@ -1682,6 +1682,35 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     status=400,
                 )
             await peek_screen(channel_id, name)
+        elif etype == "claude.bridge.rename":
+            # Rename a worker's Discord channel label. The mapping is keyed by
+            # channel id and the worker/repo name is unchanged, so this is purely
+            # cosmetic — the tmux session, state dir, and every
+            # `bridge-ctl <verb> <name>` handle keep working. Discord normalizes
+            # the label (lowercases, spaces -> dashes).
+            name = (event.get("name") or "").strip()
+            new_name = (event.get("new_name") or "").strip()
+            if not new_name:
+                return web.json_response({"error": "new_name required"}, status=400)
+            channel_id = channel_for_worker(name)
+            if not channel_id:
+                return web.json_response(
+                    {"error": f"no repo channel mapped for worker {name!r}"},
+                    status=400,
+                )
+            channel = client.get_channel(channel_id)
+            if channel is None:
+                return web.json_response(
+                    {"error": f"channel {channel_id} not in cache"}, status=400
+                )
+            try:
+                await channel.edit(name=new_name, reason="bridge-ctl rename")
+            except discord.HTTPException as e:
+                return web.json_response({"error": f"rename failed: {e}"}, status=400)
+            print(f"[bridge] rename: worker {name} channel {channel_id} -> #{channel.name}")
+            return web.json_response(
+                {"status": "ok", "channel_id": str(channel_id), "channel": channel.name}
+            )
         elif etype == "claude.worker.send":
             worker = event.get("worker", "")
             if worker:
