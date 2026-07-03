@@ -7,6 +7,8 @@
 #                                      # category and map it to <path>
 #   bridge-ctl start <name>            # start that repo's worker via the
 #                                      # bridge (protocol injected, resumes)
+#   bridge-ctl peek <name>             # post that worker's live screen into
+#                                      # its channel (same as the 👀 reaction)
 #   bridge-ctl repos                   # list channel -> repo mappings
 #   bridge-ctl addguest <name> <discord_id> [edit|view]
 #                                      # grant a guest edit (View+Send) or view
@@ -70,6 +72,15 @@ print(json.dumps({"event_type": "claude.bridge.addrepo",
     body="$(NAME="$name" python3 -c '
 import json, os
 print(json.dumps({"event_type": "claude.bridge.start",
+                  "name": os.environ["NAME"]}))')" || die "could not build request"
+    post_event "$body"
+    ;;
+  peek)
+    name="${2:-}"
+    [[ -n "$name" ]] || die "usage: bridge-ctl peek <name>"
+    body="$(NAME="$name" python3 -c '
+import json, os
+print(json.dumps({"event_type": "claude.bridge.peek",
                   "name": os.environ["NAME"]}))')" || die "could not build request"
     post_event "$body"
     ;;
@@ -159,9 +170,9 @@ for cid, repo in repos.items():
     print(f"{name:<20} discord:{cid}  {rdir}")' "$CONFIG"
     ;;
   ''|-h|--help|help)
-    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    die "unknown command '$cmd' (addrepo, start, repos, addguest, request, viewonly, revoke, guests)"
+    die "unknown command '$cmd' (addrepo, start, peek, repos, addguest, request, viewonly, revoke, guests)"
     ;;
 esac
