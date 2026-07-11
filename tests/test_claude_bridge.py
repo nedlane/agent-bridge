@@ -189,6 +189,19 @@ class ShouldResumeTests(unittest.TestCase):
         self.assertFalse(cb.should_resume(False, True))
 
 
+class ScreenIsCompactingTests(unittest.TestCase):
+    def test_compacting_screen_matches(self):
+        self.assertTrue(cb.screen_is_compacting("Compacting conversation…\n"))
+
+    def test_running_turn_is_not_compaction(self):
+        # A plain running turn must NOT match — steering queues fine there and
+        # delaying it would defeat mid-turn check-ins.
+        self.assertFalse(cb.screen_is_compacting("Working… (esc to interrupt)"))
+
+    def test_idle_prompt_is_not_compaction(self):
+        self.assertFalse(cb.screen_is_compacting("❯ "))
+
+
 class ChannelFromChatTests(unittest.TestCase):
     def test_simple(self):
         self.assertEqual(cb.channel_from_chat("discord:123"), 123)
