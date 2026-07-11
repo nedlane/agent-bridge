@@ -286,6 +286,9 @@ Notes:
   Messages** permission.
 - `/close` deletes the channel and its whole history — it needs **Manage
   Channels** and won't proceed unless `confirm` exactly matches the worker name.
+- A message beginning with `/ignore` is a **channel-only note**: the bridge
+  drops it (marking it 🙈) instead of relaying it, so you can jot something in a
+  worker's channel without the worker picking it up.
 - Any **other** message beginning with `/` (i.e. not one of the commands above)
   is typed straight into the worker as keystrokes, so any Claude Code slash
   command (`/help`, `/context`, …) still works from Discord.
