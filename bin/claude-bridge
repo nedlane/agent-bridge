@@ -543,6 +543,16 @@ def worker_busy(name):
     return "esc to interrupt" in r.stdout
 
 
+def screen_is_compacting(screen):
+    """True when a worker pane is mid-compaction — a manual /compact or an
+    auto-compact. The input box is being redrawn, so a paste lands in that
+    transient state and is silently discarded (the same race the cold-start
+    path guards with wait_ready). deliver() waits this out before sending;
+    a plain running turn ("esc to interrupt") is not compaction and queues
+    steering fine, so it must not match here."""
+    return "Compacting" in screen
+
+
 def screen_is_ready(screen):
     """True when a worker pane shows an idle, input-ready prompt.
 
@@ -830,7 +840,17 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # typed-while-running input as steering, which is what check-ins and
         # course corrections need. ⏳ just signals "delivered while working".
         last_activity[name] = time.time()
-        busy = await asyncio.to_thread(worker_busy, name)
+        screen = await asyncio.to_thread(worker_screen, name, 30)
+        busy = "esc to interrupt" in screen
+        # A worker mid-compaction (manual /compact or an auto-compact) is
+        # redrawing its input box; a paste — and the message pointing Claude at
+        # a just-saved attachment — lands in that transient state and is
+        # silently discarded. Wait for a genuinely input-ready prompt first,
+        # exactly as the cold-start path does. A normal running turn is not
+        # compaction and queues steering fine, so it isn't delayed here.
+        if screen_is_compacting(screen):
+            if await wait_ready(name):
+                busy = False
         text = tag_inbound(text, typed, tag)
         r = await asyncio.to_thread(worker_send, name, text, typed)
         if r.returncode != 0:
