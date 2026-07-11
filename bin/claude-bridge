@@ -851,6 +851,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if screen_is_compacting(screen):
             if await wait_ready(name):
                 busy = False
+            elif message:
+                # Compaction outlasted the wait — a paste now would be silently
+                # discarded. Warn instead of a misleading ✅, and let Ned retry
+                # once the worker is idle (his upload is already saved to inbox).
+                await message.channel.send(
+                    f"⚠️ `{name}` is still compacting, so your message wasn't "
+                    "delivered — re-send it in a moment."
+                )
+                return
         text = tag_inbound(text, typed, tag)
         r = await asyncio.to_thread(worker_send, name, text, typed)
         if r.returncode != 0:
