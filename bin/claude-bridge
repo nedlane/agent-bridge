@@ -38,6 +38,9 @@ on connect). The `worker` option defaults to the channel's mapped worker:
                            delete its channel (irreversible; confirm required)
   /addguest <name> <discord_id> [edit|view]   grant a guest channel access
   /lockdown                drop ALL guests everywhere to view-only
+A message starting with "/ignore" is a channel-only note: the bridge drops it
+(marking it 🙈) instead of relaying it, so you can talk in a worker's channel
+without the worker picking it up.
 A plain message starting with "/" that is NOT one of the above is typed into
 the worker as keystrokes, so any other Claude Code slash command still works.
 The worker named "orchestrator" additionally gets the ORCHESTRATOR brief, so
@@ -84,6 +87,10 @@ PEEK_EMOJI = "👀"
 VIEW_EMOJI = "👁️"
 EDIT_EMOJI = "✏️"
 DENY_EMOJI = "❌"
+
+# Reacted onto a "/ignore ..." message to confirm the bridge skipped it (the
+# note stays in the channel but is never relayed to the worker).
+IGNORE_EMOJI = "🙈"
 
 DISCORD_LIMIT = 2000
 REPLY_CAP = 8000
@@ -488,6 +495,17 @@ def compose_inbound(text, attachment_paths=None, reply_quote=None):
             f"from disk:\n{listed}]"
         )
     return "\n\n".join(parts)
+
+
+def is_ignore_message(content):
+    """True if a message is prefixed with /ignore — a note for the channel only.
+
+    Lets Ned type in a worker's channel without the bridge picking it up: start
+    the message with "/ignore" and the bridge drops it instead of relaying it to
+    the worker. Matches "/ignore" alone or followed by whitespace (so a real
+    "/ignorefoo" command wouldn't be swallowed); case-insensitive.
+    """
+    return re.match(r"/ignore(\s|$)", (content or "").strip(), re.IGNORECASE) is not None
 
 
 def compose_edit(content):
@@ -1502,6 +1520,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # channel(s) they were added to.
         if message.author.bot:
             return
+        # "/ignore ..." is a note for the channel only — never reaches a worker.
+        # React so it's clear the bridge saw it and deliberately skipped it.
+        if is_ignore_message(message.content):
+            await message.add_reaction(IGNORE_EMOJI)
+            return
         repo = repo_for_channel(message.channel.id)
         if repo and channel_allows(cfg, message.channel.id, message.author.id):
             await handle_repo_message(message, repo)
@@ -1516,6 +1539,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return
         if before.content == after.content or not after.content.strip():
             return
+        if is_ignore_message(after.content):
+            return  # channel-only note — don't relay the edit as steering
         if after.content.startswith("/"):
             return
         if str(after.channel.id) == str(cfg.get("welcome_channel")):

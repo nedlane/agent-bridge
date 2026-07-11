@@ -181,6 +181,28 @@ class SplitMessageTests(unittest.TestCase):
         self.assertEqual(cb.split_message("   \n  \n"), [])
 
 
+class IsIgnoreMessageTests(unittest.TestCase):
+    def test_ignore_alone_and_with_text(self):
+        self.assertTrue(cb.is_ignore_message("/ignore"))
+        self.assertTrue(cb.is_ignore_message("/ignore just a note to myself"))
+        self.assertTrue(cb.is_ignore_message("/ignore\nmulti line"))
+
+    def test_case_insensitive_and_leading_whitespace(self):
+        self.assertTrue(cb.is_ignore_message("/IGNORE this"))
+        self.assertTrue(cb.is_ignore_message("  /Ignore this"))
+
+    def test_not_ignore(self):
+        # A different command that merely starts with the same letters must pass.
+        self.assertFalse(cb.is_ignore_message("/ignorefoo"))
+        self.assertFalse(cb.is_ignore_message("please /ignore this"))
+        self.assertFalse(cb.is_ignore_message("/status"))
+        self.assertFalse(cb.is_ignore_message("just talking to the worker"))
+
+    def test_empty_and_none(self):
+        self.assertFalse(cb.is_ignore_message(""))
+        self.assertFalse(cb.is_ignore_message(None))
+
+
 class ShouldResumeTests(unittest.TestCase):
     def test_matrix(self):
         self.assertTrue(cb.should_resume(True, False))
