@@ -42,6 +42,12 @@ The host that runs the bridge needs:
 - **[Pillow](https://python-pillow.org/)** (`pip3 install --user Pillow`) — used
   by `bin/term-shot` to render a worker's live screen as an image for the 👀
   peek and `/screen`. Without it, peeks fall back to a text code block.
+- **[brotlicffi](https://pypi.org/project/brotlicffi/)**
+  (`pip3 install --user brotlicffi`) — recommended so aiohttp can decode
+  brotli-encoded Discord CDN responses. The bridge downloads uploaded files with
+  `Accept-Encoding: identity` to sidestep this, so it is not strictly required,
+  but installing it is the robust belt-and-suspenders fix (the Google `brotli`
+  build is incompatible with recent aiohttp and otherwise breaks file uploads).
 - **tmux** — every worker is a detached `cw-<name>` tmux session.
 - **jq** — used by CI and handy for validating config/profile JSON.
 - **curl** — the signed-event clients (`bridge-ctl`, `discord-notify`) POST with it.
