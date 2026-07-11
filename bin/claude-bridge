@@ -686,6 +686,7 @@ def prune_old_files(directory, max_age_seconds, now=None):
 def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     import logging
 
+    import aiohttp
     import discord
     from aiohttp import web
 
@@ -894,9 +895,31 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if message:
             await message.add_reaction("⏳" if busy else "✅")
 
+    async def fetch_attachment(att, dest):
+        """Download one Discord attachment to `dest`.
+
+        discord.py's att.save()/read() route the CDN response through aiohttp's
+        Brotli decompressor, which is broken against the Google `brotli` build
+        installed here (aiohttp calls Decompressor.process(data, max_length) but
+        that build's process() takes only `data`) — every brotli-encoded CDN
+        response then raises ClientPayloadError and, uncaught, crashed the whole
+        message handler. Fetch the URL ourselves asking for identity encoding so
+        no decompression is attempted."""
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                att.url, headers={"Accept-Encoding": "identity"}
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+
     async def save_attachments(name, message):
         """Download a message's Discord attachments into the worker's inbox
-        dir and return their local paths, so Claude can Read them off disk."""
+        dir and return their local paths, so Claude can Read them off disk.
+        A download that fails warns in-channel rather than crashing the handler
+        (which would drop the whole message, reaction and all)."""
         if not message.attachments:
             return []
         inbox = os.path.join(STATE_ROOT, name, "inbox")
@@ -911,10 +934,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             safe = os.path.basename(att.filename or "").strip() or "file"
             dest = os.path.join(inbox, f"{message.id}-{safe}")
             try:
-                await att.save(dest)
+                await fetch_attachment(att, dest)
                 paths.append(dest)
-            except (discord.HTTPException, OSError) as e:
+            except (aiohttp.ClientError, discord.HTTPException, OSError,
+                    asyncio.TimeoutError) as e:
                 print(f"[bridge] {name}: failed to save {att.filename!r}: {e}")
+                try:
+                    await message.channel.send(
+                        f"⚠️ couldn't download `{att.filename}` — Discord upload "
+                        "failed. Try re-uploading it."
+                    )
+                except discord.HTTPException:
+                    pass
         return paths
 
     async def reply_snippet(message):
