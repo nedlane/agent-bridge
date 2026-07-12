@@ -26,8 +26,8 @@ on connect). The `worker` option defaults to the channel's mapped worker:
   /status                  list all workers and their state
   /stop /restart /screen [worker]
   /usage [worker]          usage & session cost: plan rate-limit bars + this
-                           worker's session cost (owner-only — the bars are
-                           account-wide, not per-worker)
+                           worker's session cost (owner or a channel's editors;
+                           the bars are account-wide, not per-worker)
   /model <model> [worker]  switch the worker's model
   /clear [worker]          fresh context now: restart without --continue
                            (also wipes the channel's messages)
@@ -1502,11 +1502,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @tree.command(name="usage", description="Show usage & session cost (plan limits + this worker's cost)")
     @describe(worker="Worker name (defaults to this channel's worker)")
     async def slash_usage(interaction, worker: str = None):
-        # Owner-only: the panel's rate-limit bars and "what's contributing"
-        # breakdown are account/machine-wide (every session on the box), not
-        # scoped to one worker — so unlike /status and /screen it isn't safe to
-        # hand to a channel's guests.
-        if not (name := await guard(interaction, worker)):
+        # Open to a channel's editors (Ned opted in), scoped to their own
+        # worker like /screen. Note the panel's rate-limit bars and "what's
+        # contributing" breakdown are account/machine-wide, not per-worker — so
+        # a guest running this sees the whole box's usage picture, not just
+        # their session; that exposure is intentional here.
+        if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await render_usage(name))
