@@ -16,6 +16,7 @@
 #   claude-worker wait  <name> [--for TEXT] [--timeout SECS]
 #                                            # block until idle (or TEXT shows)
 #   claude-worker read  <name> [lines]      # capture the worker's screen
+#   claude-worker key   <name> <key>...     # send raw keys (Escape, C-c, …)
 #   claude-worker list
 #   claude-worker status <name>
 #   claude-worker restart <name>            # same name, same recorded dir
@@ -302,6 +303,18 @@ cmd_read() {
   tmux capture-pane -p -t "$(pane_for "$name")" -S "-$lines"
 }
 
+cmd_key() {
+  # Send raw key names straight to the worker's pane (tmux send-keys names:
+  # Escape, Enter, C-c, Up, …). Unlike `send`, this does NOT type text or
+  # auto-submit — it's for driving TUI overlays, e.g. Escape to dismiss the
+  # /usage panel the bridge opens.
+  require_name "${1:-}"
+  local name="$1"; shift
+  alive "$name" || die "worker '$name' is not running"
+  (($#)) || die "usage: claude-worker key <name> <key> [key...]"
+  tmux send-keys -t "$(pane_for "$name")" "$@"
+}
+
 cmd_list() {
   local name printed=0
   printf '%-20s %-8s %s\n' NAME STATE DIR
@@ -371,7 +384,7 @@ cmd_restart() {
 cmd="${1:-}"
 shift || true
 case "$cmd" in
-  start|send|wait|read|list|status|stop|restart) "cmd_$cmd" "$@" ;;
+  start|send|wait|read|key|list|status|stop|restart) "cmd_$cmd" "$@" ;;
   ''|-h|--help|help) usage ;;
   *) die "unknown command '$cmd' (see claude-worker --help)" ;;
 esac

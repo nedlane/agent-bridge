@@ -25,6 +25,9 @@ Commands are native Discord slash commands (allowed users; synced per guild
 on connect). The `worker` option defaults to the channel's mapped worker:
   /status                  list all workers and their state
   /stop /restart /screen [worker]
+  /usage [worker]          usage & session cost: plan rate-limit bars + this
+                           worker's session cost (owner-only — the bars are
+                           account-wide, not per-worker)
   /model <model> [worker]  switch the worker's model
   /clear [worker]          fresh context now: restart without --continue
                            (also wipes the channel's messages)
@@ -592,6 +595,43 @@ def screen_is_ready(screen):
     return not any(b in screen for b in blockers)
 
 
+def composer_is_empty(screen):
+    """True when the worker's input box holds no pending text. The live input
+    box is the last ❯-prefixed line in the pane (earlier ❯ lines are echoed
+    conversation turns); an empty box reads as just "❯". Guards /usage from
+    appending "/usage" onto a half-written message someone left in the box."""
+    box = None
+    for line in (screen or "").splitlines():
+        s = line.strip()
+        if s.startswith("❯"):
+            box = s[1:].strip()
+    return box == ""
+
+
+def trim_usage_panel(screen):
+    """Slice the /usage overlay out of a full pane capture: from the panel's
+    tab-bar header (Settings … Usage … Stats) down to its 'Esc to cancel'
+    footer, dropping the conversation scrollback above it. Falls back to a
+    fixed window (or the whole capture) when the markers aren't found — so a
+    Claude Code panel redesign degrades to a rougher screenshot, not nothing."""
+    lines = (screen or "").splitlines()
+    if not lines:
+        return screen or ""
+    end = next(
+        (i for i in range(len(lines) - 1, -1, -1) if "Esc to cancel" in lines[i]),
+        len(lines) - 1,
+    )
+    start = None
+    for i in range(end, -1, -1):
+        low = lines[i]
+        if "Settings" in low and "Usage" in low and "Stats" in low:
+            start = i
+            break
+    if start is None:
+        start = max(0, end - 55)
+    return "\n".join(lines[start:end + 1])
+
+
 def worker_screen(name, lines=40):
     r = _run(["claude-worker", "read", name, str(lines)], timeout=15)
     return r.stdout if r.returncode == 0 else r.stderr
@@ -616,6 +656,15 @@ def worker_send(name, text, typed=False):
     if typed:
         args.append("--type")
     return _run(args + [text], timeout=30)
+
+
+def worker_key(name, *keys):
+    """Send raw key names (tmux send-keys: Escape, Enter, C-c, `-l TEXT`, …) to
+    the worker's pane. Unlike worker_send, it neither verifies a submit nor
+    auto-presses Enter — it's for driving TUI overlays like the /usage panel,
+    where worker_send's submit check would loop (the box never clears while the
+    panel is up) and wrongly trip the wedge-recovery restart."""
+    return _run(["claude-worker", "key", name, *keys], timeout=15)
 
 
 def worker_stop(name):
@@ -855,6 +904,53 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         """Post a worker's live screen to a channel — used by the 👀 reaction."""
         text, attachments = await render_peek(name)
         await post(channel_id, text, attachments)
+
+    async def render_usage(name):
+        """Open the worker's /usage panel, screenshot it, dismiss it. Returns
+        (text, attachments). One panel covers both of Ned's asks: Claude Code
+        folds /cost into /usage, so it shows this worker's session cost/stats
+        *and* the account's 5-hour + weekly rate-limit bars.
+
+        The panel only opens on an idle worker — typing /usage mid-turn would
+        inject it into the running conversation as steering — so this bails
+        when the worker is busy or has half-written input in the box."""
+        if not await asyncio.to_thread(worker_alive, name):
+            return f"📊 `{name}` isn't running right now.", None
+        screen = await asyncio.to_thread(worker_screen, name, 30)
+        if not screen_is_ready(screen):
+            return f"📊 `{name}` is busy right now — try `/usage` once it's idle.", None
+        if not composer_is_empty(screen):
+            return (
+                f"📊 `{name}` has unsent text in its input box — clear it first, "
+                "then try `/usage`.", None,
+            )
+        # Drive the overlay with raw keys (worker_send would try to verify a
+        # submit that never clears the box while the panel is up).
+        await asyncio.to_thread(worker_key, name, "-l", "/usage")
+        await asyncio.sleep(1.2)
+        await asyncio.to_thread(worker_key, name, "Enter")
+        # Poll until the panel is up ("Esc to cancel") AND its "what's
+        # contributing" breakdown has finished its async load (the panel first
+        # shows "Scanning local sessions…"/"Refreshing…" placeholders, then
+        # grows). Keep the last capture either way so a slow load still renders.
+        panel = ""
+        for _ in range(20):
+            await asyncio.sleep(0.4)
+            cap = await asyncio.to_thread(worker_screen, name, 90)
+            if "Esc to cancel" in cap:
+                panel = cap
+                if "Scanning" not in cap and "Refreshing" not in cap:
+                    break
+        # Always dismiss, even on a miss, so the worker is never left with the
+        # panel open blocking its input box.
+        await asyncio.to_thread(worker_key, name, "Escape")
+        if not panel:
+            return f"📊 couldn't read `{name}`'s usage panel — try again in a moment.", None
+        panel = trim_usage_panel(panel)
+        png = os.path.join(STATE_ROOT, name, "usage.png")
+        if await asyncio.to_thread(render_screen_png, panel, png):
+            return f"📊 `{name}` — usage & session cost", [png]
+        return f"📊 `{name}` usage:\n```\n{panel}\n```", None
 
     async def deliver(name, text, message=None, typed=False, tag=None):
         # Messages go straight in even mid-turn — Claude Code natively queues
@@ -1402,6 +1498,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await render_peek(name))
+
+    @tree.command(name="usage", description="Show usage & session cost (plan limits + this worker's cost)")
+    @describe(worker="Worker name (defaults to this channel's worker)")
+    async def slash_usage(interaction, worker: str = None):
+        # Owner-only: the panel's rate-limit bars and "what's contributing"
+        # breakdown are account/machine-wide (every session on the box), not
+        # scoped to one worker — so unlike /status and /screen it isn't safe to
+        # hand to a channel's guests.
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await render_usage(name))
 
     @tree.command(name="checkin", description="Ask a running worker for a progress update")
     @describe(worker="Worker name (defaults to this channel's worker)")
