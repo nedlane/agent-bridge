@@ -203,6 +203,62 @@ class IsIgnoreMessageTests(unittest.TestCase):
         self.assertFalse(cb.is_ignore_message(None))
 
 
+class ComposerIsEmptyTests(unittest.TestCase):
+    def test_empty_box(self):
+        screen = "● some reply\n──── worker:foo ──\n❯ \n────\n  footer"
+        self.assertTrue(cb.composer_is_empty(screen))
+
+    def test_uses_last_prompt_not_echoed_turn(self):
+        # An earlier ❯ line is an echoed conversation turn; the live box is the
+        # last one and is empty here.
+        screen = "❯ [Christian wrote:]\n\n hi\n● reply\n──── worker:foo ──\n❯ "
+        self.assertTrue(cb.composer_is_empty(screen))
+
+    def test_pending_text(self):
+        screen = "● reply\n──── worker:foo ──\n❯ half a message"
+        self.assertFalse(cb.composer_is_empty(screen))
+
+    def test_no_prompt_at_all(self):
+        self.assertFalse(cb.composer_is_empty("booting...\nno prompt yet"))
+        self.assertFalse(cb.composer_is_empty(""))
+
+
+class TrimUsagePanelTests(unittest.TestCase):
+    PANEL = "\n".join([
+        "❯ [old conversation echo]",
+        "● a reply that should be trimmed off",
+        "❯ /usage",
+        "──── desktop / worker:welcome ──",
+        "",
+        "────────────────────────",
+        "  Settings  Status   Config   Usage   Stats",
+        "",
+        "  Session",
+        "  Total cost:            $1.15",
+        "  Current session",
+        "  ████ 17% used",
+        "  Esc to cancel",
+    ])
+
+    def test_slices_from_tabbar_to_footer(self):
+        out = cb.trim_usage_panel(self.PANEL)
+        self.assertTrue(out.startswith("  Settings"))
+        self.assertTrue(out.rstrip().endswith("Esc to cancel"))
+        self.assertNotIn("a reply that should be trimmed", out)
+        self.assertIn("Total cost:", out)
+
+    def test_fallback_window_when_no_tabbar(self):
+        # No tab bar → fall back to a fixed window ending at the footer, never
+        # empty.
+        screen = "\n".join(["line %d" % i for i in range(40)] + ["  Esc to cancel"])
+        out = cb.trim_usage_panel(screen)
+        self.assertTrue(out.rstrip().endswith("Esc to cancel"))
+        self.assertTrue(len(out.splitlines()) > 0)
+
+    def test_empty_input(self):
+        self.assertEqual(cb.trim_usage_panel(""), "")
+
+
 class ShouldResumeTests(unittest.TestCase):
     def test_matrix(self):
         self.assertTrue(cb.should_resume(True, False))
