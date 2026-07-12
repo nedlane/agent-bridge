@@ -285,7 +285,9 @@ def channel_allows(cfg, channel_id, user_id):
     is open to anyone; otherwise the owner (global allowed_users) may talk in
     any channel and a channel's `guests` (editors) may talk only in that one
     channel. View-only guests are tracked in `viewers` and cannot drive the
-    worker (Discord also denies them Send). Slash commands stay owner-only."""
+    worker (Discord also denies them Send). Most slash commands stay
+    owner-only; the read-only /status and /screen are also open to a channel's
+    editors, scoped to that channel's worker (see guard_scoped)."""
     if str(channel_id) == str(cfg.get("welcome_channel")):
         return True
     if user_id in cfg.get("allowed_users", []):
@@ -1035,6 +1037,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         r = await asyncio.to_thread(_run, ["claude-worker", "list"], 15)
         return f"```\n{r.stdout}\n```", None
 
+    async def do_status_one(name):
+        # A guest sees only their own channel's worker — never the full roster
+        # of every repo on the box.
+        r = await asyncio.to_thread(_run, ["claude-worker", "status", name], 15)
+        return f"```\n{r.stdout}\n```", None
+
     async def do_fresh(name):
         # Shut down now and arm a fresh start: the next message begins a
         # brand-new session with no --continue, without resuming first. The
@@ -1304,19 +1312,56 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return None
         return name
 
+    async def guard_scoped(interaction, worker):
+        """Like guard(), but also lets a channel's editors (guests) run the
+        command — scoped to their own channel's worker only. The owner may
+        still target any worker via `worker`; a guest is pinned to this
+        channel and can't reach into another. Returns the worker name, or
+        None after having already replied with an error. Mirrors the 👀 peek,
+        which channel editors can already trigger."""
+        uid = interaction.user.id
+        repo = repo_for_channel(interaction.channel_id)
+        if uid in cfg["allowed_users"]:
+            name = worker or (repo["name"] if repo else None)
+            if not name:
+                await interaction.response.send_message(
+                    "⚠️ no worker mapped to this channel — pass `worker`",
+                    ephemeral=True,
+                )
+                return None
+            return name
+        if repo and uid in (repo.get("guests") or []):
+            if worker and worker != repo["name"]:
+                await interaction.response.send_message(
+                    f"⛔ you can only target this channel's worker "
+                    f"(`{repo['name']}`)",
+                    ephemeral=True,
+                )
+                return None
+            return repo["name"]
+        await interaction.response.send_message("⛔ not authorized", ephemeral=True)
+        return None
+
     async def reply(interaction, text, attachments=None):
         files = [
             discord.File(a) for a in (attachments or []) if os.path.isfile(a)
         ]
         await interaction.followup.send(text, files=files)
 
-    @tree.command(name="status", description="List all workers and their state")
+    @tree.command(name="status", description="Worker state (owner: all workers; guest: this channel's)")
     async def slash_status(interaction):
-        if interaction.user.id not in cfg["allowed_users"]:
-            await interaction.response.send_message("⛔ not authorized", ephemeral=True)
+        uid = interaction.user.id
+        if uid in cfg["allowed_users"]:
+            await interaction.response.defer(thinking=True)
+            await reply(interaction, *await do_status())
             return
-        await interaction.response.defer(thinking=True)
-        await reply(interaction, *await do_status())
+        # A channel editor gets just their own worker's state, not the roster.
+        repo = repo_for_channel(interaction.channel_id)
+        if repo and uid in (repo.get("guests") or []):
+            await interaction.response.defer(thinking=True)
+            await reply(interaction, *await do_status_one(repo["name"]))
+            return
+        await interaction.response.send_message("⛔ not authorized", ephemeral=True)
 
     @tree.command(name="fresh", description="Shut a worker down + wipe the channel; next message starts fresh (no resume)")
     @describe(worker="Worker name (defaults to this channel's worker)")
@@ -1353,7 +1398,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @tree.command(name="screen", description="Peek at a worker's live screen")
     @describe(worker="Worker name (defaults to this channel's worker)")
     async def slash_screen(interaction, worker: str = None):
-        if not (name := await guard(interaction, worker)):
+        if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await render_peek(name))
