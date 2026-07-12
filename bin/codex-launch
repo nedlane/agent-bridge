@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Launch an interactive Codex session in YOLO mode for an agent worker — the
+# Codex half of the local agent control plane, mirroring claude-launch. Codex's
+# `--dangerously-bypass-approvals-and-sandbox` is the exact analog of Claude
+# Code's `--dangerously-skip-permissions`: no approval prompts, no sandbox, full
+# trust. That is what a Discord-driven worker needs, since nobody can answer an
+# interactive approval dialog over the bridge.
+#
+#   codex-launch --label NAME          # worker session in $PWD
+#   codex-launch --label NAME --resume # resume this dir's most recent session
+#   codex-launch --label NAME -- -m gpt-5.5   # extra args pass through to codex
+#
+# Deliberately subscription-only: OpenAI API-key env vars are stripped before
+# codex starts, so a calling environment can never flip the session onto
+# API-key billing. Auth must come from the normal interactive `codex login`
+# (ChatGPT subscription), exactly as claude-launch enforces for Claude.
+set -euo pipefail
+
+# --- strip API-key billing env (subscription auth only) ----------------------
+for var in OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION \
+           CODEX_API_KEY AZURE_OPENAI_API_KEY; do
+  if [[ -n "${!var:-}" ]]; then
+    echo "codex-launch: unsetting $var (interactive subscription auth only)" >&2
+    unset "$var"
+  fi
+done
+
+# --- extract --label / --resume; collect passthrough args --------------------
+label=""
+resume=0
+args=()
+while (($#)); do
+  case "$1" in
+    --label)   label="${2:?codex-launch: --label needs a value}"; shift 2 ;;
+    --label=*) label="${1#--label=}"; shift ;;
+    --resume)  resume=1; shift ;;
+    --)        shift; args+=("$@"); break ;;
+    *)         args+=("$1"); shift ;;
+  esac
+done
+
+# YOLO mode: skip all approvals and the sandbox (full trust), the analog of
+# Claude's --dangerously-skip-permissions. `-C "$PWD"` pins the working root to
+# the worker's repo dir (tmux already starts us there; this makes it explicit).
+# --dangerously-bypass-hook-trust lets the worker's turn-end Stop hook (the
+# push that wakes the bridge) run without the interactive "Hooks need review"
+# dialog that nobody can answer over Discord.
+yolo=(--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust -C "$PWD")
+
+# Layer the "worker" Codex profile ($CODEX_HOME/worker.config.toml) when it
+# exists — that file carries the turn-end Stop hook (codex-worker-done-relay)
+# that pushes replies back to the bridge. Keeping the hook in a profile (not the
+# base config) means Ned's ordinary `codex` sessions never load it and never hit
+# a "Hooks need review" prompt. If the profile isn't installed yet the worker
+# still runs; it just falls back to the worker's own discord-notify for replies.
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+if [[ -f "$codex_home/worker.config.toml" ]]; then
+  yolo+=(-p worker)
+else
+  echo "codex-launch: no $codex_home/worker.config.toml — turn-end relay off" \
+       "(see docs/agent-control-plane.md)" >&2
+fi
+
+# Resume the most recent session for THIS directory when asked. `resume --last`
+# is cwd-filtered, so it continues this repo's own last Codex conversation —
+# the per-engine history that makes /harness switching keep each engine's
+# thread. If no prior session exists for the dir, `resume --last` exits non-zero
+# before taking over the terminal; fall back to a fresh session so a first-ever
+# codex start (or a dir whose sessions were pruned) still comes up cleanly.
+if (( resume )); then
+  if codex resume --last "${yolo[@]}" ${args[@]+"${args[@]}"}; then
+    exit 0
+  fi
+  echo "codex-launch: no resumable session for $PWD — starting fresh" >&2
+fi
+exec codex "${yolo[@]}" ${args[@]+"${args[@]}"}

@@ -10,8 +10,11 @@
 # distinguishable (for Codex and in the claude.ai session list) from manual
 # `cl` sessions, whose titles use the directory name.
 #
-#   claude-worker start <name> [--dir DIR] [-- claude args...]
+#   claude-worker start <name> [--dir DIR] [--harness claude|codex] [--resume]
+#                              [-- engine args...]
 #                                            # blocks until the worker is ready
+#                                            # --harness picks the engine
+#                                            #   (codex runs in YOLO mode)
 #   claude-worker send  <name> <text|->     # '-' reads the message from stdin
 #   claude-worker wait  <name> [--for TEXT] [--timeout SECS]
 #                                            # block until idle (or TEXT shows)
@@ -67,27 +70,41 @@ meta_get() { # meta_get <name> <key>
 
 screen_of() { tmux capture-pane -p -t "$(pane_for "$1")" -S -50 2>/dev/null || true; }
 
-# Claude Code shows "esc to interrupt" the whole time a turn is working;
-# a --continue resume can auto-compact, which shows "Compacting" (often
-# without that hint). Treat both as busy so readiness checks never fire
-# while the worker is mid-turn or mid-compaction.
-is_busy() { grep -qE "esc to interrupt|Compacting" <<<"$1"; }
-# First boot in a new directory stops at the folder-trust dialog.
-is_trust_dialog() { grep -qE "trust this folder|Do you trust" <<<"$1"; }
-# A large session resumed with --continue first asks how to resume (summary
-# vs full); its menu cursor is also a "❯", so it must not be mistaken for the
-# idle input prompt — it's a blocking dialog to dismiss.
-is_resume_dialog() { grep -qE "Resume from summary|Resume full session" <<<"$1"; }
-# Idle: the input prompt is on screen and nothing is running or blocking.
+# These readiness predicates match BOTH harnesses with a superset of markers,
+# so the orchestration stays engine-agnostic without threading a harness flag
+# through every check. The strings are distinct enough not to collide:
+#   Claude Code — "esc to interrupt" while a turn works, "Compacting" mid
+#     auto-compaction; idle prompt char "❯".
+#   Codex       — "Working (Ns • esc to interrupt)" while a turn works (note it
+#     also carries "esc to interrupt"); idle prompt char "›".
+is_busy() { grep -qE "esc to interrupt|Compacting|Working \(" <<<"$1"; }
+# A blocking dialog awaiting input is always the BOTTOM-most thing on screen, so
+# the dialog checks look only at the tail of the capture. This matters after
+# dismissal: the dialog text lingers in tmux scrollback, and Codex's compact
+# boot keeps it inside the capture window (Claude's longer boot scrolls it out),
+# so a full-screen grep would keep matching a dialog that's already gone and the
+# worker would never read as ready.
+dialog_tail() { tail -15 <<<"$1"; }
+# First boot in a new directory stops at the folder-trust dialog. Both engines
+# use the phrase "Do you trust…" (Claude: "…this folder?"; Codex: "…the
+# contents of this directory?"), so the shared substring catches both.
+is_trust_dialog() { grep -qE "trust this folder|Do you trust" <<<"$(dialog_tail "$1")"; }
+# A large Claude session resumed with --continue first asks how to resume
+# (summary vs full); its menu cursor is also a "❯", so it must not be mistaken
+# for the idle input prompt — it's a blocking dialog to dismiss. Codex resume
+# has no such dialog, so this simply never matches on the Codex path.
+is_resume_dialog() { grep -qE "Resume from summary|Resume full session" <<<"$(dialog_tail "$1")"; }
+# Idle: the input prompt (Claude "❯" or Codex "›") is on screen and nothing is
+# running or blocking.
 is_ready() {
-  grep -q "❯" <<<"$1" \
+  grep -qE "❯|›" <<<"$1" \
     && ! is_busy "$1" && ! is_trust_dialog "$1" && ! is_resume_dialog "$1"
 }
 
-# The input box is the LAST screen line beginning with the "❯" prompt. A
-# submitted message also echoes as a "❯ ..." history line above it, so tail -1
-# is what isolates the live box.
-input_line() { screen_of "$1" | grep '^❯' | tail -1 || true; }
+# The input box is the LAST screen line beginning with the prompt char (Claude
+# "❯", Codex "›"). A submitted message also echoes as a "prompt ..." history
+# line above it, so tail -1 is what isolates the live box.
+input_line() { screen_of "$1" | grep -E '^❯|^›' | tail -1 || true; }
 # A multi-line (or long) bracketed paste does NOT echo its text into the box —
 # the composer collapses it to a chip like "❯ [Pasted text #1 +17 lines]". So
 # submission has to be judged by the chip's presence/absence, not by matching
@@ -136,7 +153,7 @@ cmd_start() {
   require_name "${1:-}"
   local name="$1"
   shift
-  local dir="$PWD" chat="" extra=()
+  local dir="$PWD" chat="" harness="claude" resume=0 extra=()
   while (($#)); do
     case "$1" in
       --dir)    dir="${2:?--dir needs a value}"; shift 2 ;;
@@ -147,30 +164,63 @@ cmd_start() {
       # --chat is what opts the worker into push-on-done events.
       --chat)   chat="${2:?--chat needs a value}"; shift 2 ;;
       --chat=*) chat="${1#--chat=}"; shift ;;
+      # Which engine drives this worker: "claude" (default) or "codex". The
+      # bridge passes it from the channel's mapped harness; it is recorded in
+      # meta so restart/relays know the engine without re-reading bridge config.
+      --harness)   harness="${2:?--harness needs a value}"; shift 2 ;;
+      --harness=*) harness="${1#--harness=}"; shift ;;
+      # Resume the prior conversation. Engine-specific: Claude gets --continue,
+      # Codex gets `resume --last`. Centralized here so the bridge just says
+      # "resume" and each launcher does the right thing.
+      --resume) resume=1; shift ;;
       --)       shift; extra=("$@"); break ;;
       *)        die "unknown start option '$1'" ;;
     esac
   done
   [[ "$chat" =~ ^[^[:space:]]*$ ]] || die "invalid --chat target '$chat'"
+  [[ "$harness" == claude || "$harness" == codex ]] \
+    || die "invalid --harness '$harness' (claude or codex)"
   [[ -d "$dir" ]] || die "no such directory: $dir"
-  command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
   alive "$name" && die "worker '$name' is already running (try: claude-worker restart $name)"
 
-  local session state launcher
+  local session state launcher launcher_args=()
   session="$(session_for "$name")"
   state="$STATE_ROOT/$name"
   mkdir -p "$state"
 
-  launcher="$(command -v claude-launch || true)"
-  [[ -n "$launcher" ]] || launcher="${DOTFILES_DIR:-$HOME/dotfiles}/shared/bin/claude-launch"
-  [[ -x "$launcher" ]] || die "claude-launch not found (run scripts/link.sh)"
+  # Pick the engine launcher. Both live in this repo's bin/ (symlinked by
+  # scripts/link.sh); claude-launch may also be provided by the dotfiles tree.
+  if [[ "$harness" == codex ]]; then
+    command -v codex >/dev/null 2>&1 || die "codex CLI not found on PATH"
+    launcher="$(command -v codex-launch || true)"
+    [[ -n "$launcher" ]] || launcher="$(dirname "$(readlink -f "$0")")/codex-launch"
+    [[ -x "$launcher" ]] || die "codex-launch not found (run scripts/link.sh)"
+    # Codex resume is a launcher flag; the Discord protocol is injected by the
+    # bridge as the worker's first message, not a launch flag.
+    (( resume )) && launcher_args+=(--resume)
+  else
+    command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
+    launcher="$(command -v claude-launch || true)"
+    [[ -n "$launcher" ]] || launcher="${DOTFILES_DIR:-$HOME/dotfiles}/shared/bin/claude-launch"
+    [[ -x "$launcher" ]] || die "claude-launch not found (run scripts/link.sh)"
+    # Claude resumes with --continue, passed through claude-launch to claude.
+    (( resume )) && extra=(--continue ${extra[@]+"${extra[@]}"})
+  fi
 
   # One shell-safe command string: tmux joins its trailing args with spaces,
   # so each word is %q-quoted. CLAUDE_WORKER marks the session as an
-  # orchestrated worker for hooks (e.g. the Discord todo relay).
+  # orchestrated worker for hooks/relays (Discord todo + done relays) and for
+  # discord-notify's channel auto-targeting — engine-agnostic, so a Codex
+  # worker gets the same outbound messaging. A tmux session inherits the tmux
+  # SERVER's env, not this caller's, so any var the engine needs is forwarded
+  # explicitly here: CODEX_HOME (usually unset -> default ~/.codex; set to point
+  # a worker at an alternate Codex home, e.g. for tests) rides along when set.
+  local env_prefix=(env "CLAUDE_WORKER=$name")
+  [[ -n "${CODEX_HOME:-}" ]] && env_prefix+=("CODEX_HOME=$CODEX_HOME")
   local cmd
-  cmd="$(printf '%q ' env "CLAUDE_WORKER=$name" "$launcher" \
-    --label "worker:$name" ${extra[@]+"${extra[@]}"})"
+  cmd="$(printf '%q ' "${env_prefix[@]}" "$launcher" \
+    --label "worker:$name" ${launcher_args[@]+"${launcher_args[@]}"} \
+    ${extra[@]+"${extra[@]}"})"
   tmux new-session -d -s "$session" -c "$dir" "$cmd"
   tmux pipe-pane -t "=$session:" -o "cat >> $(printf '%q' "$state/output.log")"
 
@@ -178,6 +228,7 @@ cmd_start() {
     echo "name=$name"
     echo "session=$session"
     echo "dir=$dir"
+    echo "harness=$harness"
     echo "label=worker:$name"
     if [[ -n "$chat" ]]; then echo "chat=$chat"; fi
     echo "created=$(date '+%Y-%m-%dT%H:%M:%S%z')"
@@ -316,18 +367,19 @@ cmd_key() {
 }
 
 cmd_list() {
-  local name printed=0
-  printf '%-20s %-8s %s\n' NAME STATE DIR
+  local name harness printed=0
+  printf '%-20s %-8s %-7s %s\n' NAME STATE ENGINE DIR
   for dir in "$STATE_ROOT"/*/; do
     [[ -d "$dir" ]] || continue
     # Skip artifact dirs without meta (e.g. created by the todo relay for
     # non-worker hash storage) — they aren't workers.
     [[ -f "$dir/meta" ]] || continue
     name="$(basename "$dir")"
+    harness="$(meta_get "$name" harness)"; [[ -n "$harness" ]] || harness="claude"
     if alive "$name"; then
-      printf '%-20s %-8s %s\n' "$name" running "$(meta_get "$name" dir)"
+      printf '%-20s %-8s %-7s %s\n' "$name" running "$harness" "$(meta_get "$name" dir)"
     else
-      printf '%-20s %-8s %s\n' "$name" stopped "$(meta_get "$name" dir)"
+      printf '%-20s %-8s %-7s %s\n' "$name" stopped "$harness" "$(meta_get "$name" dir)"
     fi
     printed=1
   done
@@ -335,7 +387,7 @@ cmd_list() {
   while IFS= read -r session; do
     name="${session#"$SESSION_PREFIX"}"
     [[ -f "$STATE_ROOT/$name/meta" ]] && continue
-    printf '%-20s %-8s %s\n' "$name" running "(no recorded state)"
+    printf '%-20s %-8s %-7s %s\n' "$name" running "?" "(no recorded state)"
     printed=1
   done < <(tmux list-sessions -F '#S' 2>/dev/null | grep "^$SESSION_PREFIX" || true)
   (( printed )) || echo "(no workers)"
@@ -367,18 +419,18 @@ cmd_stop() {
 
 cmd_restart() {
   require_name "${1:-}"
-  local name="$1" dir chat
+  local name="$1" dir chat harness
   dir="$(meta_get "$name" dir)"
   chat="$(meta_get "$name" chat)"
+  harness="$(meta_get "$name" harness)"
+  [[ -n "$harness" ]] || harness="claude"  # pre-harness workers default to claude
   [[ -n "$dir" ]] || die "no recorded state for '$name' (use: claude-worker start $name --dir DIR)"
   if alive "$name"; then
     tmux kill-session -t "=$(session_for "$name")"
   fi
-  if [[ -n "$chat" ]]; then
-    cmd_start "$name" --dir "$dir" --chat "$chat"
-  else
-    cmd_start "$name" --dir "$dir"
-  fi
+  local restart_args=(--dir "$dir" --harness "$harness")
+  [[ -n "$chat" ]] && restart_args+=(--chat "$chat")
+  cmd_start "$name" "${restart_args[@]}"
 }
 
 cmd="${1:-}"

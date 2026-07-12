@@ -21,9 +21,18 @@ Secrets: ~/.config/claude-workers/discord-bot-token   (Discord bot token)
                                                        BRIDGE_WEBHOOK_SECRET,
                                                        shared with the hooks)
 
+Workers run on either engine: Claude Code (default) or Codex in YOLO mode
+(bypass all approvals + sandbox, the analog of Claude's bypass-permissions).
+`/harness` switches a channel between them; each engine keeps its own
+conversation. The Discord protocol, replies, and every command below work on
+both — Codex's turn-end reply is pushed by its Stop hook (codex-worker-done-relay,
+see docs/agent-control-plane.md), and its protocol is injected as the first
+message rather than a system prompt.
+
 Commands are native Discord slash commands (allowed users; synced per guild
 on connect). The `worker` option defaults to the channel's mapped worker:
-  /status                  list all workers and their state
+  /status                  list all workers, their state, and engine
+  /harness <claude|codex> [worker]   switch a channel's engine (codex = YOLO)
   /stop /restart /screen [worker]
   /usage [worker]          usage & session cost: plan rate-limit bars + this
                            worker's session cost (owner or a channel's editors;
@@ -202,17 +211,25 @@ def system_prompt(name):
     return PROTOCOL
 
 
-def start_args(name, directory, channel_id, resume, profile="owner"):
-    """argv for claude-worker start, with the Discord protocol injected and the
-    channel's capability profile applied (owner = full trust, unchanged)."""
+def start_args(name, directory, channel_id, resume, profile="owner",
+               harness="claude"):
+    """argv for claude-worker start. Claude workers get the Discord protocol
+    injected as a system prompt and the channel's capability profile applied
+    (owner = full trust, unchanged). Codex workers run in YOLO full-trust with
+    no settings-file profile (those are Claude-only) — their protocol is
+    injected by the bridge as the worker's first message instead, and resume is
+    the launcher's own `resume --last`, so nothing rides after `--`."""
     args = [
         "claude-worker", "start", name,
         "--dir", directory,
         "--chat", f"discord:{channel_id}",
-        "--",
+        "--harness", harness,
     ]
     if resume:
-        args.append("--continue")
+        args.append("--resume")
+    if harness == "codex":
+        return args
+    args.append("--")
     args += profile_args(profile)
     args += ["--append-system-prompt", system_prompt(name)]
     return args
@@ -576,35 +593,67 @@ def screen_is_compacting(screen):
     return "Compacting" in screen
 
 
-def screen_is_ready(screen):
+# The idle input-prompt glyph differs per engine: Claude Code uses "❯", Codex
+# uses "›". Everything else about readiness converges (see screen_is_ready).
+PROMPT_CHARS = {"claude": "❯", "codex": "›"}
+
+
+def harness_for(repo):
+    """The engine driving a repo's worker: 'claude' (default) or 'codex'.
+
+    Absent/unknown values normalize to 'claude', so every pre-harness channel
+    keeps its current behavior untouched."""
+    h = (repo or {}).get("harness") or "claude"
+    return h if h in ("claude", "codex") else "claude"
+
+
+def screen_is_ready(screen, harness="claude"):
     """True when a worker pane shows an idle, input-ready prompt.
 
     The readiness counterpart to worker_busy, used to gate cold-start
-    delivery: false during boot, while a turn runs ("esc to interrupt"),
-    while a --continue resume auto-compacts ("Compacting"), at the folder-trust
-    dialog, or at the resume-mode dialog (whose menu cursor is also a "❯") — so
-    the bridge never pastes the waking message into a TUI that is still loading
-    or showing a blocking dialog and would silently discard it.
+    delivery: false during boot, while a turn runs (Claude "esc to interrupt",
+    Codex "Working (… esc to interrupt)"), while a Claude --continue resume
+    auto-compacts ("Compacting"), or at a blocking startup dialog — so the
+    bridge never pastes the waking message into a TUI that is still loading or
+    showing a dialog and would silently discard it.
+
+    A dialog awaiting input is always the bottom-most thing on screen, so the
+    dialog markers are only honored in the tail: a dismissed dialog lingers in
+    tmux scrollback, and Codex's compact boot keeps it inside the capture
+    window (Claude's longer boot scrolls it out), so a full-screen match would
+    read a gone dialog as still-open and the worker would never look ready.
     """
-    if "❯" not in screen:
+    prompt = PROMPT_CHARS.get(harness, "❯")
+    if prompt not in screen:
         return False
-    blockers = (
-        "esc to interrupt", "Compacting", "Do you trust", "trust this folder",
-        "Resume from summary", "Resume full session",
-    )
-    return not any(b in screen for b in blockers)
+    running = ("esc to interrupt", "Compacting", "Working (")
+    if any(b in screen for b in running):
+        return False
+    tail = "\n".join((screen or "").splitlines()[-15:])
+    dialogs = ("Do you trust", "trust this folder",
+               "Resume from summary", "Resume full session")
+    return not any(b in tail for b in dialogs)
 
 
-def composer_is_empty(screen):
+def composer_is_empty(screen, harness="claude"):
     """True when the worker's input box holds no pending text. The live input
-    box is the last ❯-prefixed line in the pane (earlier ❯ lines are echoed
-    conversation turns); an empty box reads as just "❯". Guards /usage from
-    appending "/usage" onto a half-written message someone left in the box."""
+    box is the last prompt-prefixed line in the pane (earlier prompt lines are
+    echoed conversation turns); an empty box reads as just the prompt glyph.
+    Guards /usage from appending onto a half-written message left in the box.
+
+    Codex renders greyed placeholder suggestions ("Run /review on my current
+    changes") inside an *empty* composer, which are indistinguishable from real
+    typed text at the capture level — so for Codex this can't reliably detect a
+    half-written message and returns True (accept the small risk rather than
+    wedge). Claude shows a truly empty "❯" box, so the check is exact there."""
+    prompt = PROMPT_CHARS.get(harness, "❯")
+    if harness == "codex":
+        return True
     box = None
     for line in (screen or "").splitlines():
         s = line.strip()
-        if s.startswith("❯"):
-            box = s[1:].strip()
+        if s.startswith(prompt):
+            box = s[len(prompt):].strip()
     return box == ""
 
 
@@ -645,9 +694,11 @@ def render_screen_png(text, path):
     return r.returncode == 0 and os.path.isfile(path)
 
 
-def worker_start(name, directory, channel_id, resume, profile="owner"):
+def worker_start(name, directory, channel_id, resume, profile="owner",
+                 harness="claude"):
     return _run(
-        start_args(name, directory, channel_id, resume, profile), timeout=180
+        start_args(name, directory, channel_id, resume, profile, harness),
+        timeout=180,
     )
 
 
@@ -790,6 +841,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             last = now
             await asyncio.sleep(0.5)
 
+    # Workers that were started fresh on Codex and still need the Discord
+    # protocol prepended to their first real message (Codex has no
+    # --append-system-prompt; the protocol rides in as a user turn instead).
+    codex_unprimed = set()
+
     async def wait_ready(name, timeout=180):
         """Poll until the worker pane is idle and input-ready (or timeout).
 
@@ -800,13 +856,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         compaction from being mistaken for readiness. Returns True if ready,
         False on timeout or if the worker died.
         """
+        harness = harness_of(name)
         stable = 0
         deadline = time.time() + timeout
         while time.time() < deadline:
             if not await asyncio.to_thread(worker_alive, name):
                 return False
             screen = await asyncio.to_thread(worker_screen, name, 40)
-            if screen_is_ready(screen):
+            if screen_is_ready(screen, harness):
                 stable += 1
                 if stable >= 2:
                     return True
@@ -823,6 +880,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if repo["name"] == name:
                 return int(cid)
         return None
+
+    def harness_of(name):
+        """The engine a worker runs, from its channel's config (default claude)."""
+        for repo in cfg["repos"].values():
+            if repo["name"] == name:
+                return harness_for(repo)
+        return "claude"
 
     async def post(channel_id, text, attachments=None):
         channel = client.get_channel(channel_id)
@@ -916,10 +980,20 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         when the worker is busy or has half-written input in the box."""
         if not await asyncio.to_thread(worker_alive, name):
             return f"📊 `{name}` isn't running right now.", None
+        harness = harness_of(name)
+        if harness == "codex":
+            # Codex's /usage is a different panel and its slash form can *spend*
+            # a usage-limit reset, so the bridge must not auto-invoke it. Point
+            # at /screen instead.
+            return (
+                f"📊 usage isn't wired up for Codex workers (Codex's panel works "
+                f"differently, and `/usage` there spends a reset) — use `/screen` "
+                f"to peek at `{name}`.", None,
+            )
         screen = await asyncio.to_thread(worker_screen, name, 30)
-        if not screen_is_ready(screen):
+        if not screen_is_ready(screen, harness):
             return f"📊 `{name}` is busy right now — try `/usage` once it's idle.", None
-        if not composer_is_empty(screen):
+        if not composer_is_empty(screen, harness):
             return (
                 f"📊 `{name}` has unsent text in its input box — clear it first, "
                 "then try `/usage`.", None,
@@ -991,17 +1065,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if repo and channel_id:
                 print(f"[bridge] {name}: send wedged, restarting worker to recover")
                 await asyncio.to_thread(worker_stop, name)
-                # Carry the channel's capability profile through the restart —
-                # omitting it would silently relaunch a restricted (utility /
-                # greeter) worker as full-trust owner.
+                # Carry the channel's capability profile AND engine through the
+                # restart — omitting either would silently relaunch a restricted
+                # (utility/greeter) worker as full-trust owner, or a Codex worker
+                # as Claude.
                 r2 = await asyncio.to_thread(
                     worker_start, name, repo["dir"], channel_id, True,
-                    repo.get("profile", "owner"),
+                    repo.get("profile", "owner"), harness_for(repo),
                 )
                 if r2.returncode == 0:
-                    # The restart resumes with --continue and may auto-compact;
-                    # wait for an input-ready prompt before re-sending so the
-                    # recovery doesn't re-lose the message into a loading TUI.
+                    # The restart resumes and may auto-compact; wait for an
+                    # input-ready prompt before re-sending so the recovery
+                    # doesn't re-lose the message into a loading TUI.
                     await wait_ready(name)
                     r = await asyncio.to_thread(worker_send, name, text, typed)
         if r.returncode != 0:
@@ -1079,12 +1154,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     async def handle_repo_message(message, repo):
         name, directory = repo["name"], repo["dir"]
+        harness = harness_for(repo)
         if not await asyncio.to_thread(worker_alive, name):
             resume = should_resume(worker_has_state(name), fresh_pending(name))
             await message.add_reaction("🚀" if resume else "🧼")
             r = await asyncio.to_thread(
                 worker_start, name, directory, message.channel.id, resume,
-                repo.get("profile", "owner"),
+                repo.get("profile", "owner"), harness,
             )
             if r.returncode != 0:
                 await message.channel.send(
@@ -1093,6 +1169,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 return
             # Started — consume any armed /fresh so it only skips resume once.
             await asyncio.to_thread(disarm_fresh, name)
+            # A fresh Codex session has no injected system prompt, so arm the
+            # first-message protocol injection (a resumed one already carries it
+            # in its restored history).
+            if harness == "codex" and not resume:
+                codex_unprimed.add(name)
             # The resume can auto-compact; wait for a genuinely input-ready
             # prompt before pasting, or this waking message is discarded when
             # the resume/compaction redraw replaces the input box.
@@ -1112,7 +1193,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             await deliver(name, message.content or "(no text)", message,
                           typed=False, tag=tag)
             return
-        # Leading "/" means a Claude Code slash command — type it so the TUI
+        # Leading "/" means an engine slash command — type it so the TUI
         # actually executes it instead of treating it as pasted text. Commands
         # go verbatim; everything else can carry a reply quote and attachments.
         if message.content.startswith("/"):
@@ -1121,6 +1202,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         paths = await save_attachments(name, message)
         quote = await reply_snippet(message)
         composed = compose_inbound(message.content, paths, quote)
+        # First real message to a fresh Codex worker: prepend the Discord
+        # protocol (Codex's stand-in for Claude's --append-system-prompt). One
+        # shot — a resumed session already has it in history.
+        if name in codex_unprimed:
+            composed = system_prompt(name) + "\n\n---\n\n" + composed
+            codex_unprimed.discard(name)
         await deliver(name, composed, message, typed=False)
 
     def repo_by_name(name):
@@ -1163,7 +1250,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await asyncio.to_thread(worker_stop, name)
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_for_worker(name), True,
-            repo.get("profile", "owner"),
+            repo.get("profile", "owner"), harness_for(repo),
         )
         # Explicit resume: cancel any armed fresh so it can't re-fire.
         await asyncio.to_thread(disarm_fresh, name)
@@ -1173,24 +1260,65 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         )
 
     async def do_clear(name):
-        # Deterministic context wipe: a fresh session (no --continue) instead
-        # of the /clear TUI command, so it works regardless of worker state
-        # and re-injects the Discord protocol.
+        # Deterministic context wipe: a fresh session (no resume) instead of the
+        # /clear TUI command, so it works regardless of worker state and
+        # re-injects the Discord protocol.
         repo = repo_by_name(name)
         if not repo:
             return f"⚠️ no repo channel mapped for `{name}`", None
         channel_id = channel_for_worker(name)
+        harness = harness_for(repo)
         await asyncio.to_thread(worker_stop, name)
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_id, False,
-            repo.get("profile", "owner"),
+            repo.get("profile", "owner"), harness,
         )
         await asyncio.to_thread(disarm_fresh, name)
         if r.returncode != 0:
             return f"⚠️ clear failed: {r.stderr.strip()}", None
+        # Fresh Codex session: re-arm first-message protocol injection.
+        if harness == "codex":
+            codex_unprimed.add(name)
         # Wiped the worker's context — wipe the channel's clutter to match.
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
+
+    async def do_harness(name, engine):
+        """Switch a channel's worker between engines ('claude' or 'codex').
+
+        Not a hot-swap — a live TUI can't change engines — so this persists the
+        choice, stops the running worker, and lets the next message start it on
+        the new engine. Claude and Codex keep SEPARATE session stores, so
+        switching to Codex begins a fresh Codex session while Claude's thread
+        stays intact (and vice versa): each engine remembers its own last
+        conversation. Codex always runs in YOLO mode (bypass all approvals +
+        sandbox), the analog of Claude's bypass-permissions."""
+        engine = (engine or "").strip().lower()
+        if engine not in ("claude", "codex"):
+            return f"⚠️ harness must be `claude` or `codex` (got `{engine}`)", None
+        item = next(
+            ((cid, r) for cid, r in cfg["repos"].items() if r["name"] == name), None
+        )
+        if not item:
+            return f"⚠️ no repo channel mapped for `{name}`", None
+        _, repo = item
+        if harness_for(repo) == engine:
+            return f"↔️ `{name}` is already on **{engine}** — nothing to change.", None
+        repo["harness"] = engine
+        save_config(cfg, config_path)
+        # Stop the current worker so the next message revives it on the new
+        # engine; a stale codex-prime flag from the old engine is cleared.
+        if await asyncio.to_thread(worker_alive, name):
+            await asyncio.to_thread(worker_stop, name)
+        codex_unprimed.discard(name)
+        last_activity.pop(name, None)
+        note = " **(YOLO mode)**" if engine == "codex" else ""
+        print(f"[bridge] harness: {name} -> {engine}")
+        return (
+            f"🔀 `{name}` is now driven by **{engine}**{note}. Your next message "
+            "starts it — each engine keeps its own conversation, so switching "
+            "back resumes that engine's last thread.", None,
+        )
 
     async def do_close(name):
         # Fully retire a worker: stop it, wipe its saved state, and drop its
@@ -1526,14 +1654,28 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         )
         await interaction.followup.send(f"📨 asked `{name}` for a check-in")
 
+    @tree.command(name="harness", description="Switch a channel between Claude and Codex (codex = YOLO mode)")
+    @describe(engine="claude or codex", worker="Worker (defaults to this channel's worker)")
+    async def slash_harness(interaction, engine: str, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await do_harness(name, engine))
+
     @tree.command(name="model", description="Switch a worker's model")
     @describe(model="e.g. opus, sonnet, haiku", worker="Worker (defaults to this channel's worker)")
     async def slash_model(interaction, model: str, worker: str = None):
         if not (name := await guard(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
+        # On Codex, /model opens an interactive picker (no inline arg), so this
+        # types the command; the value is best set in the picker via /screen or
+        # by switching before work. On Claude it sets the model directly.
         await deliver(name, f"/model {model}", typed=True)
-        await interaction.followup.send(f"🔧 sent `/model {model}` to `{name}`")
+        engine = harness_of(name)
+        hint = (" — Codex's /model is an interactive picker; use /screen to drive it"
+                if engine == "codex" else "")
+        await interaction.followup.send(f"🔧 sent `/model {model}` to `{name}`{hint}")
 
     @tree.command(name="compact", description="Compact a worker's context")
     @describe(focus="Optional focus for the compaction", worker="Worker (defaults to this channel's worker)")
@@ -1758,10 +1900,22 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # turn's text.
                 worker_spoke = name in notified
                 notified.discard(name)
+                # Codex's Stop hook hands us the final assistant message inline
+                # (the relay always sets a "reply" key, empty string included);
+                # Claude's relay never does, so its absence selects the
+                # transcript-parsing path below.
+                codex_reply = event.get("reply")
                 if channel_id and worker_spoke:
-                    _, off = extract_new_reply(path, offsets.get(path, 0))
-                    offsets[path] = off
+                    if codex_reply is None:
+                        _, off = extract_new_reply(path, offsets.get(path, 0))
+                        offsets[path] = off
                     print(f"[bridge] {name}: turn ended, worker already notified — fallback silent")
+                elif channel_id and codex_reply is not None:
+                    # Codex: no transcript parse — the reply rode in on the event.
+                    reply = codex_reply.strip() or "(no new reply text captured — use /screen)"
+                    print(f"[bridge] {name}: codex turn ended, posting "
+                          f"{len(reply)} chars to {channel_id}")
+                    await post(channel_id, reply)
                 elif channel_id:
                     # The Stop hook can fire before Claude Code flushes the final
                     # assistant message, and a stale read returns the PREVIOUS
@@ -1901,13 +2055,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 last_activity[name] = time.time()
                 return web.json_response({"status": "ok", "note": "already running"})
             resume = should_resume(worker_has_state(name), fresh_pending(name))
+            harness = harness_for(repo)
             r = await asyncio.to_thread(
                 worker_start, name, repo["dir"], channel_id, resume,
-                repo.get("profile", "owner"),
+                repo.get("profile", "owner"), harness,
             )
             if r.returncode != 0:
                 return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)
             await asyncio.to_thread(disarm_fresh, name)
+            if harness == "codex" and not resume:
+                codex_unprimed.add(name)
             last_activity[name] = time.time()
             print(f"[bridge] start event: worker {name} running")
         elif etype == "claude.bridge.peek":

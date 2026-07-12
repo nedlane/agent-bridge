@@ -93,6 +93,40 @@ only acts for orchestrated workers (those started by `claude-worker`, which sets
 `$CLAUDE_WORKER`), a manual `claude` session stays silent, and each always exits
 `0` so a relay failure can never break the Claude session.
 
+## 2b. Codex worker profile (`~/.codex/worker.config.toml`)
+
+A channel switched to Codex (`/harness codex`) needs the Codex equivalent of the
+`Stop` relay. Codex fires its own **`Stop`** hook at the end of every turn, and
+its payload carries the final assistant message inline — so `codex-worker-done-relay`
+reads it and POSTs the same `claude.worker.turn_ended` event, reply text and all
+(no transcript parsing).
+
+To keep the hook out of your everyday `codex` sessions — where it would trigger a
+"Hooks need review" prompt — it lives in a **profile**, not your base
+`~/.codex/config.toml`. `codex-launch` starts workers with `-p worker`
+(and `--dangerously-bypass-hook-trust`, so it runs unattended), which layers
+`~/.codex/worker.config.toml` on top of your base config for workers only.
+
+Install the profile (a template ships in this repo):
+
+```bash
+cp codex-profiles/worker.config.toml ~/.codex/worker.config.toml
+```
+
+It contains just:
+
+```toml
+[hooks]
+Stop = [ { hooks = [ { type = "command", command = "codex-worker-done-relay" } ] } ]
+```
+
+Like the Claude relay, `codex-worker-done-relay` only acts for chat-bound workers
+(`$CLAUDE_WORKER` set + a `chat=` in the worker meta), skips `stop_hook_active`
+continuations to avoid loops, and always exits `0`. Without the profile a Codex
+worker still runs — it just falls back to the worker's own `discord-notify` for
+replies (no silent-turn safety net). Your base `~/.codex/config.toml` is never
+modified.
+
 ## 3. Secret files under `~/.config/claude-workers/`
 
 Create these three files and `chmod 600` each — they are read for content only,
