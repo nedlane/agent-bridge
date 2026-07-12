@@ -7,7 +7,7 @@ description: Manage the Discord↔Claude-worker bridge on this machine — add a
 
 `claude-bridge` (systemd user service) is a deterministic pipe: each Discord
 channel under the **Claude** category maps to one tmux Claude Code worker
-(`claude-worker`). No LLM in the bridge. Messages in `#<repo>` go to the
+(`agent-worker`). No LLM in the bridge. Messages in `#<repo>` go to the
 worker; the worker's replies come back via its Stop hook; idle workers are
 reaped and revived with `claude --continue`.
 
@@ -31,7 +31,7 @@ discord-notify -t discord:<channel_id> "first message"   # talk into it
 Ned can also run the `/addrepo <name> <path>` slash command in Discord. Prefer these tools
 over editing config or calling the Discord REST API by hand; the bridge owns
 channel creation and the mapping file. To hand a worker a task end-to-end:
-`bridge-ctl start <name>`, then `claude-worker send <name> "the task"`.
+`bridge-ctl start <name>`, then `agent-worker send <name> "the task"`.
 
 ## The orchestrator
 

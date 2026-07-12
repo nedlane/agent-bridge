@@ -1,19 +1,21 @@
-# claude-bridge — Discord <-> Claude Code worker pipe (desktop only).
-# Linked to ~/.config/systemd/user/ by scripts/link.sh; linger keeps it
-# running after logout. Enable with:
+# agent-bridge — Discord <-> agent worker pipe, Claude Code or Codex (desktop
+# only). The daemon was renamed claude-bridge -> agent-bridge; the unit file
+# name stays claude-bridge.service so `systemctl --user restart claude-bridge`
+# is unchanged. Linked to ~/.config/systemd/user/ by scripts/link.sh; linger
+# keeps it running after logout. Enable with:
 #   systemctl --user enable --now claude-bridge
 [Unit]
-Description=claude-bridge Discord to Claude Code worker pipe
+Description=agent-bridge Discord to Claude Code / Codex worker pipe
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/claude-bridge
+ExecStart=%h/.local/bin/agent-bridge
 Environment=PYTHONUNBUFFERED=1
 # Don't scatter .pyc files beside the tools in the checkout.
 Environment=PYTHONDONTWRITEBYTECODE=1
-# The user manager's default PATH lacks ~/.local/bin, where claude-worker
-# and claude itself live — without this the bridge can't spawn workers.
+# The user manager's default PATH lacks ~/.local/bin, where agent-worker,
+# codex, and claude itself live — without this the bridge can't spawn workers.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5

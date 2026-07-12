@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Manage persistent tmux-backed interactive Claude Code workers (desktop-only
 # half of the local agent control plane: Discord/OpenClaw/Hermes -> Codex ->
-# claude-worker -> tmux -> claude-launch -> interactive Claude Code).
+# agent-worker -> tmux -> claude-launch -> interactive Claude Code).
 #
 # Each worker is a detached tmux session named "cw-<name>" running
 # shared/bin/claude-launch, so it uses the normal interactive subscription
@@ -10,20 +10,20 @@
 # distinguishable (for Codex and in the claude.ai session list) from manual
 # `cl` sessions, whose titles use the directory name.
 #
-#   claude-worker start <name> [--dir DIR] [--harness claude|codex] [--resume]
+#   agent-worker start <name> [--dir DIR] [--harness claude|codex] [--resume]
 #                              [-- engine args...]
 #                                            # blocks until the worker is ready
 #                                            # --harness picks the engine
 #                                            #   (codex runs in YOLO mode)
-#   claude-worker send  <name> <text|->     # '-' reads the message from stdin
-#   claude-worker wait  <name> [--for TEXT] [--timeout SECS]
+#   agent-worker send  <name> <text|->     # '-' reads the message from stdin
+#   agent-worker wait  <name> [--for TEXT] [--timeout SECS]
 #                                            # block until idle (or TEXT shows)
-#   claude-worker read  <name> [lines]      # capture the worker's screen
-#   claude-worker key   <name> <key>...     # send raw keys (Escape, C-c, …)
-#   claude-worker list
-#   claude-worker status <name>
-#   claude-worker restart <name>            # same name, same recorded dir
-#   claude-worker stop <name>
+#   agent-worker read  <name> [lines]      # capture the worker's screen
+#   agent-worker key   <name> <key>...     # send raw keys (Escape, C-c, …)
+#   agent-worker list
+#   agent-worker status <name>
+#   agent-worker restart <name>            # same name, same recorded dir
+#   agent-worker stop <name>
 #
 # State (no secrets) lives under ${XDG_STATE_HOME:-~/.local/state}/claude-workers/<name>/:
 #   meta        flat key=value: name, session, dir, label, created, log
@@ -42,16 +42,16 @@ POLL="${CLAUDE_WORKER_POLL:-4}"
 START_TIMEOUT="${CLAUDE_WORKER_START_TIMEOUT:-90}"
 
 usage() {
-  sed -n '/^#   claude-worker/,/^# Orchestrators/p' "$0" | sed 's/^# \{0,2\}//'
+  sed -n '/^#   agent-worker/,/^# Orchestrators/p' "$0" | sed 's/^# \{0,2\}//'
 }
 
 die() {
-  echo "claude-worker: $*" >&2
+  echo "agent-worker: $*" >&2
   exit 1
 }
 
 require_name() {
-  [[ -n "${1:-}" ]] || die "worker name required (see claude-worker --help)"
+  [[ -n "${1:-}" ]] || die "worker name required (see agent-worker --help)"
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
     || die "invalid worker name '$1' (letters, digits, '-', '_' only)"
 }
@@ -126,7 +126,7 @@ is_paste_chip() { grep -qE '\[Pasted text #[0-9]+' <<<"$1"; }
 wait_until() {
   local name="$1" timeout="$2" for_text="${3:-}" started=$SECONDS screen done_now stable=0
   while :; do
-    alive "$name" || { echo "claude-worker: worker '$name' died while waiting" >&2; return 1; }
+    alive "$name" || { echo "agent-worker: worker '$name' died while waiting" >&2; return 1; }
     screen="$(screen_of "$name")"
     done_now=0
     if is_trust_dialog "$screen" || is_resume_dialog "$screen"; then
@@ -181,7 +181,7 @@ cmd_start() {
   [[ "$harness" == claude || "$harness" == codex ]] \
     || die "invalid --harness '$harness' (claude or codex)"
   [[ -d "$dir" ]] || die "no such directory: $dir"
-  alive "$name" && die "worker '$name' is already running (try: claude-worker restart $name)"
+  alive "$name" && die "worker '$name' is already running (try: agent-worker restart $name)"
 
   local session state launcher launcher_args=()
   session="$(session_for "$name")"
@@ -247,7 +247,7 @@ cmd_start() {
   else
     case $? in
       1) die "worker '$name' exited during startup (check $state/output.log)" ;;
-      *) echo "  state:  still starting after ${START_TIMEOUT}s — check with: claude-worker read $name" >&2 ;;
+      *) echo "  state:  still starting after ${START_TIMEOUT}s — check with: agent-worker read $name" >&2 ;;
     esac
   fi
 }
@@ -274,7 +274,7 @@ cmd_wait() {
   fi
   case $? in
     1) exit 1 ;;
-    *) echo "claude-worker: timed out after ${timeout}s; current screen:" >&2
+    *) echo "agent-worker: timed out after ${timeout}s; current screen:" >&2
        screen_of "$name" | grep -v '^[[:space:]]*$' | tail -15 >&2
        exit 2 ;;
   esac
@@ -291,7 +291,7 @@ cmd_send() {
       *)      text="$1"; shift ;;
     esac
   done
-  [[ -n "$text" ]] || die "usage: claude-worker send <name> [--type] <text|->"
+  [[ -n "$text" ]] || die "usage: agent-worker send <name> [--type] <text|->"
   alive "$name" || die "worker '$name' is not running"
   [[ "$text" == "-" ]] && text="$(cat)"
   local pane
@@ -331,7 +331,7 @@ cmd_send() {
       landed=1; break
     fi
   done
-  (( landed )) || die "message never reached the input box of worker '$name' (still booting/compacting? claude-worker read $name)"
+  (( landed )) || die "message never reached the input box of worker '$name' (still booting/compacting? agent-worker read $name)"
   # Let the bracketed-paste end-sequence settle before the first Enter, or the
   # TUI can absorb it into the paste and the chip never submits.
   sleep "$SEND_DELAY"
@@ -343,7 +343,7 @@ cmd_send() {
       return 0
     fi
   done
-  die "message did not submit to worker '$name' after $attempt Enter attempts; the input box still holds it (claude-worker read $name to inspect)"
+  die "message did not submit to worker '$name' after $attempt Enter attempts; the input box still holds it (agent-worker read $name to inspect)"
 }
 
 cmd_read() {
@@ -362,7 +362,7 @@ cmd_key() {
   require_name "${1:-}"
   local name="$1"; shift
   alive "$name" || die "worker '$name' is not running"
-  (($#)) || die "usage: claude-worker key <name> <key> [key...]"
+  (($#)) || die "usage: agent-worker key <name> <key> [key...]"
   tmux send-keys -t "$(pane_for "$name")" "$@"
 }
 
@@ -414,7 +414,7 @@ cmd_stop() {
   local name="$1"
   alive "$name" || die "worker '$name' is not running"
   tmux kill-session -t "=$(session_for "$name")"
-  echo "stopped worker '$name' (state kept; restart with: claude-worker restart $name)"
+  echo "stopped worker '$name' (state kept; restart with: agent-worker restart $name)"
 }
 
 cmd_restart() {
@@ -424,7 +424,7 @@ cmd_restart() {
   chat="$(meta_get "$name" chat)"
   harness="$(meta_get "$name" harness)"
   [[ -n "$harness" ]] || harness="claude"  # pre-harness workers default to claude
-  [[ -n "$dir" ]] || die "no recorded state for '$name' (use: claude-worker start $name --dir DIR)"
+  [[ -n "$dir" ]] || die "no recorded state for '$name' (use: agent-worker start $name --dir DIR)"
   if alive "$name"; then
     tmux kill-session -t "=$(session_for "$name")"
   fi
@@ -438,5 +438,5 @@ shift || true
 case "$cmd" in
   start|send|wait|read|key|list|status|stop|restart) "cmd_$cmd" "$@" ;;
   ''|-h|--help|help) usage ;;
-  *) die "unknown command '$cmd' (see claude-worker --help)" ;;
+  *) die "unknown command '$cmd' (see agent-worker --help)" ;;
 esac

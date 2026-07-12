@@ -10,20 +10,20 @@ interactive Claude Code session on this machine, and — most importantly — th
 Discord channel  (one channel per repo, under a "Claude" category)
       │
       ▼
-claude-bridge          discord.py client + a signed localhost HTTP listener
+agent-bridge           discord.py client + a signed localhost HTTP listener
                        (aiohttp) bound to 127.0.0.1:<listen_port>, default 8765
-      │  forwards your message with `claude-worker send`
+      │  forwards your message with `agent-worker send`
       ▼
-claude-worker          worker lifecycle over a tmux session named `cw-<name>`
-      │  launches / resumes the session
+agent-worker          worker lifecycle over a tmux session named `cw-<name>`
+      │  launches / resumes the session (Claude Code via claude-launch, or
+      ▼                                  Codex via codex-launch in YOLO mode)
+claude-launch / codex-launch   wrapper that starts the interactive engine on
+      │                        the subscription auth path (see §4)
       ▼
-claude-launch          wrapper that starts interactive `claude` on the Claude
-      │                subscription auth path (see §4)
-      ▼
-Claude Code (interactive)   the only intelligence in the loop
+Claude Code / Codex (interactive)   the only intelligence in the loop
 ```
 
-There is **no LLM in the bridge**. `claude-bridge` is a deterministic pipe: it
+There is **no LLM in the bridge**. `agent-bridge` is a deterministic pipe: it
 maps each Discord channel 1:1 to one tmux-backed worker, forwards channel
 messages into the worker as keystrokes, and posts replies back out. All
 reasoning happens inside Claude Code, running on the Claude subscription.
@@ -89,7 +89,7 @@ Complete minimal `~/.claude/settings.json`:
 
 If you already have a `settings.json`, merge these into your existing `hooks`
 object rather than replacing the file. Both relays are safe by design: each
-only acts for orchestrated workers (those started by `claude-worker`, which sets
+only acts for orchestrated workers (those started by `agent-worker`, which sets
 `$CLAUDE_WORKER`), a manual `claude` session stays silent, and each always exits
 `0` so a relay failure can never break the Claude session.
 
@@ -183,9 +183,9 @@ duplicating it here.
 ## 4. The `claude-launch` dependency contract
 
 `claude-launch` is **not in this repo.** It lives in the private
-[nedlane/dotfiles](https://github.com/nedlane/dotfiles) repo, and `claude-worker`
+[nedlane/dotfiles](https://github.com/nedlane/dotfiles) repo, and `agent-worker`
 locates it via `$DOTFILES_DIR`/`PATH` (falling back to
-`$DOTFILES_DIR/shared/bin/claude-launch`). If it is missing, `claude-worker`
+`$DOTFILES_DIR/shared/bin/claude-launch`). If it is missing, `agent-worker`
 dies with an error telling you to run `scripts/link.sh` — but linking cannot
 supply a file this repo does not ship. **Without `claude-launch`, only bare
 `claude` workers run and the per-channel capability profiles do not function.**
@@ -203,7 +203,7 @@ cloud-provider billing.
 
 | Flag | Used for |
 |---|---|
-| `--label <text>` | Tag the session (`claude-worker` passes `worker:<name>`). |
+| `--label <text>` | Tag the session (`agent-worker` passes `worker:<name>`). |
 | `--continue` | Resume the worker's previous session (idle revival). |
 | `--append-system-prompt <text>` | Append the per-worker brief the bridge builds. |
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""claude-bridge — deterministic Discord <-> Claude Code worker pipe.
+"""agent-bridge — deterministic Discord <-> agent worker pipe (Claude Code / Codex).
 
 Each Discord channel under the Claude category maps to one tmux-backed
 interactive Claude Code worker (channel-per-repo, one worker per repo, no
 threads). The bridge forwards your channel messages to the worker via
-`claude-worker send`, and posts the worker's replies back when the worker's
+`agent-worker send`, and posts the worker's replies back when the worker's
 Stop hook (claude-worker-done-relay) reports a finished turn. There is no
 LLM in the bridge: Claude Code, on the Claude subscription, is the only
 intelligence in the loop.
@@ -153,15 +153,15 @@ commands to type:
   bridge-ctl addrepo <name> </abs/path>   new repo channel (returns channel_id)
   bridge-ctl start <name>                 start that repo's worker (it gets
                                           this same Discord protocol)
-  claude-worker list / status <name> / read <name> [lines]
-  claude-worker send <name> "msg"         instruct a running worker
+  agent-worker list / status <name> / read <name> [lines]
+  agent-worker send <name> "msg"         instruct a running worker
                                           (--type for /slash commands)
-  claude-worker stop <name> / restart <name>
+  agent-worker stop <name> / restart <name>
   discord-notify -t discord:<channel_id> "..."   post into any repo channel
   agent-checkup                           control-plane health report
   systemctl --user status claude-bridge / journalctl --user -u claude-bridge -n 50
 Hand real repo work to that repo's worker (bridge-ctl start, then
-claude-worker send) — do not do another repo's task yourself in this session.
+agent-worker send) — do not do another repo's task yourself in this session.
 Orchestration requests are usually quick: do them, then confirm what you did
 via discord-notify."""
 
@@ -213,14 +213,14 @@ def system_prompt(name):
 
 def start_args(name, directory, channel_id, resume, profile="owner",
                harness="claude"):
-    """argv for claude-worker start. Claude workers get the Discord protocol
+    """argv for agent-worker start. Claude workers get the Discord protocol
     injected as a system prompt and the channel's capability profile applied
     (owner = full trust, unchanged). Codex workers run in YOLO full-trust with
     no settings-file profile (those are Claude-only) — their protocol is
     injected by the bridge as the worker's first message instead, and resume is
     the launcher's own `resume --last`, so nothing rides after `--`."""
     args = [
-        "claude-worker", "start", name,
+        "agent-worker", "start", name,
         "--dir", directory,
         "--chat", f"discord:{channel_id}",
         "--harness", harness,
@@ -557,7 +557,7 @@ def reply_preview(body, limit=200):
 
 
 # --------------------------------------------------------------------------
-# claude-worker subprocess wrappers (sync; called via asyncio.to_thread)
+# agent-worker subprocess wrappers (sync; called via asyncio.to_thread)
 # --------------------------------------------------------------------------
 
 
@@ -568,18 +568,18 @@ def _run(args, timeout=180, input_text=None):
             input=input_text,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        # Surface "claude-worker not on PATH" and hangs as a failed result so
+        # Surface "agent-worker not on PATH" and hangs as a failed result so
         # callers report them to the channel instead of dying in on_message.
         return subprocess.CompletedProcess(args, 127, stdout="", stderr=str(exc))
 
 
 def worker_alive(name):
-    r = _run(["claude-worker", "status", name], timeout=15)
+    r = _run(["agent-worker", "status", name], timeout=15)
     return "running: yes" in r.stdout
 
 
 def worker_busy(name):
-    r = _run(["claude-worker", "read", name, "30"], timeout=15)
+    r = _run(["agent-worker", "read", name, "30"], timeout=15)
     return "esc to interrupt" in r.stdout
 
 
@@ -682,7 +682,7 @@ def trim_usage_panel(screen):
 
 
 def worker_screen(name, lines=40):
-    r = _run(["claude-worker", "read", name, str(lines)], timeout=15)
+    r = _run(["agent-worker", "read", name, str(lines)], timeout=15)
     return r.stdout if r.returncode == 0 else r.stderr
 
 
@@ -703,7 +703,7 @@ def worker_start(name, directory, channel_id, resume, profile="owner",
 
 
 def worker_send(name, text, typed=False):
-    args = ["claude-worker", "send", name]
+    args = ["agent-worker", "send", name]
     if typed:
         args.append("--type")
     return _run(args + [text], timeout=30)
@@ -715,11 +715,11 @@ def worker_key(name, *keys):
     auto-presses Enter — it's for driving TUI overlays like the /usage panel,
     where worker_send's submit check would loop (the box never clears while the
     panel is up) and wrongly trip the wedge-recovery restart."""
-    return _run(["claude-worker", "key", name, *keys], timeout=15)
+    return _run(["agent-worker", "key", name, *keys], timeout=15)
 
 
 def worker_stop(name):
-    return _run(["claude-worker", "stop", name], timeout=30)
+    return _run(["agent-worker", "stop", name], timeout=30)
 
 
 def worker_has_state(name, state_root=None):
@@ -740,7 +740,7 @@ def fresh_pending(name, state_root=None):
 
 def arm_fresh(name, state_root=None):
     """Mark the worker so its next start skips --continue. The marker is a file
-    beside the worker's state (which `claude-worker stop` keeps), so the lazy
+    beside the worker's state (which `agent-worker stop` keeps), so the lazy
     revive on the next message reads it and starts clean."""
     path = fresh_marker_path(name, state_root)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -849,7 +849,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     async def wait_ready(name, timeout=180):
         """Poll until the worker pane is idle and input-ready (or timeout).
 
-        claude-worker start returns success even when its own readiness check
+        agent-worker start returns success even when its own readiness check
         timed out, and a --continue resume can kick off auto-compaction that
         wasn't visible yet when that check passed. Requiring the ready state on
         two consecutive polls keeps the brief idle window between resume and
@@ -1217,13 +1217,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     # Each returns (text, attachments) so the caller can respond however it
     # likes; worker restarts block, so their callers defer the interaction.
     async def do_status():
-        r = await asyncio.to_thread(_run, ["claude-worker", "list"], 15)
+        r = await asyncio.to_thread(_run, ["agent-worker", "list"], 15)
         return f"```\n{r.stdout}\n```", None
 
     async def do_status_one(name):
         # A guest sees only their own channel's worker — never the full roster
         # of every repo on the box.
-        r = await asyncio.to_thread(_run, ["claude-worker", "status", name], 15)
+        r = await asyncio.to_thread(_run, ["agent-worker", "status", name], 15)
         return f"```\n{r.stdout}\n```", None
 
     async def do_fresh(name):
@@ -2040,7 +2040,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         elif etype == "claude.bridge.start":
             # Tools-based worker start (bridge-ctl start) — same path as a
             # channel message, so the worker gets the injected protocol and
-            # --continue resume, unlike a bare `claude-worker start`.
+            # --continue resume, unlike a bare `agent-worker start`.
             name = (event.get("name") or "").strip()
             repo = next(
                 (r for r in cfg["repos"].values() if r["name"] == name), None

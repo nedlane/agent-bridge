@@ -1,15 +1,18 @@
 # agent-bridge
 
-A Discord-driven control plane for interactive Claude Code workers.
+A Discord-driven control plane for interactive Claude Code and Codex workers.
 
-`claude-bridge` maps each Discord channel (under a **Claude** category) 1:1 to a
-persistent tmux-backed Claude Code worker: one channel per repo, one worker per
-repo, no threads. Your channel messages are forwarded into the worker; the
-worker's replies and live task checklists are relayed back out through Claude
-Code hooks; each channel runs under a per-channel capability profile
+`agent-bridge` maps each Discord channel (under a **Claude** category) 1:1 to a
+persistent tmux-backed worker running either **Claude Code** or **Codex** (in
+YOLO mode): one channel per repo, one worker per repo, no threads. `/harness`
+switches a channel's engine. Your channel messages are forwarded into the
+worker; the worker's replies and live task checklists are relayed back out
+through engine hooks; each channel runs under a per-channel capability profile
 (`owner` / `collab` / `utility` / `greeter`). **There is no LLM inside the
-bridge** — Claude Code, running on your Claude subscription, is the only
-intelligence in the loop. The bridge is deterministic plumbing around it.
+bridge** — the agent (Claude Code or Codex), on your subscription, is the only
+intelligence in the loop. The bridge is deterministic plumbing around it. (The
+daemon and worker tools were renamed `claude-bridge`→`agent-bridge` and
+`claude-worker`→`agent-worker`; the old names remain as symlinks.)
 
 It is desktop-only tooling, originally extracted from
 [nedlane/dotfiles](https://github.com/nedlane/dotfiles) (where it lives as a git
@@ -20,8 +23,8 @@ MIT-licensed — see [`LICENSE`](LICENSE).
 
 | Path | What |
 |---|---|
-| `bin/claude-bridge` | Python daemon: Discord ↔ worker pipe (discord.py + signed-event HTTP listener) |
-| `bin/claude-worker` | Worker lifecycle over tmux sessions (`cw-<name>`) |
+| `bin/agent-bridge` | Python daemon: Discord ↔ worker pipe (discord.py + signed-event HTTP listener) |
+| `bin/agent-worker` | Worker lifecycle over tmux sessions (`cw-<name>`) |
 | `bin/bridge-ctl` | Thin signed client: add repos/guests, request approvals |
 | `bin/discord-notify` | Post a message/file to a Discord channel from the host |
 | `bin/claude-worker-todo-relay` | PostToolUse/TodoWrite hook → live task checkboxes to Discord |
@@ -29,7 +32,7 @@ MIT-licensed — see [`LICENSE`](LICENSE).
 | `bin/agent-checkup` | Readiness / auth-mode report |
 | `bin/term-shot` | Captured terminal → text/image (needs Pillow) |
 | `claude-profiles/` | Per-channel capability profiles (`*.settings.json`, `*.mcp.json`) |
-| `skills/` | Claude Code skills: `claude-bridge`, `discord-notify` |
+| `skills/` | Skills: `claude-bridge`, `discord-notify` |
 | `systemd/claude-bridge.service` | User service for the daemon |
 | `scripts/link.sh` | Symlinks `bin/*`, `skills/*`, and the systemd unit into place |
 
@@ -58,12 +61,12 @@ The host that runs the bridge needs:
 
 ### About `claude-launch` (external dependency)
 
-`claude-worker` starts every worker through a wrapper called `claude-launch`,
+`agent-worker` starts every worker through a wrapper called `claude-launch`,
 resolved from `PATH` or `$DOTFILES_DIR/shared/bin/claude-launch`. It lives in
 the **private [nedlane/dotfiles](https://github.com/nedlane/dotfiles) repo and
 is not bundled here.** Be aware, honestly:
 
-- **Without `claude-launch` on PATH, workers cannot start.** `claude-worker
+- **Without `claude-launch` on PATH, workers cannot start.** `agent-worker
   start` fails fast with `claude-launch not found`.
 - The restricted capability profiles pass `claude-launch`-specific flags that
   stock `claude` does **not** accept — `--enforce-perms`, `--tools`,
@@ -132,7 +135,7 @@ You don't need the service to run it. For a foreground session with logs on
 your terminal:
 
 ```bash
-python3 bin/claude-bridge --config ~/.config/claude-bridge/config.json
+python3 bin/agent-bridge --config ~/.config/claude-bridge/config.json
 ```
 
 The config path defaults to `~/.config/claude-bridge/config.json` and can also
@@ -317,7 +320,7 @@ capabilities and the full front-desk flow.
 
 When used as the dotfiles submodule, the parent repo's own `scripts/link.sh`
 performs the same symlinking, and the service runs the daemon from the stable
-`~/.local/bin/claude-bridge` symlink. Profiles resolve relative to this checkout
+`~/.local/bin/agent-bridge` symlink. Profiles resolve relative to this checkout
 (`claude-profiles/` beside `bin/`); override with `CLAUDE_PROFILES_DIR`.
 
 ## Development
@@ -337,7 +340,7 @@ CI (`.github/workflows/ci.yml`) runs, on every push and pull request:
 
 - `bash -n` syntax checks over the shell tools,
 - **ShellCheck** over the shell tools,
-- `py_compile` over `bin/claude-bridge`,
+- `py_compile` over `bin/agent-bridge`,
 - `jq` validation of every `claude-profiles/*.json`,
 - the **`tests/` unit suite** (`python3 -m unittest discover -s tests`),
 - **Ruff** error-lint (`E9,F63,F7,F82`) over the daemon and tests — real-error

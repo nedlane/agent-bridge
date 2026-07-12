@@ -6,7 +6,7 @@
 # forwards your Discord message, ends there, and gets woken here to post the
 # worker's reply back into the repo channel.
 #
-# Only fires for chat-bound workers (started with `claude-worker start
+# Only fires for chat-bound workers (started with `agent-worker start
 # --chat ...`); plain workers and manual sessions stay silent. The event is
 # an HMAC-SHA256-signed POST to the bridge's localhost listener, carrying
 # the transcript path so the bridge can extract the exact reply text.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Readiness check for the local agent control plane:
-#   Discord -> claude-bridge -> claude-worker -> tmux -> claude-launch ->
+#   Discord -> claude-bridge -> agent-worker -> tmux -> claude-launch ->
 #   interactive Claude Code (Claude subscription; no LLM in the bridge).
 #
 # Verifies the pieces that can be checked from this machine — Claude Code on
@@ -71,7 +71,7 @@ else
 fi
 
 # --- worker tooling ----------------------------------------------------------------
-for tool in claude-launch claude-worker claude-worker-todo-relay \
+for tool in claude-launch agent-worker claude-worker-todo-relay \
             claude-worker-done-relay claude-bridge bridge-ctl discord-notify \
             agent-checkup; do
   if command -v "$tool" >/dev/null 2>&1; then
