@@ -8,7 +8,7 @@ cover local development.
 
 - **Python 3** and **tmux** — required for the tooling in general.
 - **discord.py** and **Pillow** — only needed to actually *run* the daemon
-  (`bin/claude-bridge`). You do **not** need them to run the tests: the pure
+  (`bin/agent-bridge`). You do **not** need them to run the tests: the pure
   helpers are importable with the standard library alone.
 
 ## Running CI locally
@@ -24,7 +24,7 @@ for f in bin/*; do
 done
 
 # 2. Byte-compile the Python daemon
-python3 -m py_compile bin/claude-bridge
+python3 -m py_compile bin/agent-bridge
 
 # 3. Validate the capability-profile JSON
 for f in claude-profiles/*.json; do
@@ -48,7 +48,7 @@ python3 -m unittest discover -s tests
 When you add, remove, or rename a slash command, update **all three** places so
 they don't drift:
 
-1. The command list in the `bin/claude-bridge` module docstring.
+1. The command list in the `bin/agent-bridge` module docstring.
 2. The `claude-bridge` skill (under `skills/`).
 3. The `README`.
 

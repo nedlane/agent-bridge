@@ -77,7 +77,7 @@ for f in "${attachments[@]+"${attachments[@]}"}"; do
   abs_attachments+=("$(realpath -- "$f")")
 done
 
-# Default target: the worker's repo channel (recorded by `claude-worker
+# Default target: the worker's repo channel (recorded by `agent-worker
 # start --chat`); otherwise the webhook's main channel.
 if [[ -z "$target" && -n "${CLAUDE_WORKER:-}" ]]; then
   target="$(sed -n 's/^chat=//p' "$STATE_ROOT/$CLAUDE_WORKER/meta" 2>/dev/null | head -1)"

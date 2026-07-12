@@ -49,6 +49,14 @@ if [[ -d "$REPO_ROOT/bin" ]]; then
     [[ -e "$src" ]] || continue
     link "$src" "$BIN_DIR/$(basename "$src")"
   done
+  # Backward-compatible aliases: the orchestration tools were renamed
+  # claude-worker -> agent-worker and claude-bridge -> agent-bridge (they drive
+  # both the Claude and Codex engines now). Keep the old names as symlinks so
+  # anything still calling them — the systemd unit's ExecStart, muscle memory,
+  # older docs — keeps working. Internal config/state dirs (~/.config/claude-*,
+  # ~/.local/state/claude-workers) and the CLAUDE_WORKER env var are unchanged.
+  [[ -e "$BIN_DIR/agent-worker" ]] && link "$BIN_DIR/agent-worker" "$BIN_DIR/claude-worker"
+  [[ -e "$BIN_DIR/agent-bridge" ]] && link "$BIN_DIR/agent-bridge" "$BIN_DIR/claude-bridge"
 fi
 
 # --- skills/<dir> -> ~/.claude/skills/<dir> -----------------------------------

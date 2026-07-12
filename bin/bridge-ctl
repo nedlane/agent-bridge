@@ -26,7 +26,7 @@
 # addrepo prints the bridge's JSON response ({"status":"ok","channel_id":..})
 # so callers can address the new channel immediately (e.g. with
 # discord-notify -t discord:<channel_id>). start blocks until the worker is
-# ready to receive claude-worker send.
+# ready to receive agent-worker send.
 set -uo pipefail
 
 BRIDGE_CFG="${CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/bridge-webhook}"

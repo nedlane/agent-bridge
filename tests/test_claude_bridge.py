@@ -1,6 +1,6 @@
-"""Stdlib-only unit tests for the pure helpers in bin/claude-bridge.
+"""Stdlib-only unit tests for the pure helpers in bin/agent-bridge.
 
-bin/claude-bridge has no .py extension and imports discord.py / aiohttp only
+bin/agent-bridge has no .py extension and imports discord.py / aiohttp only
 lazily inside run_bridge(), so we can load it with importlib and exercise the
 pure helpers without those third-party packages installed.
 
@@ -20,9 +20,9 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _load_module():
-    # bin/claude-bridge has no .py extension, so an explicit SourceFileLoader
+    # bin/agent-bridge has no .py extension, so an explicit SourceFileLoader
     # is required — spec_from_file_location can't infer a loader by suffix.
-    path = os.path.join(HERE, "bin", "claude-bridge")
+    path = os.path.join(HERE, "bin", "agent-bridge")
     loader = SourceFileLoader("claude_bridge", path)
     spec = importlib.util.spec_from_loader("claude_bridge", loader)
     mod = importlib.util.module_from_spec(spec)

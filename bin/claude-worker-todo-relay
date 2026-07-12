@@ -11,7 +11,7 @@
 # (~/.claude/tasks/<session-id>/, override with $CLAUDE_TASKS_DIR).
 #
 # Behaviour:
-#   - Only fires for orchestrated workers (claude-worker sets $CLAUDE_WORKER);
+#   - Only fires for orchestrated workers (agent-worker sets $CLAUDE_WORKER);
 #     manual `cl` sessions stay quiet. CLAUDE_WORKER_TODO_ALL=1 relays all.
 #   - Workers started with --chat post into their repo channel through the
 #     claude-bridge (a signed localhost event); others fall back to the
