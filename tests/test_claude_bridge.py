@@ -442,5 +442,78 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cb.load_config(path), cb.default_config())
 
 
+class HarnessForTests(unittest.TestCase):
+    def test_default_and_explicit(self):
+        self.assertEqual(cb.harness_for({}), "claude")
+        self.assertEqual(cb.harness_for({"harness": "claude"}), "claude")
+        self.assertEqual(cb.harness_for({"harness": "codex"}), "codex")
+
+    def test_unknown_or_empty_normalizes_to_claude(self):
+        self.assertEqual(cb.harness_for({"harness": "gpt"}), "claude")
+        self.assertEqual(cb.harness_for({"harness": ""}), "claude")
+        self.assertEqual(cb.harness_for(None), "claude")
+
+
+class ScreenIsReadyHarnessTests(unittest.TestCase):
+    def test_claude_idle_and_busy(self):
+        self.assertTrue(cb.screen_is_ready("some log\n❯ ", "claude"))
+        self.assertFalse(cb.screen_is_ready("❯ working esc to interrupt", "claude"))
+
+    def test_codex_prompt_char(self):
+        # Codex idle uses "›"; the Claude "❯" must not read as ready for codex.
+        self.assertTrue(cb.screen_is_ready("banner\n› \n gpt-5.5 · /x", "codex"))
+        self.assertFalse(cb.screen_is_ready("❯ ", "codex"))
+
+    def test_codex_busy_working_line(self):
+        self.assertFalse(
+            cb.screen_is_ready("› \nWorking (3s • esc to interrupt)", "codex")
+        )
+
+    def test_dismissed_trust_dialog_in_scrollback_is_ready(self):
+        # A dismissed dialog lingers in scrollback (upper lines) — only the tail
+        # counts, so this still reads as ready.
+        screen = "Do you trust the contents of this directory?\n" + \
+            "\n".join(f"line {i}" for i in range(20)) + "\n› "
+        self.assertTrue(cb.screen_is_ready(screen, "codex"))
+
+    def test_active_trust_dialog_in_tail_is_not_ready(self):
+        screen = "› 1. Yes, continue\nDo you trust the contents of this directory?"
+        self.assertFalse(cb.screen_is_ready(screen, "codex"))
+
+
+class ComposerIsEmptyHarnessTests(unittest.TestCase):
+    def test_claude_exact(self):
+        self.assertTrue(cb.composer_is_empty("❯", "claude"))
+        self.assertFalse(cb.composer_is_empty("❯ half-typed", "claude"))
+
+    def test_codex_always_empty(self):
+        # Codex's greyed placeholder is indistinguishable from typed text, so
+        # the check conservatively returns True rather than wedge /usage.
+        self.assertTrue(cb.composer_is_empty("› Run /review on my changes", "codex"))
+
+
+class StartArgsHarnessTests(unittest.TestCase):
+    def test_claude_injects_prompt_and_continue(self):
+        args = cb.start_args("w", "/d", 42, resume=True, harness="claude")
+        self.assertIn("--harness", args)
+        self.assertEqual(args[args.index("--harness") + 1], "claude")
+        self.assertIn("--resume", args)
+        self.assertIn("--", args)
+        self.assertIn("--append-system-prompt", args)
+
+    def test_codex_no_prompt_no_profile(self):
+        args = cb.start_args("w", "/d", 42, resume=True, harness="codex")
+        self.assertEqual(args[args.index("--harness") + 1], "codex")
+        self.assertIn("--resume", args)
+        # Codex carries no settings-file profile or system-prompt injection, and
+        # nothing rides after "--".
+        self.assertNotIn("--", args)
+        self.assertNotIn("--append-system-prompt", args)
+
+    def test_codex_no_resume_omits_flag(self):
+        args = cb.start_args("w", "/d", 42, resume=False, harness="codex")
+        self.assertNotIn("--resume", args)
+
+
 if __name__ == "__main__":
     unittest.main()

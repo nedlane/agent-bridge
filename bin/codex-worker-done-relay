@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Wake the claude-bridge when a Codex worker finishes a turn — the Codex analog
+# of claude-worker-done-relay. Registered as a Codex `Stop` hook in
+# ~/.codex/config.toml (see docs/agent-control-plane.md):
+#
+#   [hooks]
+#   Stop = [ { hooks = [ { type = "command", command = "codex-worker-done-relay" } ] } ]
+#
+# Codex fires this at the end of every turn (task done, or stopped to ask a
+# question) — the push that lets the bridge post the worker's reply without
+# polling, exactly like the Claude Stop hook. The Codex Stop payload is richer
+# than Claude's: it carries `last_assistant_message` inline, so this relay hands
+# the reply text straight to the bridge and no transcript parsing is needed.
+#
+# The hook is global (every Codex session runs it), so it self-limits to
+# orchestrated chat-bound workers: no CLAUDE_WORKER env (a normal `codex`
+# session) or no `chat=` in the worker meta -> exit 0 silently. `stop_hook_active`
+# marks a continuation the hook itself triggered; relaying that would loop.
+#
+# Endpoint + secret live in a chmod-600 file (never in env, never logged):
+#   ~/.config/claude-workers/bridge-webhook
+#     BRIDGE_WEBHOOK_URL=http://127.0.0.1:8765/event
+#     BRIDGE_WEBHOOK_SECRET=...
+# Override path with $CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE.
+# Always exits 0: a relay problem must never break the Codex session.
+set -uo pipefail
+
+STATE_ROOT="${CLAUDE_WORKERS_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-workers}"
+CFG="${CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-workers/bridge-webhook}"
+
+worker="${CLAUDE_WORKER:-}"
+[[ -n "$worker" ]] || exit 0
+[[ -r "$CFG" ]] || exit 0
+
+# Only chat-bound workers push events; --chat is the opt-in.
+chat="$(sed -n 's/^chat=//p' "$STATE_ROOT/$worker/meta" 2>/dev/null | head -1)"
+[[ -n "$chat" ]] || exit 0
+
+dir="$(sed -n 's/^dir=//p' "$STATE_ROOT/$worker/meta" 2>/dev/null | head -1)"
+
+hook_json="$(cat 2>/dev/null || true)"
+url="$(sed -n 's/^BRIDGE_WEBHOOK_URL=//p' "$CFG" | head -1)"
+secret="$(sed -n 's/^BRIDGE_WEBHOOK_SECRET=//p' "$CFG" | head -1)"
+[[ -n "$url" && -n "$secret" ]] || exit 0
+
+# Build the event from the hook input. stop_hook_active marks a continuation
+# triggered by a previous Stop hook — relaying those would loop. The Codex Stop
+# payload includes last_assistant_message, forwarded as `reply` so the bridge
+# posts it directly (the transcript_path is passed too, as a fallback handle).
+body="$(HOOK_JSON="$hook_json" WORKER="$worker" DIR="$dir" CHAT="$chat" python3 -c '
+import json, os, sys
+try:
+    hook = json.loads(os.environ.get("HOOK_JSON") or "{}")
+except ValueError:
+    hook = {}
+if hook.get("stop_hook_active"):
+    sys.exit(0)
+print(json.dumps({
+    "event_type": "claude.worker.turn_ended",
+    "worker": os.environ["WORKER"],
+    "dir": os.environ["DIR"],
+    "chat": os.environ["CHAT"],
+    "session_id": hook.get("session_id", ""),
+    "transcript_path": hook.get("transcript_path", ""),
+    "reply": hook.get("last_assistant_message", "") or "",
+}))' 2>/dev/null)"
+[[ -n "$body" ]] || exit 0
+
+sig="$(printf '%s' "$body" | SECRET="$secret" python3 -c '
+import hashlib, hmac, os, sys
+print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
+               hashlib.sha256).hexdigest())' 2>/dev/null)"
+[[ -n "$sig" ]] || exit 0
+
+curl -fsS -m 10 -H 'Content-Type: application/json' \
+  -H "X-Webhook-Signature: $sig" -d "$body" "$url" >/dev/null 2>&1
+exit 0

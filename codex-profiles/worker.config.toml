@@ -1,0 +1,15 @@
+# Codex "worker" profile — layered on top of your base ~/.codex/config.toml
+# only for agent-bridge workers (codex-launch passes `-p worker`). Keeping the
+# turn-end hook here, not in the base config, means your ordinary `codex`
+# sessions never load it and never see a "Hooks need review" prompt.
+#
+# Install:  cp codex-profiles/worker.config.toml ~/.codex/worker.config.toml
+# (or symlink it). `codex-worker-done-relay` must be on PATH — scripts/link.sh
+# puts it in ~/.local/bin.
+#
+# The Stop hook fires at the end of every worker turn and POSTs the reply to the
+# local bridge, the Codex analog of Claude Code's Stop hook. Workers launch with
+# --dangerously-bypass-hook-trust so this runs unattended.
+
+[hooks]
+Stop = [ { hooks = [ { type = "command", command = "codex-worker-done-relay" } ] } ]

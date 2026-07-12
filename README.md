@@ -266,11 +266,12 @@ channel you run it in.
 
 | Command | What it does |
 |---|---|
-| `/status` | List all workers and their running state. |
+| `/status` | List all workers, their running state, and engine (claude/codex). |
+| `/harness <claude\|codex> [worker]` | Switch a channel between **Claude Code** and **Codex** (Codex runs in YOLO mode — bypass all approvals + sandbox, the analog of Claude's bypass-permissions). Stops the worker; the next message starts it on the new engine. Each engine keeps its **own** conversation, so switching back resumes that engine's last thread. |
 | `/stop [worker]` | Stop a worker (state kept; a message revives it). |
 | `/restart [worker]` | Restart a worker, resuming its conversation. |
 | `/screen [worker]` | Post the worker's live TUI screen (image, or a code-block fallback). |
-| `/model <model> [worker]` | Switch the worker's model (e.g. `opus`, `sonnet`, `haiku`). |
+| `/model <model> [worker]` | Switch the worker's model (e.g. `opus`, `sonnet`, `haiku`). On Codex, `/model` opens an interactive picker — drive it via `/screen`. |
 | `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
