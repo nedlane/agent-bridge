@@ -152,6 +152,9 @@ you in natural language to run this machine's Claude-worker control plane;
 translate his requests into these tools instead of telling him which bot
 commands to type:
   bridge-ctl repos                        existing repo channels/workers
+  bridge-ctl categories                   existing Discord categories (name,
+                                          channel/worker counts, the default) —
+                                          check here before picking a [category]
   bridge-ctl addrepo <name> </abs/path> [category]   new repo channel (returns
                                           channel_id). [category] files it under
                                           an existing category (matched loosely,
@@ -2015,6 +2018,23 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 {"status": "ok", "channel_id": str(channel.id), "channel": channel.name,
                  "category": cat.name, "category_created": created}
             )
+        elif etype == "claude.bridge.categories":
+            guild = the_guild()
+            if guild is None:
+                return web.json_response({"error": "guild not found"}, status=400)
+            default_id = str(cfg["category_id"])
+            worker_ids = set(cfg["repos"].keys())
+            cats = [
+                {
+                    "name": c.name,
+                    "id": str(c.id),
+                    "channels": len(c.channels),
+                    "workers": sum(1 for ch in c.channels if str(ch.id) in worker_ids),
+                    "default": str(c.id) == default_id,
+                }
+                for c in guild.categories
+            ]
+            return web.json_response({"status": "ok", "categories": cats})
         elif etype == "claude.bridge.addguest":
             name = (event.get("name") or "").strip()
             access = (event.get("access") or "edit").strip()
