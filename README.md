@@ -173,7 +173,7 @@ The bridge reads a single JSON file at `~/.config/claude-bridge/config.json`
 | Field | Type | Meaning |
 |---|---|---|
 | `category_id` | int | Channel id of the **Claude** category new repo channels are created under. |
-| `allowed_users` | int[] | Owner Discord user ids. Gate every slash command and every owner-only action (reaction decisions, guest management). |
+| `allowed_users` | int[] | Owner Discord user ids. Gate config/roster-changing slash commands and every owner-only action (reaction decisions, guest management). A channel's editor guests can additionally run the read-only and worker-control commands on their own channel (see below). |
 | `idle_minutes` | int | Idle workers are stopped after this many minutes (default `45`). The next message revives them with `--continue`. |
 | `listen_port` | int | Port of the localhost signed-event listener (default `8765`). Must match the port in `bridge-webhook`. |
 | `repos` | object | Map of **channel id (string)** → repo object (below). |
@@ -286,6 +286,10 @@ channel you run it in.
 
 Notes:
 
+- **Editor guests** (granted via `/addguest … edit`) can run `/status`,
+  `/screen`, `/usage`, `/fresh`, `/clear` and `/stop` — scoped to their own
+  channel's worker (they can't pass a `worker` pointing elsewhere). Every other
+  command stays owner-only.
 - `/clear` and `/fresh` purge the channel and therefore need the bot's **Manage
   Messages** permission.
 - `/close` deletes the channel and its whole history — it needs **Manage
