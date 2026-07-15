@@ -16,8 +16,11 @@ reaped and revived with `claude --continue`.
 From any Claude session or shell on this machine — workers included:
 
 ```sh
-bridge-ctl addrepo <name> </abs/path>   # creates #<name>, maps it, returns
-                                        # {"channel_id": ...}
+bridge-ctl addrepo <name> </abs/path> [category]   # creates #<name>, maps it,
+                                        # returns {"channel_id": ...}. Optional
+                                        # [category] files it under an existing
+                                        # category (matched loosely) or creates
+                                        # a new one; omit for the inbox category
 bridge-ctl start <name>                 # start that repo's worker via the
                                         # bridge (protocol injected, resumes)
 bridge-ctl peek <name>                  # post that worker's live screen into
@@ -28,7 +31,7 @@ bridge-ctl repos                        # list channel -> repo mappings
 discord-notify -t discord:<channel_id> "first message"   # talk into it
 ```
 
-Ned can also run the `/addrepo <name> <path>` slash command in Discord. Prefer these tools
+Ned can also run the `/addrepo <name> <path> [category]` slash command in Discord. Prefer these tools
 over editing config or calling the Discord REST API by hand; the bridge owns
 channel creation and the mapping file. To hand a worker a task end-to-end:
 `bridge-ctl start <name>`, then `agent-worker send <name> "the task"`.
@@ -54,7 +57,7 @@ In Discord these are native slash commands (synced per-guild on connect; the
 `worker` option defaults to the channel's worker): `/status`, `/stop`,
 `/restart`, `/screen`, `/model <model>`, `/clear` (fresh context via restart
 without `--continue`), `/fresh` (shut down + fresh next start, no resume),
-`/compact`, `/checkin`, `/addrepo <name> <path>`, `/close`. `/clear` and
+`/compact`, `/checkin`, `/addrepo <name> <path> [category]`, `/close`. `/clear` and
 `/fresh` also purge the channel's messages (Ned's and the bot's) to clear
 clutter — this needs the bot's **Manage Messages** permission in the Claude
 category. `/close [worker] confirm:<name>` fully retires a worker — stops it,

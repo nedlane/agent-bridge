@@ -155,6 +155,31 @@ class RequestCardTests(unittest.TestCase):
         self.assertIn("(no details given)", card)
 
 
+class CategoryMatchTests(unittest.TestCase):
+    CATS = ["🤖 Meta & Infra", "🏎️ AV Stack (uqr_ws)", "💼 Business & Ops"]
+
+    def test_normalize_strips_emoji_case_and_punct(self):
+        self.assertEqual(cb.normalize_category("🏎️ AV Stack (uqr_ws)"), "avstackuqrws")
+        self.assertEqual(
+            cb.normalize_category("av stack uqr_ws"),
+            cb.normalize_category("🏎️ AV Stack (uqr_ws)"),
+        )
+
+    def test_find_matches_ignoring_emoji_and_case(self):
+        self.assertEqual(cb.find_category(self.CATS, "meta & infra"), "🤖 Meta & Infra")
+        self.assertEqual(
+            cb.find_category(self.CATS, "AV STACK (uqr_ws)"), "🏎️ AV Stack (uqr_ws)"
+        )
+
+    def test_find_returns_none_for_new_category(self):
+        self.assertIsNone(cb.find_category(self.CATS, "MoTeC M1"))
+
+    def test_find_none_for_blank_request(self):
+        self.assertIsNone(cb.find_category(self.CATS, ""))
+        self.assertIsNone(cb.find_category(self.CATS, "   "))
+        self.assertIsNone(cb.find_category(self.CATS, None))
+
+
 class SplitMessageTests(unittest.TestCase):
     def test_splits_on_line_boundaries(self):
         text = "aaa\nbbb\nccc"

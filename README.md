@@ -279,7 +279,7 @@ channel you run it in.
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
 | `/checkin [worker]` | Ask a running worker to send a 3–5 line progress update. |
-| `/addrepo <name> <path>` | Create `#<name>` under the category and map it to a repo directory. |
+| `/addrepo <name> <path> [category]` | Create `#<name>` and map it to a repo directory. Optional `category` files it under an existing category (matched loosely, ignoring emoji/case) or creates a new one; omitted, it lands in the default inbox category. |
 | `/close [worker] confirm:<name>` | **Irreversible teardown** — stop the worker, wipe its saved state, and delete its channel. Requires retyping the worker name in `confirm`. |
 | `/addguest <name> <discord_id> [edit\|view]` | Grant a guest edit (View+Send) or view (read-only) access to one channel. |
 | `/lockdown` | Drop **all** guests everywhere to view-only in one shot (leaves the owner untouched). |

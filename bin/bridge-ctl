@@ -3,8 +3,11 @@
 # tools-based interface workers use instead of reading screens or config
 # internals. Verbs are signed events to the bridge's localhost listener.
 #
-#   bridge-ctl addrepo <name> <path>   # create #<name> under the Claude
-#                                      # category and map it to <path>
+#   bridge-ctl addrepo <name> <path> [category]
+#                                      # create #<name> and map it to <path>.
+#                                      # [category] files it under an existing
+#                                      # category or creates a new one; omit to
+#                                      # use the default inbox category
 #   bridge-ctl start <name>            # start that repo's worker via the
 #                                      # bridge (protocol injected, resumes)
 #   bridge-ctl peek <name>             # post that worker's live screen into
@@ -59,13 +62,18 @@ case "$cmd" in
   addrepo)
     name="${2:-}"
     path="${3:-}"
-    [[ -n "$name" && -n "$path" ]] || die "usage: bridge-ctl addrepo <name> <path>"
+    category="${4:-}"
+    [[ -n "$name" && -n "$path" ]] \
+      || die "usage: bridge-ctl addrepo <name> <path> [category]"
     path="$(cd "${path/#\~/$HOME}" 2>/dev/null && pwd)" || die "no such directory: ${3}"
-    body="$(NAME="$name" REPO="$path" python3 -c '
+    body="$(NAME="$name" REPO="$path" CATEGORY="$category" python3 -c '
 import json, os
-print(json.dumps({"event_type": "claude.bridge.addrepo",
-                  "name": os.environ["NAME"],
-                  "path": os.environ["REPO"]}))')" || die "could not build request"
+req = {"event_type": "claude.bridge.addrepo",
+       "name": os.environ["NAME"],
+       "path": os.environ["REPO"]}
+if os.environ.get("CATEGORY"):
+    req["category"] = os.environ["CATEGORY"]
+print(json.dumps(req))')" || die "could not build request"
     post_event "$body"
     ;;
   start)
