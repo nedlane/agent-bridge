@@ -44,7 +44,8 @@ on connect). The `worker` option defaults to the channel's mapped worker:
                            also wipes the channel's messages)
   /compact [focus] [worker] compact the worker's context
   /checkin [worker]        ask a running worker for a progress update
-  /addrepo <name> <path>   create #<name> under the category + map it
+  /addrepo <name> <path> [category]   create #<name> + map it; file it under
+                           an existing/new category (default: inbox category)
   /close [worker] confirm:<name>
                            retire a worker: stop it, wipe its saved state, and
                            delete its channel (irreversible; confirm required)
@@ -136,8 +137,9 @@ Otherwise work silently. No progress spam. Long tasks (multiple hours) are
 expected - do not stop early to report, do not ask for permission to
 continue.
 You can also operate the bridge with tools (never by reading screens or
-internals): `bridge-ctl addrepo <name> </abs/path>` creates a new repo
-channel/conversation and maps it; `bridge-ctl repos` lists mappings;
+internals): `bridge-ctl addrepo <name> </abs/path> [category]` creates a new
+repo channel/conversation and maps it (optional [category] files it under an
+existing or new category); `bridge-ctl repos` lists mappings;
 `discord-notify -t discord:<channel_id> "..."` messages a specific channel.
 Your discord-notify and claude-bridge skills document the rest."""
 
@@ -150,7 +152,11 @@ you in natural language to run this machine's Claude-worker control plane;
 translate his requests into these tools instead of telling him which bot
 commands to type:
   bridge-ctl repos                        existing repo channels/workers
-  bridge-ctl addrepo <name> </abs/path>   new repo channel (returns channel_id)
+  bridge-ctl addrepo <name> </abs/path> [category]   new repo channel (returns
+                                          channel_id). [category] files it under
+                                          an existing category (matched loosely,
+                                          emoji/case-insensitive) or creates a
+                                          new one; omit for the default inbox
   bridge-ctl start <name>                 start that repo's worker (it gets
                                           this same Discord protocol)
   agent-worker list / status <name> / read <name> [lines]
@@ -335,6 +341,26 @@ def parse_request_marker(text):
     card carries the marker — resolving one strips it so it can't re-fire."""
     m = re.search(r"`req:(\d+):([A-Za-z0-9._-]+)`", text or "")
     return (int(m.group(1)), m.group(2)) if m else None
+
+
+def normalize_category(name):
+    """Fold a category name for matching: lowercase and drop everything but
+    a-z0-9, so leading emoji, punctuation, and spacing don't matter (e.g.
+    "🏎️ AV Stack (uqr_ws)" and "av stack uqr_ws" fold the same)."""
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def find_category(existing, requested):
+    """Return the category name from `existing` (an iterable of names) whose
+    folded form matches `requested`, or None if nothing matches. Lets the
+    caller decide: match -> reuse, None -> create a new category."""
+    want = normalize_category(requested)
+    if not want:
+        return None
+    for name in existing:
+        if normalize_category(name) == want:
+            return name
+    return None
 
 # --------------------------------------------------------------------------
 # Pure helpers (no I/O beyond explicit paths; covered by tests/)
@@ -1352,6 +1378,24 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return category.guild
         return client.guilds[0] if client.guilds else None
 
+    async def resolve_category(guild, requested):
+        """Pick the category for a new worker channel. A falsy `requested`
+        keeps today's behaviour: the configured default (the inbox category).
+        Otherwise reuse an existing category whose folded name matches, or
+        create a fresh one — hidden from @everyone like the worker categories.
+        Returns (category_channel_or_None, created)."""
+        requested = (requested or "").strip()
+        if not requested:
+            return client.get_channel(int(cfg["category_id"])), False
+        match = find_category([c.name for c in guild.categories], requested)
+        if match is not None:
+            return discord.utils.get(guild.categories, name=match), False
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False)
+        }
+        cat = await guild.create_category(requested, overwrites=overwrites)
+        return cat, True
+
     async def fetch_guild_member(guild, discord_id):
         member = guild.get_member(discord_id)
         if member is None:
@@ -1687,8 +1731,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.followup.send(f"🗜️ compacting `{name}`")
 
     @tree.command(name="addrepo", description="Create a Discord channel and map a repo to a worker")
-    @describe(name="Worker/channel name", path="Absolute path to the repo")
-    async def slash_addrepo(interaction, name: str, path: str):
+    @describe(name="Worker/channel name", path="Absolute path to the repo",
+              category="Category to file it under — an existing one, or a new "
+                       "name to create it (default: the inbox category)")
+    async def slash_addrepo(interaction, name: str, path: str, category: str = None):
         if interaction.user.id not in cfg["allowed_users"]:
             await interaction.response.send_message("⛔ not authorized", ephemeral=True)
             return
@@ -1699,12 +1745,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             )
             return
         await interaction.response.defer(thinking=True)
-        category = client.get_channel(int(cfg["category_id"]))
-        channel = await interaction.guild.create_text_channel(name, category=category)
+        cat, created = await resolve_category(interaction.guild, category)
+        channel = await interaction.guild.create_text_channel(name, category=cat)
         cfg["repos"][str(channel.id)] = {"name": name, "dir": directory}
         save_config(cfg, config_path)
+        where = f" in **{cat.name}**{' (new category)' if created else ''}" if cat else ""
         await interaction.followup.send(
-            f"✅ created {channel.mention} → `{directory}` (worker `{name}`)"
+            f"✅ created {channel.mention}{where} → `{directory}` (worker `{name}`)"
         )
 
     @tree.command(name="close", description="Retire a worker: stop it, wipe its state, and DELETE its channel (irreversible)")
@@ -1947,22 +1994,26 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         elif etype == "claude.bridge.addrepo":
             repo_name = (event.get("name") or "").strip()
             repo_path = os.path.expanduser(event.get("path") or "")
+            requested_cat = (event.get("category") or "").strip()
             if not repo_name or not os.path.isdir(repo_path):
                 return web.json_response(
                     {"error": f"invalid name or directory: {repo_name!r} {repo_path!r}"},
                     status=400,
                 )
-            category = client.get_channel(int(cfg["category_id"]))
-            if category is None:
-                return web.json_response({"error": "Claude category not found"}, status=400)
-            channel = await category.guild.create_text_channel(
-                repo_name, category=category
-            )
+            guild = the_guild()
+            if guild is None:
+                return web.json_response({"error": "guild not found"}, status=400)
+            cat, created = await resolve_category(guild, requested_cat)
+            if cat is None:
+                return web.json_response({"error": "category not found"}, status=400)
+            channel = await guild.create_text_channel(repo_name, category=cat)
             cfg["repos"][str(channel.id)] = {"name": repo_name, "dir": repo_path}
             save_config(cfg, config_path)
-            print(f"[bridge] addrepo: #{channel.name} ({channel.id}) -> {repo_path}")
+            print(f"[bridge] addrepo: #{channel.name} ({channel.id}) -> {repo_path} "
+                  f"[{cat.name}{' new' if created else ''}]")
             return web.json_response(
-                {"status": "ok", "channel_id": str(channel.id), "channel": channel.name}
+                {"status": "ok", "channel_id": str(channel.id), "channel": channel.name,
+                 "category": cat.name, "category_created": created}
             )
         elif etype == "claude.bridge.addguest":
             name = (event.get("name") or "").strip()
