@@ -28,6 +28,9 @@ bridge-ctl peek <name>                  # post that worker's live screen into
 bridge-ctl rename <name> <label>        # rename that worker's Discord channel
                                         # (display label only; mapping unchanged)
 bridge-ctl repos                        # list channel -> repo mappings
+bridge-ctl categories                   # list Discord categories (name, channel
+                                        # + worker counts, which is default) —
+                                        # check before choosing an addrepo [category]
 discord-notify -t discord:<channel_id> "first message"   # talk into it
 ```
 

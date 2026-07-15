@@ -15,6 +15,8 @@
 #   bridge-ctl rename <name> <label>   # rename that worker's Discord channel
 #                                      # (display label only; mapping unchanged)
 #   bridge-ctl repos                   # list channel -> repo mappings
+#   bridge-ctl categories              # list Discord categories (name, channel
+#                                      # + worker counts, which is the default)
 #   bridge-ctl addguest <name> <discord_id> [edit|view]
 #                                      # grant a guest edit (View+Send) or view
 #                                      # (read-only) access to #<name>
@@ -191,10 +193,15 @@ for cid, repo in repos.items():
     name, rdir = repo["name"], repo["dir"]
     print(f"{name:<20} discord:{cid}  {rdir}")' "$CONFIG"
     ;;
+  categories)
+    # Categories are live Discord state (not in config), so ask the bridge.
+    # Prints JSON: {"categories":[{name, channels, workers, default}, ...]}.
+    post_event '{"event_type": "claude.bridge.categories"}'
+    ;;
   ''|-h|--help|help)
     sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    die "unknown command '$cmd' (addrepo, start, peek, rename, repos, addguest, request, viewonly, revoke, guests)"
+    die "unknown command '$cmd' (addrepo, start, peek, rename, repos, categories, addguest, request, viewonly, revoke, guests)"
     ;;
 esac
