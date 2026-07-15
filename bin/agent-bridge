@@ -314,9 +314,10 @@ def channel_allows(cfg, channel_id, user_id):
     is open to anyone; otherwise the owner (global allowed_users) may talk in
     any channel and a channel's `guests` (editors) may talk only in that one
     channel. View-only guests are tracked in `viewers` and cannot drive the
-    worker (Discord also denies them Send). Most slash commands stay
-    owner-only; the read-only /status and /screen are also open to a channel's
-    editors, scoped to that channel's worker (see guard_scoped)."""
+    worker (Discord also denies them Send). Config/roster-changing slash
+    commands stay owner-only; /status, /screen, /usage and the worker-control
+    /fresh /clear /stop are also open to a channel's editors, scoped to that
+    channel's worker (see guard_scoped)."""
     if str(channel_id) == str(cfg.get("welcome_channel")):
         return True
     if user_id in cfg.get("allowed_users", []):
@@ -1588,8 +1589,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         command — scoped to their own channel's worker only. The owner may
         still target any worker via `worker`; a guest is pinned to this
         channel and can't reach into another. Returns the worker name, or
-        None after having already replied with an error. Mirrors the 👀 peek,
-        which channel editors can already trigger."""
+        None after having already replied with an error. Backs the read-only
+        /status /screen /usage and the worker-control /fresh /clear /stop —
+        all things a channel editor may drive on their own worker."""
         uid = interaction.user.id
         repo = repo_for_channel(interaction.channel_id)
         if uid in cfg["allowed_users"]:
@@ -1637,7 +1639,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @tree.command(name="fresh", description="Shut a worker down + wipe the channel; next message starts fresh (no resume)")
     @describe(worker="Worker name (defaults to this channel's worker)")
     async def slash_fresh(interaction, worker: str = None):
-        if not (name := await guard(interaction, worker)):
+        if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await do_fresh(name))
@@ -1645,7 +1647,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @tree.command(name="clear", description="Fresh context now + wipe the channel: restart the worker without --continue")
     @describe(worker="Worker name (defaults to this channel's worker)")
     async def slash_clear(interaction, worker: str = None):
-        if not (name := await guard(interaction, worker)):
+        if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await do_clear(name))
@@ -1653,7 +1655,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @tree.command(name="stop", description="Stop a worker (state kept; a message revives it)")
     @describe(worker="Worker name (defaults to this channel's worker)")
     async def slash_stop(interaction, worker: str = None):
-        if not (name := await guard(interaction, worker)):
+        if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await do_stop(name))
