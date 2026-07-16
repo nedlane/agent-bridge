@@ -316,8 +316,8 @@ def channel_allows(cfg, channel_id, user_id):
     channel. View-only guests are tracked in `viewers` and cannot drive the
     worker (Discord also denies them Send). Config/roster-changing slash
     commands stay owner-only; /status, /screen, /usage and the worker-control
-    /fresh /clear /stop are also open to a channel's editors, scoped to that
-    channel's worker (see guard_scoped)."""
+    /fresh /clear /stop /model are also open to a channel's editors, scoped to
+    that channel's worker (see guard_scoped)."""
     if str(channel_id) == str(cfg.get("welcome_channel")):
         return True
     if user_id in cfg.get("allowed_users", []):
@@ -1590,8 +1590,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         still target any worker via `worker`; a guest is pinned to this
         channel and can't reach into another. Returns the worker name, or
         None after having already replied with an error. Backs the read-only
-        /status /screen /usage and the worker-control /fresh /clear /stop —
-        all things a channel editor may drive on their own worker."""
+        /status /screen /usage and the worker-control /fresh /clear /stop
+        /model — all things a channel editor may drive on their own worker."""
         uid = interaction.user.id
         repo = repo_for_channel(interaction.channel_id)
         if uid in cfg["allowed_users"]:
@@ -1714,7 +1714,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @tree.command(name="model", description="Switch a worker's model")
     @describe(model="e.g. opus, sonnet, haiku", worker="Worker (defaults to this channel's worker)")
     async def slash_model(interaction, model: str, worker: str = None):
-        if not (name := await guard(interaction, worker)):
+        if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
         # On Codex, /model opens an interactive picker (no inline arg), so this

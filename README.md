@@ -287,9 +287,9 @@ channel you run it in.
 Notes:
 
 - **Editor guests** (granted via `/addguest … edit`) can run `/status`,
-  `/screen`, `/usage`, `/fresh`, `/clear` and `/stop` — scoped to their own
-  channel's worker (they can't pass a `worker` pointing elsewhere). Every other
-  command stays owner-only.
+  `/screen`, `/usage`, `/fresh`, `/clear`, `/stop` and `/model` — scoped to
+  their own channel's worker (they can't pass a `worker` pointing elsewhere).
+  Every other command stays owner-only.
 - `/clear` and `/fresh` purge the channel and therefore need the bot's **Manage
   Messages** permission.
 - `/close` deletes the channel and its whole history — it needs **Manage
