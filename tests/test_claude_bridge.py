@@ -469,14 +469,15 @@ class ConfigTests(unittest.TestCase):
 
 class HarnessForTests(unittest.TestCase):
     def test_default_and_explicit(self):
-        self.assertEqual(cb.harness_for({}), "claude")
+        # Codex is the fleet default; an explicit harness is honored as-is.
+        self.assertEqual(cb.harness_for({}), "codex")
         self.assertEqual(cb.harness_for({"harness": "claude"}), "claude")
         self.assertEqual(cb.harness_for({"harness": "codex"}), "codex")
 
-    def test_unknown_or_empty_normalizes_to_claude(self):
-        self.assertEqual(cb.harness_for({"harness": "gpt"}), "claude")
-        self.assertEqual(cb.harness_for({"harness": ""}), "claude")
-        self.assertEqual(cb.harness_for(None), "claude")
+    def test_unknown_or_empty_normalizes_to_codex(self):
+        self.assertEqual(cb.harness_for({"harness": "gpt"}), "codex")
+        self.assertEqual(cb.harness_for({"harness": ""}), "codex")
+        self.assertEqual(cb.harness_for(None), "codex")
 
 
 class ScreenIsReadyHarnessTests(unittest.TestCase):
