@@ -638,6 +638,26 @@ def harness_for(repo):
     return h if h in ("claude", "codex") else "codex"
 
 
+def worker_model_tag(name, harness):
+    """Short 'which model' label for the tag prepended to a worker's first
+    Discord reply, so Ned can tell at a glance what answered in each channel.
+
+    Codex renders 'gpt-5.6-sol high · <dir>' in its footer, so parse the model
+    (and effort) out of the pane. Claude's pane doesn't surface the model, so it
+    tags at the engine level."""
+    if harness != "codex":
+        return "Claude"
+    try:
+        screen = worker_screen(name, 40)
+    except Exception:
+        return "Codex"
+    m = re.search(r"(gpt[\w.\-]+)(?:\s+(low|medium|high|minimal|xhigh|max))?\s*·",
+                  screen)
+    if m:
+        return "Codex · " + m.group(1) + (f" {m.group(2)}" if m.group(2) else "")
+    return "Codex"
+
+
 def screen_is_ready(screen, harness="claude"):
     """True when a worker pane shows an idle, input-ready prompt.
 
@@ -877,6 +897,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     # --append-system-prompt; the protocol rides in as a user turn instead).
     codex_unprimed = set()
 
+    # Workers whose NEXT outbound message should carry the little model tag.
+    # Armed when Ned messages a worker; consumed by the worker's first reply, so
+    # only the top message of each response is tagged (not every message).
+    first_reply_pending = {}
+
     async def wait_ready(name, timeout=180):
         """Poll until the worker pane is idle and input-ready (or timeout).
 
@@ -1062,6 +1087,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # typed-while-running input as steering, which is what check-ins and
         # course corrections need. ⏳ just signals "delivered while working".
         last_activity[name] = time.time()
+        # Arm the model tag for this worker's next reply (Ned just messaged it).
+        if message is not None:
+            first_reply_pending[name] = True
         screen = await asyncio.to_thread(worker_screen, name, 30)
         busy = "esc to interrupt" in screen
         # A worker mid-compaction (manual /compact or an auto-compact) is
@@ -1243,6 +1271,19 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     def repo_by_name(name):
         return next((x for x in cfg["repos"].values() if x["name"] == name), None)
+
+    async def tag_reply(name, text):
+        """Prepend a small model tag to a worker's FIRST reply after each
+        inbound message. The flag is consumed here, so only the top message of a
+        response gets tagged; follow-ups in the same turn go untagged."""
+        if not first_reply_pending.pop(name, False):
+            return text
+        harness = harness_for(repo_by_name(name))
+        try:
+            label = await asyncio.to_thread(worker_model_tag, name, harness)
+        except Exception:
+            label = "Codex" if harness == "codex" else "Claude"
+        return f"-# 🤖 {label}\n{text}"
 
     # --- command actions (shared by the slash commands below) ---------------
     # Each returns (text, attachments) so the caller can respond however it
@@ -1968,7 +2009,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     reply = codex_reply.strip() or "(no new reply text captured — use /screen)"
                     print(f"[bridge] {name}: codex turn ended, posting "
                           f"{len(reply)} chars to {channel_id}")
-                    await post(channel_id, reply)
+                    await post(channel_id, await tag_reply(name, reply))
                 elif channel_id:
                     # The Stop hook can fire before Claude Code flushes the final
                     # assistant message, and a stale read returns the PREVIOUS
@@ -1996,7 +2037,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                           f"{len(reply) if reply else 0} chars to {channel_id}")
                     if not reply:
                         reply = "(no new reply text captured — use /screen)"
-                    await post(channel_id, reply)
+                    await post(channel_id, await tag_reply(name, reply))
         elif etype == "claude.bridge.addrepo":
             repo_name = (event.get("name") or "").strip()
             repo_path = os.path.expanduser(event.get("path") or "")
@@ -2187,8 +2228,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 notified.add(worker)
             channel_id = channel_from_chat(event.get("chat", ""))
             attachments = event.get("attachments") or []
-            if channel_id and (event.get("content") or attachments):
-                await post(channel_id, event.get("content") or "", attachments)
+            content = event.get("content") or ""
+            if channel_id and (content or attachments):
+                if content and worker:
+                    content = await tag_reply(worker, content)
+                await post(channel_id, content, attachments)
         return web.json_response({"status": "ok"})
 
     async def reaper():
