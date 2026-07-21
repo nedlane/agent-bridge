@@ -25,14 +25,16 @@ for var in OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION \
   fi
 done
 
-# --- extract --label / --resume; collect passthrough args --------------------
-label=""
+# --- extract --resume; collect passthrough args ------------------------------
+# --label is accepted for launcher-interface symmetry with claude-launch (the
+# caller passes it to both), but codex-launch has no use for it — agent-worker
+# owns the tmux session — so the flag is consumed and discarded here.
 resume=0
 args=()
 while (($#)); do
   case "$1" in
-    --label)   label="${2:?codex-launch: --label needs a value}"; shift 2 ;;
-    --label=*) label="${1#--label=}"; shift ;;
+    --label)   : "${2:?codex-launch: --label needs a value}"; shift 2 ;;
+    --label=*) shift ;;
     --resume)  resume=1; shift ;;
     --)        shift; args+=("$@"); break ;;
     *)         args+=("$1"); shift ;;
