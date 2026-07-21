@@ -629,12 +629,13 @@ PROMPT_CHARS = {"claude": "❯", "codex": "›"}
 
 
 def harness_for(repo):
-    """The engine driving a repo's worker: 'claude' (default) or 'codex'.
+    """The engine driving a repo's worker: 'codex' (default) or 'claude'.
 
-    Absent/unknown values normalize to 'claude', so every pre-harness channel
-    keeps its current behavior untouched."""
-    h = (repo or {}).get("harness") or "claude"
-    return h if h in ("claude", "codex") else "claude"
+    Codex is the fleet default. Every existing channel carries an explicit
+    harness in config, so this fallback only decides the engine for newly
+    added repos; absent/unknown values normalize to 'codex'."""
+    h = (repo or {}).get("harness") or "codex"
+    return h if h in ("claude", "codex") else "codex"
 
 
 def screen_is_ready(screen, harness="claude"):
