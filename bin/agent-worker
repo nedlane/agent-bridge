@@ -106,10 +106,13 @@ is_ready() {
 # line above it, so tail -1 is what isolates the live box.
 input_line() { screen_of "$1" | grep -E '^❯|^›' | tail -1 || true; }
 # A multi-line (or long) bracketed paste does NOT echo its text into the box —
-# the composer collapses it to a chip like "❯ [Pasted text #1 +17 lines]". So
-# submission has to be judged by the chip's presence/absence, not by matching
-# the message text back on the prompt line.
-is_paste_chip() { grep -qE '\[Pasted text #[0-9]+' <<<"$1"; }
+# the composer collapses it to a chip, so submission has to be judged by the
+# chip's presence/absence, not by matching the message text back on the prompt
+# line. The two engines render the chip differently:
+#   Claude Code: "❯ [Pasted text #1 +17 lines]"
+#   Codex:       "› [Pasted Content 2000 chars]"
+# Match both, or a long Codex paste is read as never-landed and wrongly fails.
+is_paste_chip() { grep -qiE '\[Pasted (text #[0-9]+|content [0-9]+ chars)' <<<"$1"; }
 
 # wait_until <name> <timeout> [text] — poll the worker's screen until it is
 # idle at its prompt (or [text] appears). Auto-dismisses the startup dialogs
