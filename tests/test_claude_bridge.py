@@ -479,6 +479,17 @@ class HarnessForTests(unittest.TestCase):
         self.assertEqual(cb.harness_for({"harness": ""}), "codex")
         self.assertEqual(cb.harness_for(None), "codex")
 
+    def test_restricted_profiles_force_claude(self):
+        # greeter/utility rely on Claude's settings-file jail; Codex ignores it,
+        # so they must never run on Codex whatever the configured harness.
+        self.assertEqual(
+            cb.harness_for({"profile": "greeter", "harness": "codex"}), "claude")
+        self.assertEqual(
+            cb.harness_for({"profile": "utility", "harness": "codex"}), "claude")
+        # unrestricted profiles still honor an explicit codex harness
+        self.assertEqual(
+            cb.harness_for({"profile": "collab", "harness": "codex"}), "codex")
+
 
 class ScreenIsReadyHarnessTests(unittest.TestCase):
     def test_claude_idle_and_busy(self):

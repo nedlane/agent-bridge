@@ -628,12 +628,23 @@ def screen_is_compacting(screen):
 PROMPT_CHARS = {"claude": "❯", "codex": "›"}
 
 
+RESTRICTED_PROFILES = ("greeter", "utility")
+
+
 def harness_for(repo):
     """The engine driving a repo's worker: 'codex' (default) or 'claude'.
 
     Codex is the fleet default. Every existing channel carries an explicit
     harness in config, so this fallback only decides the engine for newly
-    added repos; absent/unknown values normalize to 'codex'."""
+    added repos; absent/unknown values normalize to 'codex'.
+
+    SAFETY: restricted profiles (greeter/utility) ALWAYS run on Claude,
+    whatever their configured harness. Their confinement is Claude's
+    settings-file allow/deny list — Codex runs full-YOLO and ignores it, so a
+    Codex greeter/utility worker would be unrestricted (a public greeter could
+    then run anything). This can't be overridden from config or /harness."""
+    if (repo or {}).get("profile") in RESTRICTED_PROFILES:
+        return "claude"
     h = (repo or {}).get("harness") or "codex"
     return h if h in ("claude", "codex") else "codex"
 
@@ -1371,6 +1382,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not item:
             return f"⚠️ no repo channel mapped for `{name}`", None
         _, repo = item
+        if engine == "codex" and repo.get("profile") in RESTRICTED_PROFILES:
+            return (
+                f"🚫 `{name}` runs the restricted **{repo['profile']}** profile, "
+                "which only Claude can enforce — Codex runs full-YOLO and would "
+                "ignore its guardrails. Keeping it on Claude.", None,
+            )
         if harness_for(repo) == engine:
             return f"↔️ `{name}` is already on **{engine}** — nothing to change.", None
         repo["harness"] = engine
