@@ -1347,6 +1347,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         paths = await save_attachments(name, message)
         quote = await reply_snippet(message)
         composed = compose_inbound(message.content, paths, quote)
+        # A pending /harness handoff rides on the first real message to
+        # whichever engine starts next — including a Codex worker resuming
+        # its OWN prior thread here, since the note is catching it up on what
+        # the OTHER engine just did, not on its own history (so this is
+        # deliberately not gated on codex_unprimed below).
+        handoff = consume_handoff(name)
+        if handoff:
+            composed = (
+                "Handoff from the previous engine:\n\n" + handoff + "\n\n---\n\n" + composed
+            )
         # First real message to a fresh Codex worker: prepend the Discord
         # protocol (Codex's stand-in for Claude's --append-system-prompt). One
         # shot — a resumed session already has it in history.
