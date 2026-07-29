@@ -216,14 +216,20 @@ DISCORD_TAG = (
 )
 
 
-def system_prompt(name):
+def system_prompt(name, state_root=None):
     """The injected protocol; the orchestrator also gets the control-plane
-    brief, and the public welcome greeter gets its own brief instead."""
+    brief, and the public welcome greeter gets its own brief instead. A
+    pending /harness handoff note is appended and consumed, one-shot."""
     if name == "welcome":
-        return GREETER
-    if name == "orchestrator":
-        return PROTOCOL + "\n\n" + ORCHESTRATOR
-    return PROTOCOL
+        base = GREETER
+    elif name == "orchestrator":
+        base = PROTOCOL + "\n\n" + ORCHESTRATOR
+    else:
+        base = PROTOCOL
+    handoff = consume_handoff(name, state_root)
+    if handoff:
+        base += "\n\n---\n\nHandoff from the previous engine:\n\n" + handoff
+    return base
 
 
 def start_args(name, directory, channel_id, resume, profile="owner",
