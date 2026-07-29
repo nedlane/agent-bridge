@@ -655,5 +655,30 @@ class ConsumeHandoffTests(unittest.TestCase):
             self.assertEqual(cb.consume_handoff("w", root, now=now), "recent context")
 
 
+class SystemPromptHandoffTests(unittest.TestCase):
+    def test_no_handoff_unchanged(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(cb.system_prompt("w", root), cb.PROTOCOL)
+
+    def test_appends_and_consumes_pending_handoff(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "w"))
+            with open(cb.handoff_path("w", root), "w") as f:
+                f.write("finish the auth refactor")
+            prompt = cb.system_prompt("w", root)
+            self.assertTrue(prompt.startswith(cb.PROTOCOL))
+            self.assertIn("finish the auth refactor", prompt)
+            # one-shot: consumed by the call above
+            self.assertEqual(cb.system_prompt("w", root), cb.PROTOCOL)
+
+    def test_welcome_and_orchestrator_bases_unaffected(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(cb.system_prompt("welcome", root), cb.GREETER)
+            self.assertEqual(
+                cb.system_prompt("orchestrator", root),
+                cb.PROTOCOL + "\n\n" + cb.ORCHESTRATOR,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
