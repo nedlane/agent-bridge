@@ -603,5 +603,57 @@ class StartArgsHarnessTests(unittest.TestCase):
         self.assertNotIn("--resume", args)
 
 
+class HandoffPathTests(unittest.TestCase):
+    def test_path_shape(self):
+        self.assertEqual(
+            cb.handoff_path("myworker", "/state"),
+            "/state/myworker/handoff.md",
+        )
+
+
+class ConsumeHandoffTests(unittest.TestCase):
+    def test_absent_returns_none(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(cb.consume_handoff("w", root))
+
+    def test_reads_and_deletes_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "w"))
+            path = cb.handoff_path("w", root)
+            with open(path, "w") as f:
+                f.write("  finish the auth refactor  \n")
+            self.assertEqual(cb.consume_handoff("w", root), "finish the auth refactor")
+            self.assertFalse(os.path.exists(path))
+            # one-shot: a second read finds nothing
+            self.assertIsNone(cb.consume_handoff("w", root))
+
+    def test_empty_file_returns_none(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "w"))
+            open(cb.handoff_path("w", root), "w").close()
+            self.assertIsNone(cb.consume_handoff("w", root))
+
+    def test_stale_file_discarded_unread(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "w"))
+            path = cb.handoff_path("w", root)
+            with open(path, "w") as f:
+                f.write("old context")
+            now = 1_000_000.0
+            os.utime(path, (now - cb.HANDOFF_MAX_AGE_SECONDS - 10,) * 2)
+            self.assertIsNone(cb.consume_handoff("w", root, now=now))
+            self.assertFalse(os.path.exists(path))
+
+    def test_fresh_file_within_age_kept(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "w"))
+            path = cb.handoff_path("w", root)
+            with open(path, "w") as f:
+                f.write("recent context")
+            now = 1_000_000.0
+            os.utime(path, (now - 10,) * 2)
+            self.assertEqual(cb.consume_handoff("w", root, now=now), "recent context")
+
+
 if __name__ == "__main__":
     unittest.main()
