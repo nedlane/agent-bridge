@@ -270,7 +270,7 @@ channel you run it in.
 | Command | What it does |
 |---|---|
 | `/status` | List all workers, their running state, and engine (claude/codex). |
-| `/harness <claude\|codex> [worker]` | Switch a channel between **Claude Code** and **Codex** (Codex runs in YOLO mode — bypass all approvals + sandbox, the analog of Claude's bypass-permissions). Stops the worker; the next message starts it on the new engine. Each engine keeps its **own** conversation, so switching back resumes that engine's last thread. |
+| `/harness <claude\|codex> [worker] [handoff]` | Switch a channel between **Claude Code** and **Codex** (Codex runs in YOLO mode — bypass all approvals + sandbox, the analog of Claude's bypass-permissions). Stops the worker; the next message starts it on the new engine. Each engine keeps its **own** conversation, so switching back resumes that engine's last thread. `handoff:True` first asks the outgoing worker to write a short handoff note (current task, decisions, next steps) that's injected into the new engine's first turn — best-effort; the switch proceeds either way. |
 | `/stop [worker]` | Stop a worker (state kept; a message revives it). |
 | `/restart [worker]` | Restart a worker, resuming its conversation. |
 | `/screen [worker]` | Post the worker's live TUI screen (image, or a code-block fallback). |
