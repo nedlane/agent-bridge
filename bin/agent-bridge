@@ -215,6 +215,19 @@ DISCORD_TAG = (
     "your terminal output is not visible to him.]"
 )
 
+# /harness ... handoff:True sends this to the outgoing worker before
+# stopping it, then waits this long for it to go idle again before
+# switching anyway (see capture_handoff in run_bridge).
+HANDOFF_TIMEOUT_SECONDS = 240
+
+HANDOFF_PROMPT = (
+    "You're about to be switched to a different engine that keeps a "
+    "completely separate conversation — it will remember nothing from this "
+    "session. Before that happens, write a concise handoff (current task, "
+    "key decisions so far, files touched, next steps) to exactly this "
+    "path: {path}\nKeep it under ~400 words."
+)
+
 
 def system_prompt(name, state_root=None):
     """The injected protocol; the orchestrator also gets the control-plane
@@ -1429,7 +1442,22 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
 
-    async def do_harness(name, engine):
+    async def capture_handoff(name):
+        """Ask the live worker to write a handoff note for the next engine,
+        wait for it to finish, and return a short status suffix. Never
+        blocks the switch — always returns, whatever happened."""
+        try:
+            os.remove(handoff_path(name))
+        except FileNotFoundError:
+            pass
+        await deliver(name, HANDOFF_PROMPT.format(path=handoff_path(name)))
+        if not await wait_ready(name, timeout=HANDOFF_TIMEOUT_SECONDS):
+            return " ⚠️ handoff didn't finish in time — switching without it."
+        if os.path.isfile(handoff_path(name)):
+            return " 📝 handoff captured for the next engine."
+        return " ⚠️ didn't write a handoff file — switching without one."
+
+    async def do_harness(name, engine, handoff=False):
         """Switch a channel's worker between engines ('claude' or 'codex').
 
         Not a hot-swap — a live TUI can't change engines — so this persists the
@@ -1438,7 +1466,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         switching to Codex begins a fresh Codex session while Claude's thread
         stays intact (and vice versa): each engine remembers its own last
         conversation. Codex always runs in YOLO mode (bypass all approvals +
-        sandbox), the analog of Claude's bypass-permissions."""
+        sandbox), the analog of Claude's bypass-permissions.
+
+        handoff=True asks the outgoing worker to write a short context note
+        for whichever engine starts next before it's stopped (see
+        capture_handoff) — best-effort, the switch proceeds either way."""
         engine = (engine or "").strip().lower()
         if engine not in ("claude", "codex"):
             return f"⚠️ harness must be `claude` or `codex` (got `{engine}`)", None
@@ -1460,16 +1492,21 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         save_config(cfg, config_path)
         # Stop the current worker so the next message revives it on the new
         # engine; a stale codex-prime flag from the old engine is cleared.
+        handoff_note = ""
         if await asyncio.to_thread(worker_alive, name):
+            if handoff:
+                handoff_note = await capture_handoff(name)
             await asyncio.to_thread(worker_stop, name)
+        elif handoff:
+            handoff_note = " ℹ️ no running session to capture a handoff from."
         codex_unprimed.discard(name)
         last_activity.pop(name, None)
         note = " **(YOLO mode)**" if engine == "codex" else ""
         print(f"[bridge] harness: {name} -> {engine}")
         return (
-            f"🔀 `{name}` is now driven by **{engine}**{note}. Your next message "
-            "starts it — each engine keeps its own conversation, so switching "
-            "back resumes that engine's last thread.", None,
+            f"🔀 `{name}` is now driven by **{engine}**{note}.{handoff_note} Your "
+            "next message starts it — each engine keeps its own conversation, "
+            "so switching back resumes that engine's last thread.", None,
         )
 
     async def do_close(name):
@@ -1826,12 +1863,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.followup.send(f"📨 asked `{name}` for a check-in")
 
     @tree.command(name="harness", description="Switch a channel between Claude and Codex (codex = YOLO mode)")
-    @describe(engine="claude or codex", worker="Worker (defaults to this channel's worker)")
-    async def slash_harness(interaction, engine: str, worker: str = None):
+    @describe(engine="claude or codex", worker="Worker (defaults to this channel's worker)",
+              handoff="Ask the outgoing worker to write a handoff note for the next engine first (default: off)")
+    async def slash_harness(interaction, engine: str, worker: str = None, handoff: bool = False):
         if not (name := await guard(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        await reply(interaction, *await do_harness(name, engine))
+        await reply(interaction, *await do_harness(name, engine, handoff))
 
     @tree.command(name="model", description="Switch a worker's model")
     @describe(model="e.g. opus, sonnet, haiku", worker="Worker (defaults to this channel's worker)")
