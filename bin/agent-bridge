@@ -1459,10 +1459,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         wait for it to finish, and return a short status suffix. Never
         blocks the switch — always returns, whatever happened."""
         try:
-            os.remove(handoff_path(name))
-        except FileNotFoundError:
-            pass
-        try:
+            try:
+                os.remove(handoff_path(name))
+            except FileNotFoundError:
+                pass
             await deliver(name, HANDOFF_PROMPT.format(path=handoff_path(name)))
             if not await wait_ready(name, timeout=HANDOFF_TIMEOUT_SECONDS):
                 return " ⚠️ handoff didn't finish in time — switching without it."
