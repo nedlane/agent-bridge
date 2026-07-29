@@ -112,6 +112,12 @@ REPLY_CAP = 8000
 # gets a unique name); prune anything older than this on the next download.
 INBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
 
+# A /harness handoff note nobody's switch ever consumed (e.g. a second
+# switch arrived before any message reached the new engine) is discarded
+# unread after this long, rather than surfacing in an unrelated later
+# session.
+HANDOFF_MAX_AGE_SECONDS = 24 * 3600
+
 # Injected into every worker's system prompt: the worker itself is the
 # publisher. It messages Ned through discord-notify (which auto-targets the
 # worker's repo channel, and can attach images/files with -i); the bridge's
@@ -888,6 +894,37 @@ def prune_old_files(directory, max_age_seconds, now=None):
         except OSError:
             pass
     return removed
+
+
+def handoff_path(name, state_root=None):
+    return os.path.join(state_root or STATE_ROOT, name, "handoff.md")
+
+
+def consume_handoff(name, state_root=None, now=None):
+    """Read-and-delete a pending /harness handoff note once: returns its
+    content, or None if absent/empty. A note older than
+    HANDOFF_MAX_AGE_SECONDS is discarded unread — an unconsumed handoff from
+    a switch nobody followed up on shouldn't surface in an unrelated later
+    session."""
+    path = handoff_path(name, state_root)
+    now = time.time() if now is None else now
+    try:
+        stale = now - os.path.getmtime(path) > HANDOFF_MAX_AGE_SECONDS
+    except OSError:
+        return None
+    if stale:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    try:
+        with open(path) as f:
+            content = f.read().strip()
+        os.remove(path)
+    except OSError:
+        return None
+    return content or None
 
 
 # --------------------------------------------------------------------------
