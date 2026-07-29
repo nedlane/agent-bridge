@@ -1450,12 +1450,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             os.remove(handoff_path(name))
         except FileNotFoundError:
             pass
-        await deliver(name, HANDOFF_PROMPT.format(path=handoff_path(name)))
-        if not await wait_ready(name, timeout=HANDOFF_TIMEOUT_SECONDS):
-            return " ⚠️ handoff didn't finish in time — switching without it."
-        if os.path.isfile(handoff_path(name)):
-            return " 📝 handoff captured for the next engine."
-        return " ⚠️ didn't write a handoff file — switching without one."
+        try:
+            await deliver(name, HANDOFF_PROMPT.format(path=handoff_path(name)))
+            if not await wait_ready(name, timeout=HANDOFF_TIMEOUT_SECONDS):
+                return " ⚠️ handoff didn't finish in time — switching without it."
+            if os.path.isfile(handoff_path(name)):
+                return " 📝 handoff captured for the next engine."
+            return " ⚠️ didn't write a handoff file — switching without one."
+        except Exception as e:
+            print(f"[bridge] {name}: handoff capture failed: {e}")
+            return " ⚠️ handoff capture failed — switching without it."
 
     async def do_harness(name, engine, handoff=False):
         """Switch a channel's worker between engines ('claude' or 'codex').
