@@ -32,7 +32,9 @@ message rather than a system prompt.
 Commands are native Discord slash commands (allowed users; synced per guild
 on connect). The `worker` option defaults to the channel's mapped worker:
   /status                  list all workers, their state, and engine
-  /harness <claude|codex> [worker]   switch a channel's engine (codex = YOLO)
+  /harness <claude|codex> [worker] [handoff]   switch a channel's engine
+                           (codex = YOLO; handoff first captures a note for
+                           the next engine, best-effort)
   /stop /restart /screen [worker]
   /usage [worker]          usage & session cost: plan rate-limit bars + this
                            worker's session cost (owner or a channel's editors;
