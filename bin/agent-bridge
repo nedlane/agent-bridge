@@ -410,11 +410,17 @@ def split_message(text, limit=DISCORD_LIMIT):
         text = text[:REPLY_CAP] + "\n… (truncated — use /screen for the live view)"
     chunks, current = [], ""
     for line in text.splitlines(keepends=True):
+        if len(line) > limit and current.strip():
+            # Preserve ordering: flush preceding short lines (including the
+            # worker status tag) before splitting a pathological long line.
+            chunks.append(current)
+            current = ""
         while len(line) > limit:  # single pathological line
             chunks.append(line[:limit])
             line = line[limit:]
         if len(current) + len(line) > limit:
-            chunks.append(current)
+            if current.strip():
+                chunks.append(current)
             current = line
         else:
             current += line
@@ -932,11 +938,6 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     # --append-system-prompt; the protocol rides in as a user turn instead).
     codex_unprimed = set()
 
-    # Workers whose NEXT outbound message should carry the little model tag.
-    # Armed when Ned messages a worker; consumed by the worker's first reply, so
-    # only the top message of each response is tagged (not every message).
-    first_reply_pending = {}
-
     async def wait_ready(name, timeout=180):
         """Poll until the worker pane is idle and input-ready (or timeout).
 
@@ -1123,9 +1124,6 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # course corrections need. A ✅ confirms the message was delivered,
         # whether the worker was idle or mid-turn (a queued steer still sent).
         last_activity[name] = time.time()
-        # Arm the model tag for this worker's next reply (Ned just messaged it).
-        if message is not None:
-            first_reply_pending[name] = True
         screen = await asyncio.to_thread(worker_screen, name, 30)
         # A worker mid-compaction (manual /compact or an auto-compact) is
         # redrawing its input box; a paste — and the message pointing Claude at
@@ -1305,11 +1303,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         return next((x for x in cfg["repos"].values() if x["name"] == name), None)
 
     async def tag_reply(name, text):
-        """Prepend a small model tag to a worker's FIRST reply after each
-        inbound message. The flag is consumed here, so only the top message of a
-        response gets tagged; follow-ups in the same turn go untagged."""
-        if not first_reply_pending.pop(name, False):
-            return text
+        """Prepend the engine/model/speed tag to every logical worker message.
+
+        post() splits over-limit text only after this runs, so a multipart
+        Discord delivery gets the tag on its first chunk and not its
+        continuation chunks.
+        """
         harness = harness_for(repo_by_name(name))
         try:
             label = await asyncio.to_thread(worker_model_tag, name, harness)
@@ -2268,7 +2267,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             attachments = event.get("attachments") or []
             content = event.get("content") or ""
             if channel_id and (content or attachments):
-                if content and worker:
+                if worker:
                     content = await tag_reply(worker, content)
                 await post(channel_id, content, attachments)
         return web.json_response({"status": "ok"})
