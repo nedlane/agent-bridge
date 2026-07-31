@@ -491,6 +491,50 @@ class HarnessForTests(unittest.TestCase):
             cb.harness_for({"profile": "collab", "harness": "codex"}), "codex")
 
 
+class CodexStatusTagTests(unittest.TestCase):
+    def test_standard_mode(self):
+        screen = "› Write tests for @filename\n\n  gpt-5.6-sol high · ~/repo"
+        self.assertEqual(
+            cb.codex_status_tag(screen),
+            "Codex · gpt-5.6-sol high · Fast off",
+        )
+
+    def test_fast_mode_suffix(self):
+        screen = "› Write tests for @filename\n\n  gpt-5.6-sol high fast · ~/repo"
+        self.assertEqual(
+            cb.codex_status_tag(screen),
+            "Codex · gpt-5.6-sol high · Fast on",
+        )
+
+    def test_explicit_fast_mode_status_item(self):
+        self.assertEqual(
+            cb.codex_status_tag(
+                "  gpt-5.6-terra ultra fast · Fast on · ~/repo"
+            ),
+            "Codex · gpt-5.6-terra ultra · Fast on",
+        )
+        self.assertEqual(
+            cb.codex_status_tag(
+                "  gpt-5.6-terra medium · Fast off · ~/repo"
+            ),
+            "Codex · gpt-5.6-terra medium · Fast off",
+        )
+
+    def test_last_footer_wins_after_toggle(self):
+        screen = (
+            "  gpt-5.6-sol high fast · Fast on · ~/repo\n"
+            "• Service tier set to default\n"
+            "  gpt-5.6-sol high · Fast off · ~/repo"
+        )
+        self.assertEqual(
+            cb.codex_status_tag(screen),
+            "Codex · gpt-5.6-sol high · Fast off",
+        )
+
+    def test_missing_footer(self):
+        self.assertIsNone(cb.codex_status_tag("Codex is still booting"))
+
+
 class ScreenIsReadyHarnessTests(unittest.TestCase):
     def test_claude_idle_and_busy(self):
         self.assertTrue(cb.screen_is_ready("some log\n❯ ", "claude"))
