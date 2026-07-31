@@ -649,24 +649,48 @@ def harness_for(repo):
     return h if h in ("claude", "codex") else "codex"
 
 
-def worker_model_tag(name, harness):
-    """Short 'which model' label for the tag prepended to a worker's first
-    Discord reply, so Ned can tell at a glance what answered in each channel.
+def codex_status_tag(screen):
+    """Build the Discord reply tag from Codex's most recent footer.
 
-    Codex renders 'gpt-5.6-sol high · <dir>' in its footer, so parse the model
-    (and effort) out of the pane. Claude's pane doesn't surface the model, so it
-    tags at the engine level."""
+    Standard mode renders ``gpt-5.6-sol high · <dir>`` while Fast mode adds a
+    ``fast`` suffix before the separator. If the worker has Codex's optional
+    ``fast-mode`` status-line item enabled, the footer also contains
+    ``Fast on`` or ``Fast off``. Prefer the last footer-looking line because an
+    older footer can remain in the captured scrollback after /fast toggles.
+    """
+    matches = list(re.finditer(
+        r"(?m)^\s*(gpt[\w.\-]+)"
+        r"(?:\s+(minimal|low|medium|high|xhigh|max|ultra))?"
+        r"(?:\s+(fast))?\s*·"
+        r"(?:\s*Fast\s+(on|off)\s*·)?",
+        screen or "",
+        re.IGNORECASE,
+    ))
+    if not matches:
+        return None
+    match = matches[-1]
+    model = match.group(1)
+    effort = match.group(2)
+    explicit_fast = match.group(4)
+    fast_on = (
+        explicit_fast.lower() == "on"
+        if explicit_fast else match.group(3) is not None
+    )
+    label = "Codex · " + model
+    if effort:
+        label += " " + effort.lower()
+    return label + (" · Fast on" if fast_on else " · Fast off")
+
+
+def worker_model_tag(name, harness):
+    """Short engine/model/speed label for a worker's first Discord reply."""
     if harness != "codex":
         return "Claude"
     try:
         screen = worker_screen(name, 40)
     except Exception:
         return "Codex"
-    m = re.search(r"(gpt[\w.\-]+)(?:\s+(low|medium|high|minimal|xhigh|max))?\s*·",
-                  screen)
-    if m:
-        return "Codex · " + m.group(1) + (f" {m.group(2)}" if m.group(2) else "")
-    return "Codex"
+    return codex_status_tag(screen) or "Codex"
 
 
 def screen_is_ready(screen, harness="claude"):
