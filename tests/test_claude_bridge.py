@@ -205,6 +205,13 @@ class SplitMessageTests(unittest.TestCase):
     def test_blank_input_yields_nothing(self):
         self.assertEqual(cb.split_message("   \n  \n"), [])
 
+    def test_worker_tag_only_appears_on_first_multipart_chunk(self):
+        tag = "-# 🤖 Codex · gpt-5.6-sol high · Fast on\n"
+        chunks = cb.split_message(tag + ("x" * 100), limit=60)
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(chunks[0], tag.rstrip())
+        self.assertTrue(all("🤖" not in chunk for chunk in chunks[1:]))
+
 
 class IsIgnoreMessageTests(unittest.TestCase):
     def test_ignore_alone_and_with_text(self):
