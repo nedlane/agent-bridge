@@ -909,6 +909,68 @@ class SystemPromptHandoffTests(unittest.TestCase):
             self.assertEqual(composed.count("finish the auth refactor"), 1)
 
 
+class SessionLookupTests(unittest.TestCase):
+    """Locating a worker's session on disk, for /cost."""
+
+    def test_claude_slug_flattens_slashes_and_dots(self):
+        self.assertEqual(cb.claude_project_slug("/home/n/guest/x"),
+                         "-home-n-guest-x")
+        # The dot in a hidden dir becomes a dash too, which is why real
+        # project dirs contain a doubled dash.
+        self.assertEqual(cb.claude_project_slug("/home/n/.local/state/x"),
+                         "-home-n--local-state-x")
+        self.assertEqual(cb.claude_project_slug("/home/n/x/"), "-home-n-x")
+
+    def test_picks_the_newest_claude_transcript(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, cb.claude_project_slug("/w/p"))
+            os.makedirs(d)
+            old = os.path.join(d, "old.jsonl"); new = os.path.join(d, "new.jsonl")
+            for f in (old, new):
+                open(f, "w").close()
+            os.utime(old, (1000, 1000)); os.utime(new, (2000, 2000))
+            open(os.path.join(d, "notes.txt"), "w").close()  # ignored
+            self.assertEqual(cb.newest_claude_transcript("/w/p", root), new)
+
+    def test_missing_claude_project_dir_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(cb.newest_claude_transcript("/never/ran", root))
+
+    def test_codex_rollout_matched_by_session_cwd(self):
+        with tempfile.TemporaryDirectory() as root:
+            day = os.path.join(root, "2026", "08", "01"); os.makedirs(day)
+            def write(name, cwd, mtime):
+                path = os.path.join(day, name)
+                with open(path, "w") as f:
+                    f.write(json.dumps({"type": "session_meta",
+                                        "payload": {"cwd": cwd}}) + "\n")
+                os.utime(path, (mtime, mtime))
+                return path
+            write("rollout-a-1.jsonl", "/other/project", 3000)
+            mine_old = write("rollout-b-2.jsonl", "/w/p", 1000)
+            mine_new = write("rollout-c-3.jsonl", "/w/p", 2000)
+            # Newest matching wins, and a newer non-matching one is skipped.
+            self.assertEqual(cb.newest_codex_rollout("/w/p", root), mine_new)
+            self.assertNotEqual(cb.newest_codex_rollout("/w/p", root), mine_old)
+            self.assertIsNone(cb.newest_codex_rollout("/nothing/here", root))
+
+    def test_session_tokens_returns_none_when_nothing_on_disk(self):
+        with tempfile.TemporaryDirectory() as root:
+            roots = {"claude": root, "codex": root}
+            for h in ("claude", "codex"):
+                self.assertEqual(cb.session_tokens(h, "/w/p", roots),
+                                 (None, None, None))
+
+
+class FormatTokensTests(unittest.TestCase):
+    def test_scales_readably(self):
+        self.assertEqual(cb.format_tokens(812), "812")
+        self.assertEqual(cb.format_tokens(340_500), "340.5k")
+        self.assertEqual(cb.format_tokens(1_200_000), "1.2M")
+        self.assertEqual(cb.format_tokens(0), "0")
+        self.assertEqual(cb.format_tokens(None), "0")
+
+
 class PricingTableTests(unittest.TestCase):
     def test_shipped_table_loads_and_covers_both_engines(self):
         pricing = cb.load_pricing(os.path.join(HERE, "pricing.json"))

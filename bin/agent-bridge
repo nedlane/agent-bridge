@@ -56,6 +56,8 @@ on connect). The `worker` option defaults to the channel's mapped worker:
                            the bars are account-wide, not per-worker)
   /limits                  your own usage against this channel's configured
                            message caps and cost budgets (ephemeral, anyone)
+  /cost [worker]           what this channel's current worker session has cost
+                           so far (whole session, priced from the transcript)
   /model <model> [worker]  switch the worker's model
   /clear [worker]          fresh context now: restart without --continue
                            (also wipes the channel's messages)
@@ -744,6 +746,91 @@ def claude_turn_usage(transcript_path, offset=0):
             except (TypeError, ValueError):
                 continue
     return tokens, model
+
+
+CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
+
+
+def claude_project_slug(directory):
+    """Claude Code's on-disk name for a working directory.
+
+    It flattens the path by replacing both "/" and "." with "-", so
+    /home/n/.local/state/x becomes -home-n--local-state-x (the doubled dash
+    is the dot, not a typo).
+    """
+    return re.sub(r"[/.]", "-", (directory or "").rstrip("/"))
+
+
+def newest_claude_transcript(directory, root=None):
+    """The most recently written transcript for a worker's cwd, or None.
+
+    Used by /cost to price a session on demand: the bridge otherwise only
+    learns a transcript path when a turn ends, which would make /cost blind
+    until the worker had replied at least once since the daemon started.
+    """
+    d = os.path.join(root or CLAUDE_PROJECTS, claude_project_slug(directory))
+    try:
+        files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jsonl")]
+    except OSError:
+        return None
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def newest_codex_rollout(directory, root=None, scan_limit=300):
+    """The most recent Codex rollout whose session started in `directory`.
+
+    Codex files rollouts by date rather than by project, so the cwd only
+    appears inside the session_meta on the first line — this walks newest
+    first and reads one line per candidate, capped so a long-lived box
+    doesn't turn /cost into a full-tree scan.
+    """
+    root = root or CODEX_SESSIONS
+    files = []
+    for dirpath, _, names in os.walk(root):
+        for n in names:
+            if n.startswith("rollout-") and n.endswith(".jsonl"):
+                files.append(os.path.join(dirpath, n))
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    for path in files[:scan_limit]:
+        try:
+            with open(path) as f:
+                entry = json.loads(f.readline())
+        except (OSError, ValueError):
+            continue
+        if (entry.get("payload") or {}).get("cwd") == directory:
+            return path
+    return None
+
+
+def session_tokens(harness, directory, roots=None):
+    """(tokens, model, path) for a worker's whole current session.
+
+    Whole-session, not per-turn: /cost answers "what has this conversation
+    cost", so it re-reads the transcript from the start rather than using the
+    incremental per-turn ledger.
+    """
+    roots = roots or {}
+    if harness == "codex":
+        path = newest_codex_rollout(directory, roots.get("codex"))
+        if not path:
+            return None, None, None
+        return codex_session_totals(path), None, path
+    path = newest_claude_transcript(directory, roots.get("claude"))
+    if not path:
+        return None, None, None
+    tokens, model = claude_turn_usage(path, 0)
+    return tokens, model, path
+
+
+def format_tokens(n):
+    """Compact token count for a Discord reply (1.2M / 340.5k / 812)."""
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
 
 
 def codex_session_totals(rollout_path):
@@ -2578,6 +2665,49 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await render_usage(name))
 
+    @tree.command(name="cost",
+                  description="Cost this channel's current worker session so far")
+    @describe(worker="Worker name (defaults to this channel's worker)")
+    async def slash_cost(interaction, worker: str = None):
+        # Scoped like /usage: a channel's editors can see their own channel's
+        # spend. Prices the whole session from the transcript rather than the
+        # per-turn ledger, so it answers "what has this conversation cost"
+        # even for turns that ran before this daemon started.
+        if not (name := await guard_scoped(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        repo = repo_by_name(name)
+        if not repo:
+            await interaction.followup.send(f"⚠️ no repo channel mapped for `{name}`")
+            return
+        if pricing is None:
+            await interaction.followup.send(
+                "⚠️ no pricing table loaded — see scripts/refresh-pricing.py")
+            return
+        harness = harness_for(repo)
+        tokens, model, path = await asyncio.to_thread(
+            session_tokens, harness, repo["dir"])
+        if not tokens:
+            await interaction.followup.send(
+                f"💰 no session found on disk for `{name}` — it may not have "
+                "run yet on this engine.")
+            return
+        model = model or (harness == "codex" and "gpt-5.6") or None
+        rates = rates_for_model(pricing, model)
+        total = token_cost(tokens, rates)
+        known = bool((pricing.get("models") or {}).get(str(model or "")))
+        lines = [
+            f"💰 `{name}` — **${total:.2f}** this session "
+            f"({model or 'unknown model'}{'' if known else ', fallback rate'})",
+            f"-# output {format_tokens(tokens['output'])} · "
+            f"input {format_tokens(tokens['input'])} · "
+            f"cache read {format_tokens(tokens['cache_read'])} · "
+            f"cache write {format_tokens(tokens['cache_write'])}",
+            "-# Workers run on subscriptions, so this is a cost-weighting for "
+            "comparing burn, not a bill.",
+        ]
+        await interaction.followup.send("\n".join(lines))
+
     @tree.command(name="limits",
                   description="Show how much of your usage limit you've used here")
     async def slash_limits(interaction):
@@ -2612,7 +2742,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.followup.send(f"📨 asked `{name}` for a check-in")
 
     @tree.command(name="harness", description="Switch between Claude, Codex, and Antigravity")
-    @describe(engine="claude, codex, or antigravity", worker="Worker (defaults to this channel's worker)",
+    @describe(engine="claude, codex, or antigravity", worker="Worker name (defaults to this channel's worker)",
               handoff="Ask the outgoing worker to write a handoff note for the next engine first (default: on)")
     async def slash_harness(interaction, engine: str, worker: str = None, handoff: bool = True):
         if not (name := await guard(interaction, worker)):
@@ -2629,7 +2759,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await reply(interaction, *await do_fast(name))
 
     @tree.command(name="model", description="Switch a worker's model")
-    @describe(model="e.g. opus, sonnet, haiku", worker="Worker (defaults to this channel's worker)")
+    @describe(model="e.g. opus, sonnet, haiku", worker="Worker name (defaults to this channel's worker)")
     async def slash_model(interaction, model: str, worker: str = None):
         if not (name := await guard_scoped(interaction, worker)):
             return
@@ -2646,7 +2776,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.followup.send(f"🔧 sent `/model {model}` to `{name}`{hint}")
 
     @tree.command(name="compact", description="Compact a worker's context")
-    @describe(focus="Optional focus for the compaction", worker="Worker (defaults to this channel's worker)")
+    @describe(focus="Optional focus for the compaction", worker="Worker name (defaults to this channel's worker)")
     async def slash_compact(interaction, focus: str = None, worker: str = None):
         if not (name := await guard(interaction, worker)):
             return
