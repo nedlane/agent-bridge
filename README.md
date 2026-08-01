@@ -442,6 +442,7 @@ channel you run it in.
 | `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
+| `/cost [worker]` | What this channel's current worker session has cost so far — priced from the whole transcript, not just turns seen since the daemon started. Shows the token breakdown. Owner or a channel's editors. |
 | `/limits` | Show **your own** usage against the limits configured for this channel (messages and cost). Ephemeral; open to anyone who can talk in the channel. |
 | `/checkin [worker]` | Ask a running worker to send a 3–5 line progress update. |
 | `/addrepo <name> <path> [category]` | Create `#<name>` and map it to a repo directory. Optional `category` files it under an existing category (matched loosely, ignoring emoji/case) or creates a new one; omitted, it lands in the default inbox category. |
