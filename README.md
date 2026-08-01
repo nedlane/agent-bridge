@@ -338,6 +338,18 @@ makes the total track spend.
 subscriptions, not metered API keys, so nothing here is invoiced — the figure
 exists to make burn comparable across engines and users.
 
+**No worker command resets anyone's usage.** `/fresh`, `/clear`, `/restart`
+and `/stop` tear down a worker; three of them are available to editor guests.
+None of them touch the ledger, and that isn't a promise about those commands
+— it falls out of how the ledger is keyed. Spend is recorded against
+*channel + user*, never against a worker name or session file, so there is
+nothing a worker teardown could invalidate. The counts live in
+`usage-limits.json` at the top of the state root, a sibling of the per-worker
+directories rather than inside one, so even `/close` (which rmtree's a
+worker's whole state dir, and is owner-only) leaves it untouched. What a fresh
+session *does* reset is the pricing baseline — and that is charged from zero
+rather than skipped, so it buys nothing either.
+
 Rates live in `pricing.json`, regenerated from a maintained upstream dataset:
 
 ```bash
