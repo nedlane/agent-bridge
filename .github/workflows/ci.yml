@@ -40,6 +40,13 @@ jobs:
           for f in claude-profiles/*.json; do
             jq empty "$f"
           done
+          jq empty pricing.json
+
+      - name: Validate refresh-pricing.py syntax
+        # Deliberately NOT `--check`: that hits the network, so a change to
+        # upstream pricing would redden CI on an unrelated PR. Staleness is a
+        # thing to notice and commit, not a build failure.
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile scripts/refresh-pricing.py
 
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v

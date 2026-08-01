@@ -182,6 +182,7 @@ The bridge reads a single JSON file at `~/.config/claude-bridge/config.json`
 | `repos` | object | Map of **channel id (string)** → repo object (below). |
 | `welcome_channel` | int \| null | Channel id of the public `#welcome` greeter (open to any member). `null` disables it. |
 | `requests_channel` | int \| null | Channel id where guest-access approval cards are posted. `null` disables it. |
+| `usage_limits` | object | Optional persistent message caps by channel, user, and user-within-channel. See below. |
 
 Each entry in `repos` is keyed by the Discord channel id (as a string) and holds:
 
@@ -221,6 +222,149 @@ start with an empty `repos` object. A complete example:
   }
 }
 ```
+
+Every ordinary Discord message is prefixed for the worker with the sender's
+display name, immutable Discord user id, and channel id. This prevents a shared
+worker from assuming every turn came from the owner.
+
+### Usage limits
+
+Limits are optional and disabled by default. Matching rules are cumulative: a
+message must fit the channel-wide cap, the user's aggregate cap across all
+channels, and any user-specific cap inside that channel. Each cap is a sliding
+window, not a lifetime total. Counts persist across daemon restarts in
+`~/.local/state/claude-workers/usage-limits.json`.
+
+The owner (`allowed_users`) is **exempt** — these caps exist to fence guests,
+so a channel-wide cap doesn't throttle you in your own channel. Editing a
+message counts the same as sending one; a refused message gets a ⛔ reaction,
+and the reason is spelled out at most once every 5 minutes per user so a
+capped guest can't farm bot replies.
+
+Each rule accepts `messages`, `cost`, and `window_seconds` (default `3600` for
+messages, `86400` for cost), or `"blocked": true` to disable that scope
+entirely. `messages` and `cost` apply to **different engines** — see [Token
+budgets](#token-budgets-the-cost-key) below. IDs are JSON string keys:
+
+```json
+{
+  "usage_limits": {
+    "channels": {
+      "555555555555555555": {
+        "messages": 100,
+        "cost": 5.00,
+        "window_seconds": 3600,
+        "users": {
+          "777777777777777777": {
+            "messages": 10,
+            "cost": 1.00,
+            "window_seconds": 3600
+          }
+        }
+      },
+      "666666666666666666": { "blocked": true }
+    },
+    "users": {
+      "777777777777777777": {
+        "messages": 50,
+        "cost": 20.00,
+        "window_seconds": 86400
+      }
+    }
+  }
+}
+```
+
+On a Claude or Codex channel that reads as: channel `555...` gets $5.00 of
+usage per hour in total and user `777...` gets $1.00/hour there plus $20.00/day
+across all channels — the `messages` values are inert. Switch that channel to
+Antigravity and the reverse holds: the caps become 100 messages/hour for the
+channel and 10/hour plus 50/day for the user, with the `cost` values inert.
+Channel `666...` is disabled globally on any engine.
+
+Anyone can run **`/limits`** in a worker channel to see their own numbers
+against each scope. The reply is ephemeral, so a guest checking their budget
+doesn't broadcast it.
+
+### Token budgets (the `cost` key)
+
+**The two keys apply to different engines — they are not layered.**
+
+| | `messages` | `cost` |
+|---|---|---|
+| Applies to | Antigravity, and any engine without turn-end telemetry | Claude and Codex |
+| Enforcement | Pre-hoc — refuses before anything is spent | Post-hoc — refuses the turn *after* the budget is blown |
+| Measures | Turns taken | Cost-weighted tokens |
+
+Counting turns is a poor proxy for burn: one message is a greeting or a
+repo-wide refactor. Wherever the bridge can price a turn it does, and the
+message cap is switched off there — layering a turn count on top would just
+fence the cheap requests too. Engines with no token telemetry have nothing
+else to go on, so they keep it.
+
+An engine the running build doesn't recognize counts as unmetered and is
+message-capped. That's the fail-safe direction: a new engine gets capped
+rather than escaping every control.
+
+`"blocked": true` is unaffected by any of this — it's an access decision, not
+a rate limit, and applies on every engine.
+
+**Cost is inherently post-hoc.** A turn's price isn't known until it has run,
+so overage is bounded by one turn — a user can always blow through their
+budget with a single expensive turn.
+
+**Where the numbers come from.** At turn end the bridge reads the same
+transcript window it already parses for the reply — Claude's per-message
+`usage`, or the running `total_token_usage` in Codex's rollout file — and
+prices it against `pricing.json`.
+
+Both engines report cumulatively, so a turn is the delta against the previous
+reading, and a session file with no previous reading needs a rule:
+
+- **A new session** (`/clear`, `/fresh`, a harness switch) genuinely starts at
+  zero, so it's priced in full from zero. Skipping it would make `/clear` a
+  repeatable way to dodge the budget — and `/clear` is available to exactly
+  the editor guests these budgets exist to fence.
+- **A worker the daemon has never priced** may already hold a long session in
+  its file, and there's no way to tell this turn's share from the history. That
+  turn is skipped and the baseline recorded — one under-charge per worker per
+  daemon restart. Every turn after it is exact.
+
+**Why cost-weighted and not raw tokens.** Cache reads bill at a tenth of the
+input rate but dominate the raw count — a real assistant message here shows
+190,369 cache-read tokens against 1,580 output. Summed raw, cache reads are
+~99% of the number and the budget degenerates into a turn counter that ranks a
+cheap resumed session above an expensive fresh one. Weighting by rate is what
+makes the total track spend.
+
+**The dollars are a weighting, not a bill.** Workers run on Claude and ChatGPT
+subscriptions, not metered API keys, so nothing here is invoiced — the figure
+exists to make burn comparable across engines and users.
+
+**No worker command resets anyone's usage.** `/fresh`, `/clear`, `/restart`
+and `/stop` tear down a worker; three of them are available to editor guests.
+None of them touch the ledger, and that isn't a promise about those commands
+— it falls out of how the ledger is keyed. Spend is recorded against
+*channel + user*, never against a worker name or session file, so there is
+nothing a worker teardown could invalidate. The counts live in
+`usage-limits.json` at the top of the state root, a sibling of the per-worker
+directories rather than inside one, so even `/close` (which rmtree's a
+worker's whole state dir, and is owner-only) leaves it untouched. What a fresh
+session *does* reset is the pricing baseline — and that is charged from zero
+rather than skipped, so it buys nothing either.
+
+Rates live in `pricing.json`, regenerated from a maintained upstream dataset:
+
+```bash
+scripts/refresh-pricing.py           # rewrite pricing.json, then commit it
+scripts/refresh-pricing.py --check   # exit 1 if stale
+```
+
+The bridge loads that file once at startup and never fetches at runtime — it
+has to work offline. If the file is missing or unreadable, cost budgets are
+disabled and the daemon logs it; `messages` caps keep working. A model that
+isn't in the table bills at the table's `fallback` rate rather than at zero, so
+a newly shipped model can't silently escape every budget.
 
 ## Secrets
 
@@ -281,6 +425,7 @@ channel you run it in.
 | `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
+| `/limits` | Show **your own** usage against the limits configured for this channel (messages and cost). Ephemeral; open to anyone who can talk in the channel. |
 | `/checkin [worker]` | Ask a running worker to send a 3–5 line progress update. |
 | `/addrepo <name> <path> [category]` | Create `#<name>` and map it to a repo directory. Optional `category` files it under an existing category (matched loosely, ignoring emoji/case) or creates a new one; omitted, it lands in the default inbox category. |
 | `/close [worker] confirm:<name>` | **Irreversible teardown** — stop the worker, wipe its saved state, and delete its channel. Requires retyping the worker name in `confirm`. |
