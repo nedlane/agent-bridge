@@ -46,8 +46,9 @@ on connect). The `worker` option defaults to the channel's mapped worker:
   /status                  list all workers, their state, and engine
   /harness <claude|codex|antigravity> [worker] [handoff]
                            switch a channel's engine (non-Claude = YOLO;
-                           handoff first captures a note for the next engine,
-                           best-effort)
+                           handoff:True (the default) first captures a note
+                           for the next engine, best-effort — pass
+                           handoff:False to switch immediately)
   /fast [worker]           toggle Codex Fast mode on/off
   /stop /restart /screen [worker]
   /usage [worker]          usage & session cost: plan rate-limit bars + this
@@ -255,7 +256,7 @@ DISCORD_TAG = (
     "your terminal output is not visible to him.]"
 )
 
-# /harness ... handoff:True sends this to the outgoing worker before
+# /harness handoff (on by default) sends this to the outgoing worker before
 # stopping it, then waits this long for it to go idle again before
 # switching anyway (see capture_handoff in run_bridge).
 HANDOFF_TIMEOUT_SECONDS = 240
@@ -2151,7 +2152,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             print(f"[bridge] {name}: handoff capture failed: {e}")
             return " ⚠️ handoff capture failed — switching without it."
 
-    async def do_harness(name, engine, handoff=False):
+    async def do_harness(name, engine, handoff=True):
         """Switch a channel's worker between engines ('claude', 'codex', or 'antigravity').
 
         Not a hot-swap — a live TUI can't change engines — so this persists the
@@ -2162,9 +2163,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         conversation. The non-Claude engines always run in YOLO mode (bypass
         all approvals + sandbox), the analog of Claude's bypass-permissions.
 
-        handoff=True asks the outgoing worker to write a short context note
-        for whichever engine starts next before it's stopped (see
-        capture_handoff) — best-effort, the switch proceeds either way."""
+        handoff=True (the default) asks the outgoing worker to write a short
+        context note for whichever engine starts next before it's stopped (see
+        capture_handoff) — best-effort, the switch proceeds either way. It is
+        the default because a switch that silently drops the thread is the
+        surprising outcome: the engines keep separate histories, so without a
+        note the new engine starts blind. Pass handoff=False when the context
+        genuinely doesn't matter and the extra wait isn't wanted."""
         engine = (engine or "").strip().lower()
         if engine not in ("claude", "codex", "antigravity"):
             return f"⚠️ harness must be `claude`, `codex`, or `antigravity` (got `{engine}`)", None
@@ -2608,8 +2613,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     @tree.command(name="harness", description="Switch between Claude, Codex, and Antigravity")
     @describe(engine="claude, codex, or antigravity", worker="Worker (defaults to this channel's worker)",
-              handoff="Ask the outgoing worker to write a handoff note for the next engine first (default: off)")
-    async def slash_harness(interaction, engine: str, worker: str = None, handoff: bool = False):
+              handoff="Ask the outgoing worker to write a handoff note for the next engine first (default: on)")
+    async def slash_harness(interaction, engine: str, worker: str = None, handoff: bool = True):
         if not (name := await guard(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
