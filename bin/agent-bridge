@@ -471,6 +471,38 @@ def usage_timestamps(entries, cutoff):
     return kept
 
 
+# Engines whose turns the bridge can actually price: Claude via its transcript
+# usage, Codex via its rollout totals. Anything else — Antigravity today, any
+# future engine landing without a turn-end relay — has no token telemetry, so
+# the crude message cap is the only lever there. New engines are unmetered by
+# default, which is the safe direction: they get capped rather than escaping.
+COST_METERED_HARNESSES = ("claude", "codex")
+
+
+def channel_meters_cost(cfg, channel_id):
+    """True when this channel's engine reports tokens the bridge can price.
+
+    Deliberately NOT `harness_for`: that normalizes every unrecognized value
+    to the fleet default, so an engine the running build hasn't learned about
+    yet would read as Codex and be treated as priceable. Here an unrecognized
+    engine must read as unmetered — that is the fail-safe direction, and it
+    keeps this correct no matter which order the engine PRs land in.
+
+    The restricted-profile override IS honored, because it is a real safety
+    invariant: greeter/utility always run on Claude whatever config says, so
+    they are always priceable.
+    """
+    repo = (cfg.get("repos") or {}).get(str(channel_id))
+    if not repo:
+        return False
+    if repo.get("profile") in RESTRICTED_PROFILES:
+        return True
+    # Absent means the fleet default (Codex); a present-but-unknown value is
+    # left alone so it falls through as unmetered.
+    harness = (repo.get("harness") or "codex").strip().lower()
+    return harness in COST_METERED_HARNESSES
+
+
 def usage_scopes(cfg, channel_id, user_id):
     """The three cumulative scopes a turn is charged against, in check order.
 
@@ -500,6 +532,15 @@ def rule_window(rule, default=3600):
 def check_usage_limit(cfg, state, channel_id, user_id, now=None):
     """Enforce cumulative channel, user, and channel-user message limits.
 
+    Message counting applies ONLY where the engine can't be priced. Counting
+    turns is a poor proxy for burn — one message is a greeting or a repo-wide
+    refactor — so on Claude and Codex the cost budget is the real control and
+    a message cap on top would just fence the cheap requests too. Engines
+    without token telemetry have nothing else, so they keep it.
+
+    `blocked` is checked on every engine regardless: it is an access decision,
+    not a rate limit.
+
     The owner (`allowed_users`) is exempt: a channel-wide cap exists to fence
     guests, and without this a cap set on a shared channel would throttle Ned
     in his own channel too.
@@ -507,11 +548,14 @@ def check_usage_limit(cfg, state, channel_id, user_id, now=None):
     now = time.time() if now is None else now
     if user_id in (cfg.get("allowed_users") or []):
         return True, None
+    counts_messages = not channel_meters_cost(cfg, channel_id)
     rules = usage_scopes(cfg, channel_id, user_id)
     active = []
     for key, rule, label in rules:
         if rule.get("blocked") is True:
             return False, f"{label}: access is disabled"
+        if not counts_messages:
+            continue
         maximum = rule.get("messages")
         if maximum is None:
             continue
@@ -783,6 +827,9 @@ def usage_summary(cfg, state, channel_id, user_id, now=None):
     now = time.time() if now is None else now
     if user_id in (cfg.get("allowed_users") or []):
         return ["You're the owner — no limits apply to you."]
+    # Report only the currency actually enforced here, so a configured cap the
+    # engine doesn't use never shows up as a number someone is watching.
+    metered = channel_meters_cost(cfg, channel_id)
     lines = []
     for key, rule, label in usage_scopes(cfg, channel_id, user_id):
         if rule.get("blocked") is True:
@@ -790,10 +837,10 @@ def usage_summary(cfg, state, channel_id, user_id, now=None):
             continue
         window = rule_window(rule)
         parts = []
-        if rule.get("messages") is not None:
+        if rule.get("messages") is not None and not metered:
             used = len(usage_timestamps(state.get(key), now - window))
             parts.append(f"{used}/{rule['messages']} messages")
-        if rule.get("cost") is not None:
+        if rule.get("cost") is not None and metered:
             cost_window = rule_window(rule, 86400)
             spent = sum(a for _, a in
                         usage_costs(state.get(cost_key(key)), now - cost_window))
@@ -1346,6 +1393,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     pricing = load_pricing()
     turn_owner = {}     # worker name -> (channel id, user id) that started it
     codex_totals = {}   # rollout path -> last cumulative token reading
+    priced_path = {}    # worker name -> transcript path last priced for it
     if pricing is None:
         print(f"[bridge] no pricing table at {PRICING_FILE} — cost budgets off")
 
@@ -1392,18 +1440,31 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         transcript offset, so the window priced here is exactly the window
         that turn wrote.
 
-        The FIRST turn on a transcript the bridge hasn't seen is free. Both
-        engines report cumulatively — Claude by byte offset, Codex by running
-        session totals — so with no prior reading to diff against, the only
-        options are to charge the entire session history to whoever happened
-        to send the next message, or to charge nothing and start measuring.
-        Under-charging one turn is the honest error; the baseline recorded
-        here makes every subsequent turn exact.
+        Both engines report cumulatively — Claude by byte offset, Codex by
+        running session totals — so a turn is the delta against the previous
+        reading, and a path with no previous reading needs a rule. There are
+        two such cases and they are NOT the same:
+
+        - The path changed for a worker we have already priced. That is a new
+          session (`/clear`, `/fresh`, a harness switch), which genuinely
+          starts at zero, so it is priced in full from zero. Without this,
+          `/clear` would buy an unpriced turn — and `/clear` is available to
+          exactly the editor guests these budgets exist to fence, so it would
+          be a repeatable way to never be billed.
+        - We have never priced this worker at all: the bridge just started,
+          and the file may already hold a long session. There is no way to
+          tell this turn's share from the history, so it is skipped and the
+          baseline recorded. One under-charge per worker per daemon start.
         """
         owner = turn_owner.pop(name, None)
         if pricing is None or not path:
             return
         try:
+            # A worker we've priced before that has moved to a new file is
+            # mid-fleet-life, not mid-cold-start: its new session starts at 0.
+            known_worker = name in priced_path
+            fresh_session = known_worker and priced_path[name] != path
+            priced_path[name] = path
             if codex:
                 totals = await asyncio.to_thread(codex_session_totals, path)
                 if totals is None:
@@ -1411,13 +1472,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 baseline = codex_totals.get(path)
                 codex_totals[path] = totals
                 if baseline is None:
-                    return
+                    if not fresh_session:
+                        return
+                    baseline = dict.fromkeys(TOKEN_FIELDS, 0)
                 tokens = subtract_tokens(totals, baseline)
             else:
-                if path not in offsets:
-                    return
+                start = offsets.get(path)
+                if start is None:
+                    if not fresh_session:
+                        return
+                    start = 0
                 tokens, seen_model = await asyncio.to_thread(
-                    claude_turn_usage, path, offsets[path])
+                    claude_turn_usage, path, start)
                 model = seen_model or model
             cost = token_cost(tokens, rates_for_model(pricing, model))
             if cost <= 0:
