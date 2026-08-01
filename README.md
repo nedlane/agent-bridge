@@ -271,6 +271,7 @@ channel you run it in.
 |---|---|
 | `/status` | List all workers, their running state, and engine (claude/codex). |
 | `/harness <claude\|codex> [worker]` | Switch a channel between **Claude Code** and **Codex** (Codex runs in YOLO mode — bypass all approvals + sandbox, the analog of Claude's bypass-permissions). Stops the worker; the next message starts it on the new engine. Each engine keeps its **own** conversation, so switching back resumes that engine's last thread. |
+| `/fast [worker]` | Toggle Codex Fast mode on or off. Running it once enables faster inference with increased plan usage; running it again returns the worker to standard speed. Codex workers only. |
 | `/stop [worker]` | Stop a worker (state kept; a message revives it). |
 | `/restart [worker]` | Restart a worker, resuming its conversation. |
 | `/screen [worker]` | Post the worker's live TUI screen (image, or a code-block fallback). |
