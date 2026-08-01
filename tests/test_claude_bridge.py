@@ -557,6 +557,20 @@ class ScreenIsReadyHarnessTests(unittest.TestCase):
             cb.screen_is_ready("› \nWorking (3s • esc to interrupt)", "codex")
         )
 
+    def test_claude_to_codex_handoff_uses_outgoing_prompt(self):
+        # The target is Codex, but capture still runs in the outgoing Claude TUI.
+        screen = "handoff written\n❯ "
+        outgoing_harness = "claude"
+        self.assertTrue(cb.screen_is_ready(screen, outgoing_harness))
+        self.assertFalse(cb.screen_is_ready(screen, "codex"))
+
+    def test_codex_to_claude_handoff_uses_outgoing_prompt(self):
+        # The target is Claude, but capture still runs in the outgoing Codex TUI.
+        screen = "handoff written\n› "
+        outgoing_harness = "codex"
+        self.assertTrue(cb.screen_is_ready(screen, outgoing_harness))
+        self.assertFalse(cb.screen_is_ready(screen, "claude"))
+
     def test_dismissed_trust_dialog_in_scrollback_is_ready(self):
         # A dismissed dialog lingers in scrollback (upper lines) — only the tail
         # counts, so this still reads as ready.
