@@ -32,7 +32,8 @@ message rather than a system prompt.
 Commands are native Discord slash commands (allowed users; synced per guild
 on connect). The `worker` option defaults to the channel's mapped worker:
   /status                  list all workers, their state, and engine
-  /harness <claude|codex|antigravity> [worker]   switch a channel's engine (codex/antigravity = YOLO)
+  /harness <claude|codex|antigravity> [worker]
+                           switch a channel's engine (non-Claude = YOLO)
   /stop /restart /screen [worker]
   /usage [worker]          usage & session cost: plan rate-limit bars + this
                            worker's session cost (owner or a channel's editors;
@@ -689,7 +690,7 @@ def codex_status_tag(screen):
 
 
 def worker_model_tag(name, harness):
-    """Short engine/model/speed label for a worker's first Discord reply."""
+    """Short engine/model/speed label for a worker's Discord reply."""
     if harness not in ("codex", "antigravity"):
         return "Claude"
     if harness == "antigravity":
@@ -1410,7 +1411,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if engine in ("codex", "antigravity") and repo.get("profile") in RESTRICTED_PROFILES:
             return (
                 f"🚫 `{name}` runs the restricted **{repo['profile']}** profile, "
-                "which only Claude can enforce — Codex runs full-YOLO and would "
+                "which only Claude can enforce — non-Claude harnesses run "
+                "full-YOLO and would "
                 "ignore its guardrails. Keeping it on Claude.", None,
             )
         if harness_for(repo) == engine:
@@ -1784,7 +1786,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         )
         await interaction.followup.send(f"📨 asked `{name}` for a check-in")
 
-    @tree.command(name="harness", description="Switch a channel between Claude, Codex, and Antigravity (codex/antigravity = YOLO mode)")
+    @tree.command(name="harness", description="Switch between Claude, Codex, and Antigravity")
     @describe(engine="claude, codex, or antigravity", worker="Worker (defaults to this channel's worker)")
     async def slash_harness(interaction, engine: str, worker: str = None):
         if not (name := await guard(interaction, worker)):

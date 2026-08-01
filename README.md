@@ -58,6 +58,8 @@ The host that runs the bridge needs:
   logged in interactively on a **Claude subscription** (not an API key, not
   Bedrock/Vertex). Run `claude` once and `/login` first.
 - **`claude-launch`** — a launcher wrapper that this repo does **not** include.
+- **`agy`** — required only for the optional Antigravity harness. It must be
+  installed and authenticated before selecting `/harness antigravity`.
 
 ### About `claude-launch` (external dependency)
 
