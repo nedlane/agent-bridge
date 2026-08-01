@@ -1,0 +1,35 @@
+{
+  "category_id": 111111111111111111,
+  "allowed_users": [222222222222222222],
+  "welcome_channel": 333333333333333333,
+  "requests_channel": 444444444444444444,
+  "idle_minutes": 120,
+  "repos": {
+    "555555555555555555": {
+      "name": "my-project",
+      "dir": "/home/you/projects/my-project",
+      "harness": "codex",
+      "guests": [777777777777777777],
+      "viewers": [888888888888888888]
+    },
+    "666666666666666666": {
+      "name": "solo-project",
+      "dir": "/home/you/projects/solo-project",
+      "harness": "claude"
+    }
+  },
+  "usage_limits": {
+    "channels": {
+      "555555555555555555": {
+        "messages": 100,
+        "window_seconds": 3600
+      }
+    },
+    "users": {
+      "777777777777777777": {
+        "cost": 25.0,
+        "window_seconds": 86400
+      }
+    }
+  }
+}

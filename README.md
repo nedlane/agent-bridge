@@ -169,6 +169,22 @@ be set with the `CLAUDE_BRIDGE_CONFIG` environment variable.
 
 ## Configuration
 
+A ready-to-edit template lives at [`config.example.json`](config.example.json) —
+copy it to `~/.config/claude-bridge/config.json` and replace the placeholder
+IDs with your own:
+
+```bash
+mkdir -p ~/.config/claude-bridge
+cp config.example.json ~/.config/claude-bridge/config.json
+```
+
+**Keep your real config out of version control.** It carries Discord channel
+and user IDs (yours and your guests') plus local filesystem paths, so it lives
+outside the repo by design; `config.json` is gitignored here so a stray copy
+can't be committed by accident. If you want it version-controlled anyway, put
+it in a private repo or encrypt it at rest (git-crypt, SOPS, age) — not in a
+public dotfiles repo.
+
 The bridge reads a single JSON file at `~/.config/claude-bridge/config.json`
 (override with the `CLAUDE_BRIDGE_CONFIG` environment variable). Fields
 (defaults come from `default_config()`):
