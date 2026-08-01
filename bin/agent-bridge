@@ -755,11 +755,15 @@ CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 def claude_project_slug(directory):
     """Claude Code's on-disk name for a working directory.
 
-    It flattens the path by replacing both "/" and "." with "-", so
+    It flattens the path by replacing "/", "." and "_" with "-", so
     /home/n/.local/state/x becomes -home-n--local-state-x (the doubled dash
-    is the dot, not a typo).
+    is the dot, not a typo) and /home/n/uqr_ws becomes -home-n-uqr-ws.
+
+    The underscore matters more than it looks: miss it and /cost silently
+    finds no session for every worker whose path has one, reporting "no
+    session found" rather than an error.
     """
-    return re.sub(r"[/.]", "-", (directory or "").rstrip("/"))
+    return re.sub(r"[/._]", "-", (directory or "").rstrip("/"))
 
 
 def newest_claude_transcript(directory, root=None):
