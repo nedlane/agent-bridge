@@ -327,6 +327,32 @@ class ChannelFromChatTests(unittest.TestCase):
         self.assertIsNone(cb.channel_from_chat(None))
 
 
+class WorkerNotificationChannelTests(unittest.TestCase):
+    CFG = {
+        "repos": {
+            "100": {"name": "alpha"},
+            "200": {"name": "beta"},
+        }
+    }
+
+    def test_mapped_worker_is_pinned_to_its_channel(self):
+        self.assertEqual(
+            cb.worker_notification_channel(self.CFG, "alpha", "discord:200"),
+            100,
+        )
+
+    def test_unknown_worker_cannot_choose_a_channel(self):
+        self.assertIsNone(
+            cb.worker_notification_channel(self.CFG, "unknown", "discord:200")
+        )
+
+    def test_unbound_caller_may_use_explicit_target(self):
+        self.assertEqual(
+            cb.worker_notification_channel(self.CFG, "", "discord:200"),
+            200,
+        )
+
+
 class TagInboundTests(unittest.TestCase):
     def test_typed_passes_through(self):
         self.assertEqual(cb.tag_inbound("/model opus", typed=True), "/model opus")
@@ -567,6 +593,27 @@ class ScreenIsReadyHarnessTests(unittest.TestCase):
     def test_active_trust_dialog_in_tail_is_not_ready(self):
         screen = "› 1. Yes, continue\nDo you trust the contents of this directory?"
         self.assertFalse(cb.screen_is_ready(screen, "codex"))
+
+    def test_codex_update_menu_is_not_idle_prompt(self):
+        screen = (
+            "✨ Update available! 0.145.0 -> 0.146.0\n"
+            "› 1. Update now\n"
+            "  2. Skip\n"
+            "  3. Skip until next version\n"
+            "Press enter to continue"
+        )
+        self.assertFalse(cb.screen_is_ready(screen, "codex"))
+
+    def test_dismissed_codex_update_menu_in_scrollback_is_ready(self):
+        screen = (
+            "✨ Update available! 0.145.0 -> 0.146.0\n"
+            "› 1. Update now\n"
+            "  2. Skip\n"
+            "  3. Skip until next version\n"
+            "Press enter to continue\n\n"
+            "› "
+        )
+        self.assertTrue(cb.screen_is_ready(screen, "codex"))
 
 
 class ComposerIsEmptyHarnessTests(unittest.TestCase):
