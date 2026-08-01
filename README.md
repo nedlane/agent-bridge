@@ -353,6 +353,17 @@ input rate but dominate the raw count — a real assistant message here shows
 cheap resumed session above an expensive fresh one. Weighting by rate is what
 makes the total track spend.
 
+**Fast tier is priced.** Both providers bill their fast/priority tier at
+exactly 2x standard per-token rates — OpenAI's Fast mode (`service_tier`
+`priority`/`fast`, renamed from Priority processing on 2026-07-30) and
+Anthropic's fast mode on Opus 5 ($10/$50 vs $5/$25). `pricing.json` carries
+that as `fast_multiplier`, and cost is blended by the share of work actually
+served fast. Claude records `speed` per message so its share is weighted by
+output tokens; Codex reports only cumulative session totals, so its share is
+weighted by response count — close, but an approximation. Note the Codex
+worker profile ships with `service_tier = "fast"`, so Codex workers run fast
+by default.
+
 **The dollars are a weighting, not a bill.** Workers run on Claude and ChatGPT
 subscriptions, not metered API keys, so nothing here is invoiced — the figure
 exists to make burn comparable across engines and users.

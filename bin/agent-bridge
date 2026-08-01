@@ -690,8 +690,17 @@ def rates_for_model(pricing, model):
     return {f: float(rates.get(f) or 0.0) for f in TOKEN_FIELDS}
 
 
-def token_cost(tokens, rates):
-    """Cost-weighted value of one turn's token counts."""
+def token_cost(tokens, rates, fast_share=0.0, fast_multiplier=1.0):
+    """Cost-weighted value of one turn's token counts.
+
+    `fast_share` is the fraction of this work served by the fast/priority
+    tier, which both providers bill at a flat multiple of standard rates
+    (2x for OpenAI Fast mode and Anthropic fast mode alike). Blending by
+    share rather than pricing each token separately keeps this exact where
+    the share is token-weighted, and a good approximation where it can only
+    be response-weighted — which is the case for Codex, whose rollouts report
+    cumulative session totals rather than per-response usage.
+    """
     if not rates or not isinstance(tokens, dict):
         return 0.0
     total = 0.0
@@ -702,7 +711,87 @@ def token_cost(tokens, rates):
             continue
         if count > 0:
             total += count * rates.get(field, 0.0)
-    return total
+    try:
+        share = min(1.0, max(0.0, float(fast_share or 0.0)))
+        mult = float(fast_multiplier or 1.0)
+    except (TypeError, ValueError):
+        return total
+    return total * (1.0 + share * (mult - 1.0))
+
+
+def fast_multiplier(pricing):
+    """The fast/priority premium from the rate table (1.0 disables it)."""
+    try:
+        return float((pricing or {}).get("fast_multiplier") or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def codex_priority_share(rollout_path, cap_bytes=64 * 1024 * 1024):
+    """Fraction of a Codex session's responses served on the fast tier.
+
+    Codex records the tier per response body ("priority" since the rename
+    from Priority processing to Fast mode, "default" otherwise) but only
+    reports tokens as a cumulative session total, so the tier can only be
+    weighted by response count, not by tokens. Reads at most cap_bytes —
+    rollouts reach hundreds of MB and this runs on the /cost path.
+    """
+    fast = std = 0
+    try:
+        with open(rollout_path, "rb") as f:
+            read = 0
+            for line in f:
+                read += len(line)
+                if read > cap_bytes:
+                    break
+                # Tolerate whitespace around the colon: the rollouts write
+                # compact JSON today, but a serializer change shouldn't
+                # silently turn every session back into standard-rate.
+                for m in re.finditer(rb'"service_tier"\s*:\s*"([a-z]+)"', line):
+                    tier = m.group(1)
+                    if tier in (b"priority", b"fast"):
+                        fast += 1
+                    else:
+                        std += 1
+    except OSError:
+        return 0.0
+    return fast / (fast + std) if (fast + std) else 0.0
+
+
+def claude_fast_share(transcript_path, offset=0):
+    """Output-token-weighted fraction of a Claude window served fast.
+
+    Claude records `speed` per assistant message, so unlike Codex this can be
+    weighted by tokens rather than by message count.
+    """
+    fast = total = 0
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(offset)
+            buf = f.read()
+    except OSError:
+        return 0.0
+    end = buf.rfind(b"\n")
+    if end < 0:
+        return 0.0
+    for line in buf[: end + 1].splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        message = entry.get("message") or {}
+        usage = message.get("usage") or {}
+        try:
+            out = int(usage.get("output_tokens") or 0)
+        except (TypeError, ValueError):
+            continue
+        total += out
+        if usage.get("speed") == "fast" or usage.get("service_tier") in (
+                "priority", "fast"):
+            fast += out
+    return fast / total if total else 0.0
 
 
 def claude_turn_usage(transcript_path, offset=0):
@@ -808,7 +897,7 @@ def newest_codex_rollout(directory, root=None, scan_limit=300):
 
 
 def session_tokens(harness, directory, roots=None):
-    """(tokens, model, path) for a worker's whole current session.
+    """(tokens, model, path, fast_share) for a worker's whole session.
 
     Whole-session, not per-turn: /cost answers "what has this conversation
     cost", so it re-reads the transcript from the start rather than using the
@@ -818,13 +907,13 @@ def session_tokens(harness, directory, roots=None):
     if harness == "codex":
         path = newest_codex_rollout(directory, roots.get("codex"))
         if not path:
-            return None, None, None
-        return codex_session_totals(path), None, path
+            return None, None, None, 0.0
+        return codex_session_totals(path), None, path, codex_priority_share(path)
     path = newest_claude_transcript(directory, roots.get("claude"))
     if not path:
-        return None, None, None
+        return None, None, None, 0.0
     tokens, model = claude_turn_usage(path, 0)
-    return tokens, model, path
+    return tokens, model, path, claude_fast_share(path, 0)
 
 
 def format_tokens(n):
@@ -1681,6 +1770,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                         return
                     baseline = dict.fromkeys(TOKEN_FIELDS, 0)
                 tokens = subtract_tokens(totals, baseline)
+                share = codex_priority_share(path)
             else:
                 start = offsets.get(path)
                 if start is None:
@@ -1690,7 +1780,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 tokens, seen_model = await asyncio.to_thread(
                     claude_turn_usage, path, start)
                 model = seen_model or model
-            cost = token_cost(tokens, rates_for_model(pricing, model))
+                share = await asyncio.to_thread(claude_fast_share, path, start)
+            cost = token_cost(tokens, rates_for_model(pricing, model),
+                              share, fast_multiplier(pricing))
             if cost <= 0:
                 return
             channel, user = owner if owner else (channel_id, None)
@@ -2689,7 +2781,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 "⚠️ no pricing table loaded — see scripts/refresh-pricing.py")
             return
         harness = harness_for(repo)
-        tokens, model, path = await asyncio.to_thread(
+        tokens, model, path, fast_share = await asyncio.to_thread(
             session_tokens, harness, repo["dir"])
         if not tokens:
             await interaction.followup.send(
@@ -2698,15 +2790,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return
         model = model or (harness == "codex" and "gpt-5.6") or None
         rates = rates_for_model(pricing, model)
-        total = token_cost(tokens, rates)
+        mult = fast_multiplier(pricing)
+        total = token_cost(tokens, rates, fast_share, mult)
         known = bool((pricing.get("models") or {}).get(str(model or "")))
+        fast_note = (f" · {fast_share:.0%} fast tier @{mult:g}x"
+                     if fast_share > 0.005 else "")
         lines = [
             f"💰 `{name}` — **${total:.2f}** this session "
             f"({model or 'unknown model'}{'' if known else ', fallback rate'})",
             f"-# output {format_tokens(tokens['output'])} · "
             f"input {format_tokens(tokens['input'])} · "
             f"cache read {format_tokens(tokens['cache_read'])} · "
-            f"cache write {format_tokens(tokens['cache_write'])}",
+            f"cache write {format_tokens(tokens['cache_write'])}{fast_note}",
             "-# Workers run on subscriptions, so this is a cost-weighting for "
             "comparing burn, not a bill.",
         ]
