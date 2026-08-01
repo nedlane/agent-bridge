@@ -921,6 +921,44 @@ class CodexSessionTotalsTests(unittest.TestCase):
         self.assertEqual(cb.subtract_tokens({"output": 5}, None)["output"], 5)
 
 
+class FreshSessionPricingTests(unittest.TestCase):
+    """A new session after /clear must be priced from zero, not skipped.
+
+    charge_turn is a closure inside run_bridge and isn't unit-testable, but
+    the arithmetic it relies on is: a fresh session's baseline is a zero
+    reading, so the whole of the new file is one turn's charge. Skipping it
+    instead would make /clear a repeatable way to dodge the budget.
+    """
+
+    def test_zero_baseline_charges_the_whole_new_session(self):
+        totals = {"input": 3944, "output": 5, "cache_read": 11008,
+                  "cache_write": 0}
+        baseline = dict.fromkeys(cb.TOKEN_FIELDS, 0)
+        self.assertEqual(cb.subtract_tokens(totals, baseline), totals)
+
+    def test_offset_zero_prices_a_whole_new_transcript(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "fresh.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({
+                    "type": "assistant",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 3, "output_tokens": 99,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0}},
+                }) + "\n")
+            tokens, model = cb.claude_turn_usage(path, 0)
+            self.assertEqual(tokens["output"], 99)
+            self.assertEqual(model, "claude-opus-5")
+
+    def test_a_zero_baseline_is_not_the_same_as_no_baseline(self):
+        # The distinction the fix turns on: dict.fromkeys(...) is a real
+        # reading meaning "started at zero"; None means "we have no idea what
+        # is already in this file".
+        self.assertIsNotNone(dict.fromkeys(cb.TOKEN_FIELDS, 0))
+        self.assertEqual(sum(dict.fromkeys(cb.TOKEN_FIELDS, 0).values()), 0)
+
+
 class CostLimitTests(unittest.TestCase):
     def config(self):
         return {
@@ -1006,18 +1044,87 @@ class CostLimitTests(unittest.TestCase):
             self.assertFalse(cb.check_cost_limit(cfg, reloaded, 10, 9, 101)[0])
 
 
-class UsageSummaryTests(unittest.TestCase):
-    def config(self):
-        return {"usage_limits": {"channels": {"10": {
-            "messages": 5, "cost": 2.00, "window_seconds": 3600}}}}
+class MessageCapScopeTests(unittest.TestCase):
+    """Message caps apply only where the engine can't be priced."""
 
-    def test_reports_both_currencies_for_the_caller(self):
-        cfg, state = self.config(), {}
-        cb.check_usage_limit(cfg, state, 10, 7, 100)
+    def config(self, harness):
+        return {
+            "repos": {"10": {"name": "w", "dir": "/d", "harness": harness}},
+            "usage_limits": {"channels": {"10": {"messages": 1,
+                                                 "window_seconds": 60}}},
+        }
+
+    def test_metered_engines_ignore_the_message_cap(self):
+        for harness in ("claude", "codex"):
+            cfg, state = self.config(harness), {}
+            for now in range(50):
+                self.assertEqual(
+                    cb.check_usage_limit(cfg, state, 10, 7, now), (True, None),
+                    f"{harness} should not be message-capped")
+            self.assertEqual(state, {}, "no counting on a metered engine")
+
+    def test_unmetered_engines_still_count_messages(self):
+        cfg, state = self.config("antigravity"), {}
+        self.assertTrue(cb.check_usage_limit(cfg, state, 10, 7, 100)[0])
+        allowed, reason = cb.check_usage_limit(cfg, state, 10, 7, 101)
+        self.assertFalse(allowed)
+        self.assertIn("1 messages", reason)
+
+    def test_an_unrecognized_future_engine_is_capped_not_exempt(self):
+        # Fail safe: an engine we can't price must not escape every control
+        # just because the bridge doesn't know it yet.
+        self.assertFalse(cb.channel_meters_cost(self.config("something-new"), 10))
+        self.assertFalse(cb.channel_meters_cost({"repos": {}}, 10))
+
+    def test_blocked_still_applies_on_every_engine(self):
+        # `blocked` is an access decision, not a rate limit — scoping message
+        # counting must not quietly unblock a metered channel.
+        cfg = self.config("claude")
+        cfg["usage_limits"]["channels"]["10"]["blocked"] = True
+        allowed, reason = cb.check_usage_limit(cfg, {}, 10, 7, 100)
+        self.assertFalse(allowed)
+        self.assertIn("disabled", reason)
+
+    def test_restricted_profiles_are_metered_because_they_force_claude(self):
+        # harness_for pins greeter/utility to Claude whatever config says, so
+        # the cost path is what applies to them.
+        cfg = self.config("antigravity")
+        cfg["repos"]["10"]["profile"] = "greeter"
+        self.assertTrue(cb.channel_meters_cost(cfg, 10))
+
+    def test_summary_shows_only_the_enforced_currency(self):
+        cfg = self.config("claude")
+        cfg["usage_limits"]["channels"]["10"]["cost"] = 2.0
+        line = " ".join(cb.usage_summary(cfg, {}, 10, 7, 100))
+        self.assertIn("$0.00/$2.00", line)
+        self.assertNotIn("messages", line)
+
+        cfg = self.config("antigravity")
+        cfg["usage_limits"]["channels"]["10"]["cost"] = 2.0
+        line = " ".join(cb.usage_summary(cfg, {}, 10, 7, 100))
+        self.assertIn("0/1 messages", line)
+        self.assertNotIn("$", line)
+
+
+class UsageSummaryTests(unittest.TestCase):
+    def config(self, harness="claude"):
+        return {
+            "repos": {"10": {"name": "w", "dir": "/d", "harness": harness}},
+            "usage_limits": {"channels": {"10": {
+                "messages": 5, "cost": 2.00, "window_seconds": 3600}}},
+        }
+
+    def test_metered_channel_reports_spend(self):
+        cfg, state = self.config("claude"), {}
         cb.record_cost(cfg, state, 10, 7, 0.75, 100)
         line = " ".join(cb.usage_summary(cfg, state, 10, 7, 101))
-        self.assertIn("1/5 messages", line)
         self.assertIn("$0.75/$2.00", line)
+
+    def test_unmetered_channel_reports_messages(self):
+        cfg, state = self.config("antigravity"), {}
+        cb.check_usage_limit(cfg, state, 10, 7, 100)
+        line = " ".join(cb.usage_summary(cfg, state, 10, 7, 101))
+        self.assertIn("1/5 messages", line)
 
     def test_owner_and_unlimited_users_get_a_plain_answer(self):
         cfg = self.config()

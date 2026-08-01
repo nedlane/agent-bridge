@@ -240,7 +240,8 @@ capped guest can't farm bot replies.
 
 Each rule accepts `messages`, `cost`, and `window_seconds` (default `3600` for
 messages, `86400` for cost), or `"blocked": true` to disable that scope
-entirely. IDs are JSON string keys:
+entirely. `messages` and `cost` apply to **different engines** — see [Token
+budgets](#token-budgets-the-cost-key) below. IDs are JSON string keys:
 
 ```json
 {
@@ -271,10 +272,12 @@ entirely. IDs are JSON string keys:
 }
 ```
 
-Here channel `555...` accepts at most 100 messages and $5.00 of usage per hour
-in total, user `777...` gets 10 messages and $1.00/hour in that channel plus 50
-messages and $20.00/day across all channels, and channel `666...` is disabled
-globally.
+On a Claude or Codex channel that reads as: channel `555...` gets $5.00 of
+usage per hour in total and user `777...` gets $1.00/hour there plus $20.00/day
+across all channels — the `messages` values are inert. Switch that channel to
+Antigravity and the reverse holds: the caps become 100 messages/hour for the
+channel and 10/hour plus 50/day for the user, with the `cost` values inert.
+Channel `666...` is disabled globally on any engine.
 
 Anyone can run **`/limits`** in a worker channel to see their own numbers
 against each scope. The reply is ephemeral, so a guest checking their budget
@@ -282,28 +285,47 @@ doesn't broadcast it.
 
 ### Token budgets (the `cost` key)
 
-`messages` counts turns; `cost` measures what those turns actually burned.
-They do different jobs and are meant to be used together:
+**The two keys apply to different engines — they are not layered.**
 
 | | `messages` | `cost` |
 |---|---|---|
-| Enforcement | **Pre-hoc** — refuses before anything is spent | **Post-hoc** — refuses the turn *after* the budget is blown |
-| Engines | Claude, Codex, Antigravity | Claude and Codex |
+| Applies to | Antigravity, and any engine without turn-end telemetry | Claude and Codex |
+| Enforcement | Pre-hoc — refuses before anything is spent | Post-hoc — refuses the turn *after* the budget is blown |
 | Measures | Turns taken | Cost-weighted tokens |
+
+Counting turns is a poor proxy for burn: one message is a greeting or a
+repo-wide refactor. Wherever the bridge can price a turn it does, and the
+message cap is switched off there — layering a turn count on top would just
+fence the cheap requests too. Engines with no token telemetry have nothing
+else to go on, so they keep it.
+
+An engine the running build doesn't recognize counts as unmetered and is
+message-capped. That's the fail-safe direction: a new engine gets capped
+rather than escaping every control.
+
+`"blocked": true` is unaffected by any of this — it's an access decision, not
+a rate limit, and applies on every engine.
 
 **Cost is inherently post-hoc.** A turn's price isn't known until it has run,
 so overage is bounded by one turn — a user can always blow through their
-budget with a single expensive turn. That's exactly why `messages` stays: it's
-the only control that can refuse *before* spending, and the only one that
-covers every engine.
+budget with a single expensive turn.
 
 **Where the numbers come from.** At turn end the bridge reads the same
 transcript window it already parses for the reply — Claude's per-message
 `usage`, or the running `total_token_usage` in Codex's rollout file — and
-prices it against `pricing.json`. The first turn on a transcript the bridge
-hasn't seen yet is free: both engines report cumulatively, so with no prior
-reading to diff against the alternative is billing someone for the entire
-session history. Every subsequent turn is exact.
+prices it against `pricing.json`.
+
+Both engines report cumulatively, so a turn is the delta against the previous
+reading, and a session file with no previous reading needs a rule:
+
+- **A new session** (`/clear`, `/fresh`, a harness switch) genuinely starts at
+  zero, so it's priced in full from zero. Skipping it would make `/clear` a
+  repeatable way to dodge the budget — and `/clear` is available to exactly
+  the editor guests these budgets exist to fence.
+- **A worker the daemon has never priced** may already hold a long session in
+  its file, and there's no way to tell this turn's share from the history. That
+  turn is skipped and the baseline recorded — one under-charge per worker per
+  daemon restart. Every turn after it is exact.
 
 **Why cost-weighted and not raw tokens.** Cache reads bill at a tenth of the
 input rate but dominate the raw count — a real assistant message here shows
