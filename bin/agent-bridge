@@ -91,6 +91,7 @@ SECRET_FILE = os.path.expanduser(
 STATE_ROOT = os.path.expanduser(
     os.environ.get("CLAUDE_WORKERS_STATE", "~/.local/state/claude-workers")
 )
+USAGE_STATE_FILE = os.path.join(STATE_ROOT, "usage-limits.json")
 
 # React with this on any message in a worker channel to have the bridge post
 # that worker's live TUI screen — an eyes-on peek with no command to type.
@@ -380,6 +381,7 @@ def default_config():
         "repos": {},
         "welcome_channel": None,
         "requests_channel": None,
+        "usage_limits": {"channels": {}, "users": {}},
     }
 
 
@@ -400,6 +402,67 @@ def save_config(cfg, path=None):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def sender_tag(display_name, user_id, channel_id):
+    """Identity envelope prepended to every non-command Discord turn."""
+    return (f"[Discord message from {display_name} (user id {user_id}) "
+            f"in channel {channel_id}:]")
+
+
+def check_usage_limit(cfg, state, channel_id, user_id, now=None):
+    """Enforce cumulative channel, user, and channel-user message limits."""
+    now = time.time() if now is None else now
+    limits = cfg.get("usage_limits") or {}
+    channel_id, user_id = str(channel_id), str(user_id)
+    channel_rule = (limits.get("channels") or {}).get(channel_id) or {}
+    rules = [
+        (f"channel:{channel_id}", channel_rule, "channel limit"),
+        (f"user:{user_id}", (limits.get("users") or {}).get(user_id) or {},
+         "user limit"),
+        (f"channel:{channel_id}:user:{user_id}",
+         (channel_rule.get("users") or {}).get(user_id) or {},
+         "user limit for this channel"),
+    ]
+    active = []
+    for key, rule, label in rules:
+        if rule.get("blocked") is True:
+            return False, f"{label}: access is disabled"
+        maximum = rule.get("messages")
+        if maximum is None:
+            continue
+        try:
+            maximum = int(maximum)
+            window = max(1, int(rule.get("window_seconds", 3600)))
+        except (TypeError, ValueError):
+            continue
+        cutoff = now - window
+        recent = [float(t) for t in state.get(key, []) if float(t) > cutoff]
+        state[key] = recent
+        if maximum <= 0 or len(recent) >= maximum:
+            return False, f"{label}: {maximum} messages per {window}s"
+        active.append(key)
+    for key in active:
+        state.setdefault(key, []).append(now)
+    return True, None
+
+
+def load_usage_state(path=USAGE_STATE_FILE):
+    try:
+        with open(path) as f:
+            value = json.load(f)
+            return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_usage_state(state, path=USAGE_STATE_FILE):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
         f.write("\n")
     os.replace(tmp, path)
 
@@ -919,6 +982,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     offsets = {}        # transcript path -> bytes already consumed
     notified = set()    # workers that messaged Ned themselves this turn
     turn_locks = {}     # transcript key -> asyncio.Lock (serialize turn_ended)
+    usage_state = load_usage_state()
 
     async def settle_file(path, timeout=10):
         """Wait until `path` stops changing (two identical mtimes 0.5s apart)."""
@@ -1297,7 +1361,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if name in codex_unprimed:
             composed = system_prompt(name) + "\n\n---\n\n" + composed
             codex_unprimed.discard(name)
-        await deliver(name, composed, message, typed=False)
+        await deliver(
+            name, composed, message, typed=False,
+            tag=sender_tag(message.author.display_name, message.author.id,
+                           message.channel.id),
+        )
 
     def repo_by_name(name):
         return next((x for x in cfg["repos"].values() if x["name"] == name), None)
@@ -1954,6 +2022,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return
         repo = repo_for_channel(message.channel.id)
         if repo and channel_allows(cfg, message.channel.id, message.author.id):
+            allowed, reason = check_usage_limit(
+                cfg, usage_state, message.channel.id, message.author.id
+            )
+            if not allowed:
+                await message.channel.send(f"⛔ usage limit reached ({reason})")
+                return
+            save_usage_state(usage_state)
             await handle_repo_message(message, repo)
 
     @client.event
@@ -1978,7 +2053,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         name = repo["name"]
         if not await asyncio.to_thread(worker_alive, name):
             return
-        await deliver(name, compose_edit(after.content), after, typed=False)
+        await deliver(
+            name, compose_edit(after.content), after, typed=False,
+            tag=sender_tag(after.author.display_name, after.author.id,
+                           after.channel.id),
+        )
 
     @client.event
     async def on_raw_reaction_add(payload):
