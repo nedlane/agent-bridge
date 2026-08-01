@@ -58,7 +58,8 @@ agent-checkup                              # full readiness report
 
 In Discord these are native slash commands (synced per-guild on connect; the
 `worker` option defaults to the channel's worker): `/status`, `/stop`,
-`/restart`, `/screen`, `/model <model>`, `/clear` (fresh context via restart
+`/restart`, `/screen`, `/fast` (toggle Codex Fast mode), `/model <model>`,
+`/clear` (fresh context via restart
 without `--continue`), `/fresh` (shut down + fresh next start, no resume),
 `/compact`, `/checkin`, `/addrepo <name> <path> [category]`, `/close`. `/clear` and
 `/fresh` also purge the channel's messages (Ned's and the bot's) to clear
