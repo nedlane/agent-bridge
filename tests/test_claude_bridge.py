@@ -921,6 +921,80 @@ class CodexSessionTotalsTests(unittest.TestCase):
         self.assertEqual(cb.subtract_tokens({"output": 5}, None)["output"], 5)
 
 
+class LedgerSurvivesWorkerLifecycleTests(unittest.TestCase):
+    """A worker restart must never reset someone's usage.
+
+    /fresh, /clear, /restart and /close all tear a worker down, and three of
+    them are available to editor guests — the people these budgets exist to
+    fence. If any of them cleared the ledger, the budget would be one slash
+    command away from meaningless. These pin the two properties that keep
+    that true.
+    """
+
+    def test_ledger_keys_carry_no_worker_or_session_identity(self):
+        # THE invariant. Spend is keyed by who spent it and where, never by
+        # which worker process or session file was live at the time — so
+        # there is nothing a worker teardown could invalidate. Re-key any of
+        # this by worker name or transcript path and /fresh becomes a reset.
+        cfg = {"usage_limits": {"channels": {"10": {
+            "messages": 5, "cost": 1.0, "window_seconds": 60,
+            "users": {"7": {"messages": 2, "cost": 0.5}}}},
+            "users": {"7": {"cost": 9.0}}}}
+        state = {}
+        cb.check_usage_limit(cfg, state, 10, 7, 100)
+        cb.record_cost(cfg, state, 10, 7, 0.10, 100)
+        self.assertTrue(state)
+        for key in state:
+            self.assertRegex(key, r"^(cost:)?(channel:10|user:7|channel:10:user:7)$")
+
+    def test_wiping_a_workers_state_cannot_touch_the_ledger(self):
+        # The ledger is a file directly in STATE_ROOT, a sibling of the
+        # per-worker directories /close rmtree's.
+        with tempfile.TemporaryDirectory() as root:
+            ledger = os.path.join(root, "usage-limits.json")
+            cb.save_usage_state({"channel:10": [100.0]}, ledger)
+            os.makedirs(os.path.join(root, "w"))
+            with open(os.path.join(root, "w", "meta"), "w") as f:
+                f.write("dir=/d\n")
+
+            self.assertTrue(cb.remove_worker_state("w", root))
+            self.assertFalse(os.path.exists(os.path.join(root, "w")))
+            self.assertEqual(cb.load_usage_state(ledger), {"channel:10": [100.0]})
+
+    def test_a_worker_named_after_the_ledger_still_cannot_delete_it(self):
+        # remove_worker_state is directory-only, so even an adversarially
+        # named worker can't take the ledger with it.
+        with tempfile.TemporaryDirectory() as root:
+            ledger = os.path.join(root, "usage-limits.json")
+            cb.save_usage_state({"channel:10": [100.0]}, ledger)
+            self.assertFalse(cb.remove_worker_state("usage-limits.json", root))
+            self.assertTrue(os.path.exists(ledger))
+            # ...and traversal out of the state root is refused outright.
+            for evil in ("../..", "a/b", ".", ""):
+                self.assertFalse(cb.remove_worker_state(evil, root))
+
+    def test_spend_persists_across_a_daemon_restart(self):
+        # /fresh stops the worker; a bridge restart reloads the ledger from
+        # disk, so a stop-and-start cycle can't wash out prior spend either.
+        cfg = {"usage_limits": {"channels": {"10": {"cost": 1.0,
+                                                    "window_seconds": 3600}}}}
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "usage-limits.json")
+            state = {}
+            cb.record_cost(cfg, state, 10, 7, 0.60, 100)
+            cb.save_usage_state(state, path)
+
+            # The charge itself survives the round trip...
+            reloaded = cb.load_usage_state(path)
+            self.assertEqual(reloaded["cost:channel:10"], [[100.0, 0.60]])
+            # ...still under budget, so it isn't refused yet...
+            self.assertTrue(cb.check_cost_limit(cfg, reloaded, 10, 7, 101)[0])
+            # ...and the next charge lands on top of it rather than starting
+            # from zero, which is what a reset would look like.
+            cb.record_cost(cfg, reloaded, 10, 7, 0.60, 101)
+            self.assertFalse(cb.check_cost_limit(cfg, reloaded, 10, 7, 102)[0])
+
+
 class FreshSessionPricingTests(unittest.TestCase):
     """A new session after /clear must be priced from zero, not skipped.
 
