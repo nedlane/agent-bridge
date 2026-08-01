@@ -735,5 +735,302 @@ class StartArgsHarnessTests(unittest.TestCase):
         self.assertNotIn("--resume", args)
 
 
+class PricingTableTests(unittest.TestCase):
+    def test_shipped_table_loads_and_covers_both_engines(self):
+        pricing = cb.load_pricing(os.path.join(HERE, "pricing.json"))
+        self.assertIsNotNone(pricing, "pricing.json must be present and valid")
+        models = pricing["models"]
+        # One from each engine — a table that lost either one silently
+        # disables budgets for that half of the fleet.
+        self.assertIn("claude-opus-5", models)
+        self.assertIn("gpt-5.6-sol", models)
+        for rates in models.values():
+            for field in cb.TOKEN_FIELDS:
+                self.assertIsInstance(rates[field], float)
+
+    def test_missing_or_corrupt_table_disables_budgets(self):
+        # None means "off", not "bill everything at a guessed rate".
+        self.assertIsNone(cb.load_pricing("/nonexistent/pricing.json"))
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "p.json")
+            with open(path, "w") as f:
+                f.write("{not json")
+            self.assertIsNone(cb.load_pricing(path))
+            with open(path, "w") as f:
+                json.dump({"models": "not-a-dict"}, f)
+            self.assertIsNone(cb.load_pricing(path))
+
+    def test_unknown_model_bills_at_fallback_not_zero(self):
+        pricing = {"fallback": {"input": 1e-06, "output": 2e-06,
+                                "cache_read": 1e-07, "cache_write": 1e-06},
+                   "models": {}}
+        rates = cb.rates_for_model(pricing, "some-model-shipped-tomorrow")
+        self.assertEqual(rates["output"], 2e-06)
+        self.assertIsNone(cb.rates_for_model(None, "anything"))
+
+
+class TokenCostTests(unittest.TestCase):
+    RATES = {"input": 5e-06, "output": 2.5e-05,
+             "cache_read": 5e-07, "cache_write": 6.25e-06}
+
+    def test_each_field_is_weighted_by_its_own_rate(self):
+        cost = cb.token_cost(
+            {"input": 1_000_000, "output": 1_000_000,
+             "cache_read": 1_000_000, "cache_write": 1_000_000},
+            self.RATES,
+        )
+        self.assertAlmostEqual(cost, 5.0 + 25.0 + 0.5 + 6.25, places=6)
+
+    def test_weighting_collapses_the_cache_read_share(self):
+        # The reason this is cost-weighted at all. These counts are from a
+        # real assistant message: 190,369 cache reads against 1,580 output.
+        # Summed raw, cache reads are ~99% of the number, so a raw-token
+        # budget would rank a cheap resumed session above an expensive fresh
+        # one. Weighted by rate they are still the larger share — cache reads
+        # are not free — but the ratio falls from ~120:1 to under 3:1, which
+        # is what makes the total track spend instead of session length.
+        tokens = {"input": 2, "output": 1_580,
+                  "cache_read": 190_369, "cache_write": 63}
+        raw_share = tokens["cache_read"] / sum(tokens.values())
+        cache_cost = tokens["cache_read"] * self.RATES["cache_read"]
+        output_cost = tokens["output"] * self.RATES["output"]
+        cost_share = cache_cost / cb.token_cost(tokens, self.RATES)
+        self.assertGreater(raw_share, 0.99)
+        self.assertLess(cost_share, 0.75)
+        self.assertLess(cache_cost / output_cost, 3.0)
+
+    def test_degenerate_inputs_cost_nothing_rather_than_raising(self):
+        self.assertEqual(cb.token_cost({"output": 10}, None), 0.0)
+        self.assertEqual(cb.token_cost(None, self.RATES), 0.0)
+        self.assertEqual(cb.token_cost({"output": "junk"}, self.RATES), 0.0)
+        self.assertEqual(cb.token_cost({"output": -50}, self.RATES), 0.0)
+
+
+class ClaudeTurnUsageTests(unittest.TestCase):
+    def entry(self, out, model="claude-opus-5", cache_read=0):
+        return json.dumps({
+            "type": "assistant",
+            "message": {"model": model, "usage": {
+                "input_tokens": 2, "output_tokens": out,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": 7}},
+        })
+
+    def test_sums_usage_and_reports_model(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "t.jsonl")
+            with open(path, "w") as f:
+                f.write(self.entry(100, cache_read=500) + "\n")
+                f.write(self.entry(50, cache_read=600) + "\n")
+            tokens, model = cb.claude_turn_usage(path, 0)
+            self.assertEqual(tokens["output"], 150)
+            self.assertEqual(tokens["cache_read"], 1100)
+            self.assertEqual(tokens["input"], 4)
+            self.assertEqual(tokens["cache_write"], 14)
+            self.assertEqual(model, "claude-opus-5")
+
+    def test_offset_isolates_one_turn_from_history(self):
+        # This is what stops a turn being billed for the whole session: the
+        # byte offset is the same window extract_new_reply consumes.
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "t.jsonl")
+            first = self.entry(100) + "\n"
+            with open(path, "w") as f:
+                f.write(first)
+            with open(path, "a") as f:
+                f.write(self.entry(42) + "\n")
+            tokens, _ = cb.claude_turn_usage(path, len(first.encode()))
+            self.assertEqual(tokens["output"], 42)
+
+    def test_partial_trailing_line_and_junk_are_skipped(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "t.jsonl")
+            with open(path, "w") as f:
+                f.write(self.entry(10) + "\n")
+                f.write("{not json}\n")
+                f.write(json.dumps({"type": "user"}) + "\n")
+                f.write('{"type": "assistant", "message":')  # mid-write
+            tokens, _ = cb.claude_turn_usage(path, 0)
+            self.assertEqual(tokens["output"], 10)
+
+    def test_missing_file_is_not_an_error(self):
+        tokens, model = cb.claude_turn_usage("/nonexistent/t.jsonl", 0)
+        self.assertEqual(tokens["output"], 0)
+        self.assertIsNone(model)
+
+
+class CodexSessionTotalsTests(unittest.TestCase):
+    def rollout(self, path, readings):
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "session_meta", "payload": {}}) + "\n")
+            for raw_input, cached, out, reasoning in readings:
+                f.write(json.dumps({
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {
+                        "total_token_usage": {
+                            "input_tokens": raw_input,
+                            "cached_input_tokens": cached,
+                            "cache_write_input_tokens": 0,
+                            "output_tokens": out,
+                            "reasoning_output_tokens": reasoning,
+                        }}},
+                }) + "\n")
+
+    def test_last_reading_wins_and_cached_is_subtracted_from_input(self):
+        # Codex's input_tokens INCLUDES cached_input_tokens. Verified against
+        # a real rollout: 14952 - 11008 + 5 == 3949, the figure the Codex TUI
+        # itself printed as "tokens used" for that session.
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "r.jsonl")
+            self.rollout(path, [(500, 100, 2, 0), (14952, 11008, 5, 0)])
+            totals = cb.codex_session_totals(path)
+            self.assertEqual(totals["input"], 3944)
+            self.assertEqual(totals["cache_read"], 11008)
+            self.assertEqual(totals["output"], 5)
+            self.assertEqual(totals["input"] + totals["output"], 3949)
+
+    def test_reasoning_tokens_count_as_output(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "r.jsonl")
+            self.rollout(path, [(100, 0, 10, 7)])
+            self.assertEqual(cb.codex_session_totals(path)["output"], 17)
+
+    def test_no_token_events_or_missing_file_returns_none(self):
+        # None means "no reading", which the caller treats as "don't charge" —
+        # distinct from a zero reading, which would look like a free turn.
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "r.jsonl")
+            self.rollout(path, [])
+            self.assertIsNone(cb.codex_session_totals(path))
+        self.assertIsNone(cb.codex_session_totals("/nonexistent/r.jsonl"))
+
+    def test_cumulative_readings_diff_to_one_turn(self):
+        first = {"input": 100, "output": 10, "cache_read": 50, "cache_write": 0}
+        second = {"input": 180, "output": 25, "cache_read": 90, "cache_write": 0}
+        delta = cb.subtract_tokens(second, first)
+        self.assertEqual(delta, {"input": 80, "output": 15,
+                                 "cache_read": 40, "cache_write": 0})
+
+    def test_a_reset_session_never_refunds_budget(self):
+        # A rolled-over or truncated rollout reads lower than the baseline;
+        # clamping at zero stops that becoming a negative charge.
+        delta = cb.subtract_tokens({"input": 5, "output": 1},
+                                   {"input": 900, "output": 900})
+        self.assertEqual(delta["input"], 0)
+        self.assertEqual(delta["output"], 0)
+        self.assertEqual(cb.subtract_tokens({"output": 5}, None)["output"], 5)
+
+
+class CostLimitTests(unittest.TestCase):
+    def config(self):
+        return {
+            "usage_limits": {
+                "channels": {
+                    "10": {"cost": 1.00, "window_seconds": 3600,
+                           "users": {"7": {"cost": 0.25,
+                                           "window_seconds": 3600}}},
+                },
+                "users": {"7": {"cost": 5.00, "window_seconds": 86400}},
+            }
+        }
+
+    def test_spend_accumulates_until_the_scope_budget_is_reached(self):
+        cfg, state = self.config(), {}
+        self.assertTrue(cb.check_cost_limit(cfg, state, 10, 9, 100)[0])
+        cb.record_cost(cfg, state, 10, 9, 0.60, 100)
+        self.assertTrue(cb.check_cost_limit(cfg, state, 10, 9, 101)[0])
+        cb.record_cost(cfg, state, 10, 9, 0.60, 101)
+        allowed, reason = cb.check_cost_limit(cfg, state, 10, 9, 102)
+        self.assertFalse(allowed)
+        self.assertIn("channel limit", reason)
+        self.assertIn("$1.00", reason)
+
+    def test_the_tightest_applicable_scope_wins(self):
+        cfg, state = self.config(), {}
+        cb.record_cost(cfg, state, 10, 7, 0.30, 100)
+        allowed, reason = cb.check_cost_limit(cfg, state, 10, 7, 101)
+        self.assertFalse(allowed)
+        self.assertIn("this channel", reason)
+
+    def test_spend_ages_out_of_the_window(self):
+        cfg, state = self.config(), {}
+        cb.record_cost(cfg, state, 10, 9, 2.00, 100)
+        self.assertFalse(cb.check_cost_limit(cfg, state, 10, 9, 200)[0])
+        self.assertTrue(cb.check_cost_limit(cfg, state, 10, 9, 100 + 3601)[0])
+
+    def test_owner_is_exempt_from_charges_and_checks(self):
+        cfg = self.config()
+        cfg["allowed_users"] = [7]
+        state = {}
+        cb.record_cost(cfg, state, 10, 7, 500.0, 100)
+        self.assertEqual(state, {})
+        self.assertEqual(cb.check_cost_limit(cfg, state, 10, 7, 101),
+                         (True, None))
+
+    def test_unattributed_turns_charge_only_the_channel(self):
+        # A check-in or a web-console send has no Discord sender; it still
+        # burns the channel's budget but can't be pinned on a user.
+        cfg, state = self.config(), {}
+        cb.record_cost(cfg, state, 10, None, 0.50, 100)
+        self.assertIn("cost:channel:10", state)
+        self.assertEqual([k for k in state if "user" in k], [])
+
+    def test_no_cost_rule_means_nothing_is_recorded_or_refused(self):
+        state = {}
+        cb.record_cost({}, state, 10, 7, 9.99, 100)
+        self.assertEqual(state, {})
+        self.assertEqual(cb.check_cost_limit({}, state, 10, 7, 100),
+                         (True, None))
+
+    def test_zero_and_negative_charges_are_ignored(self):
+        cfg, state = self.config(), {}
+        cb.record_cost(cfg, state, 10, 9, 0.0, 100)
+        cb.record_cost(cfg, state, 10, 9, -5.0, 100)
+        self.assertEqual(state, {})
+
+    def test_corrupt_ledger_entries_are_dropped_not_raised(self):
+        cfg = self.config()
+        for junk in ({"cost:channel:10": "nope"},
+                     {"cost:channel:10": [[100, "abc"], None, [101], 5]},
+                     {"cost:channel:10": 7}):
+            allowed, _ = cb.check_cost_limit(cfg, dict(junk), 10, 9, 200)
+            self.assertTrue(allowed)
+
+    def test_cost_ledger_survives_a_reload(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "usage.json")
+            cfg, state = self.config(), {}
+            cb.record_cost(cfg, state, 10, 9, 1.50, 100)
+            cb.save_usage_state(state, path)
+            reloaded = cb.load_usage_state(path)
+            self.assertFalse(cb.check_cost_limit(cfg, reloaded, 10, 9, 101)[0])
+
+
+class UsageSummaryTests(unittest.TestCase):
+    def config(self):
+        return {"usage_limits": {"channels": {"10": {
+            "messages": 5, "cost": 2.00, "window_seconds": 3600}}}}
+
+    def test_reports_both_currencies_for_the_caller(self):
+        cfg, state = self.config(), {}
+        cb.check_usage_limit(cfg, state, 10, 7, 100)
+        cb.record_cost(cfg, state, 10, 7, 0.75, 100)
+        line = " ".join(cb.usage_summary(cfg, state, 10, 7, 101))
+        self.assertIn("1/5 messages", line)
+        self.assertIn("$0.75/$2.00", line)
+
+    def test_owner_and_unlimited_users_get_a_plain_answer(self):
+        cfg = self.config()
+        cfg["allowed_users"] = [7]
+        self.assertIn("owner", " ".join(cb.usage_summary(cfg, {}, 10, 7, 100)))
+        self.assertIn("No limits",
+                      " ".join(cb.usage_summary({}, {}, 10, 9, 100)))
+
+    def test_blocked_scope_is_reported_as_blocked(self):
+        cfg = {"usage_limits": {"channels": {"10": {"blocked": True}}}}
+        self.assertIn("blocked",
+                      " ".join(cb.usage_summary(cfg, {}, 10, 7, 100)))
+
+
 if __name__ == "__main__":
     unittest.main()
