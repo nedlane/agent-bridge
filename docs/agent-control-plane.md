@@ -127,6 +127,29 @@ worker still runs — it just falls back to the worker's own `discord-notify` fo
 replies (no silent-turn safety net). Your base `~/.codex/config.toml` is never
 modified.
 
+## 2c. Antigravity has no relay yet
+
+`/harness antigravity` starts a worker through `antigravity-launch`, and
+everything *inbound* works — the bridge pastes messages into the pane, and
+`$CLAUDE_WORKER` is set, so the worker's own `discord-notify` calls
+auto-target its channel.
+
+Nothing *outbound* is automatic. There is no `antigravity-worker-done-relay`
+and no hook registration for `agy`, so no `claude.worker.turn_ended` event is
+ever POSTed for an antigravity worker. That means:
+
+- no turn-end reply is posted unless the worker volunteers one via
+  `discord-notify`;
+- neither fallback that covers a quiet worker applies — Claude's transcript
+  parse needs a `transcript_path` from its relay, and Codex's inline text
+  rides on the relay's payload. Without an event, neither runs;
+- the `PostToolUse` todo relay doesn't fire either, so no live checklists.
+
+Wiring this up needs whatever hook mechanism `agy` actually exposes, which is
+why it isn't done here rather than guessed at. Until then the engine is
+experimental: a turn can end in silence, and the operator has to `/screen` to
+see what happened.
+
 ## 3. Secret files under `~/.config/claude-workers/`
 
 Create these three files and `chmod 600` each — they are read for content only,

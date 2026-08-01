@@ -58,6 +58,9 @@ The host that runs the bridge needs:
   logged in interactively on a **Claude subscription** (not an API key, not
   Bedrock/Vertex). Run `claude` once and `/login` first.
 - **`claude-launch`** — a launcher wrapper that this repo does **not** include.
+- **`agy`** — required only for the **experimental** Antigravity harness. It
+  must be installed and authenticated before selecting `/harness antigravity`.
+  See the limitations below before switching a channel to it.
 
 ### About `claude-launch` (external dependency)
 
@@ -269,12 +272,12 @@ channel you run it in.
 
 | Command | What it does |
 |---|---|
-| `/status` | List all workers, their running state, and engine (claude/codex). |
-| `/harness <claude\|codex> [worker] [handoff]` | Switch a channel between **Claude Code** and **Codex** (Codex runs in YOLO mode — bypass all approvals + sandbox, the analog of Claude's bypass-permissions). Stops the worker; the next message starts it on the new engine. Each engine keeps its **own** conversation, so switching back resumes that engine's last thread. `handoff:True` first asks the outgoing worker to write a short handoff note (current task, decisions, next steps) that's injected into the new engine's first turn — best-effort; the switch proceeds either way. |
+| `/status` | List all workers, their running state, and engine (claude/codex/antigravity). |
+| `/harness <claude\|codex\|antigravity> [worker] [handoff]` | Switch a channel between **Claude Code**, **Codex**, and **Antigravity** (the non-Claude engines run in YOLO mode — bypass all approvals + sandbox, the analog of Claude's bypass-permissions). Stops the worker; the next message starts it on the new engine. Each engine keeps its **own** conversation, so switching back resumes that engine's last thread. `handoff:True` first asks the outgoing worker to write a short handoff note (current task, decisions, next steps) that's injected into the new engine's first turn — best-effort; the switch proceeds either way. Antigravity is **experimental** — see [Antigravity limitations](#antigravity-limitations). |
 | `/stop [worker]` | Stop a worker (state kept; a message revives it). |
 | `/restart [worker]` | Restart a worker, resuming its conversation. |
 | `/screen [worker]` | Post the worker's live TUI screen (image, or a code-block fallback). |
-| `/model <model> [worker]` | Switch the worker's model (e.g. `opus`, `sonnet`, `haiku`). On Codex, `/model` opens an interactive picker — drive it via `/screen`. |
+| `/model <model> [worker]` | Switch the worker's model (e.g. `opus`, `sonnet`, `haiku`). Outside Claude, `/model` may open an interactive picker — drive it via `/screen`. |
 | `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
@@ -283,6 +286,29 @@ channel you run it in.
 | `/close [worker] confirm:<name>` | **Irreversible teardown** — stop the worker, wipe its saved state, and delete its channel. Requires retyping the worker name in `confirm`. |
 | `/addguest <name> <discord_id> [edit\|view]` | Grant a guest edit (View+Send) or view (read-only) access to one channel. |
 | `/lockdown` | Drop **all** guests everywhere to view-only in one shot (leaves the owner untouched). |
+
+### Antigravity limitations
+
+`/harness antigravity` is **experimental and not at parity** with the other two
+engines. Before switching a channel to it, know that:
+
+- **Turn-end replies are not relayed.** Claude and Codex each register a `Stop`
+  hook (`claude-worker-done-relay` / `codex-worker-done-relay`) that pushes the
+  reply back to Discord — see [the control-plane
+  doc](docs/agent-control-plane.md). There is no equivalent for `agy`, so an
+  antigravity worker reaches Discord **only** when it calls `discord-notify`
+  itself. The safety net that posts a reply for a worker which stayed quiet
+  does not exist, so a turn can end in silence.
+- **Live task checklists are not relayed** either, for the same reason.
+- **Readiness detection is unverified.** The bridge decides a worker is
+  input-ready by looking for Claude's `❯` prompt glyph and Codex's busy
+  markers. Those strings are reused as-is for Antigravity. If the real TUI
+  differs, messages can be pasted into a pane that isn't ready and silently
+  discarded.
+- **The YOLO flag is unverified.** `antigravity-launch` passes
+  `--dangerously-skip-permissions`, which is Claude Code's spelling; Codex
+  needed a different one. If `agy` doesn't accept it, workers die at launch.
+- **`/usage` is unmapped** — use `/screen`.
 
 Notes:
 

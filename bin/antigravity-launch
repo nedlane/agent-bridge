@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Launch an interactive Antigravity session for an agent worker — the
+# Antigravity half of the local agent control plane, mirroring claude-launch
+# and codex-launch.
+#
+#   antigravity-launch --label NAME          # worker session in $PWD
+#   antigravity-launch --label NAME --resume # resume this dir's most recent session
+#   antigravity-launch --label NAME -- --foo # extra args pass through to agy
+#
+# Subscription-only, enforced the same way codex-launch enforces it: the
+# API-key env vars below are unset before `agy` starts, so a calling
+# environment can never flip the session onto API-key billing. Auth must come
+# from the normal interactive `agy` login. That list is best-effort — it covers
+# the Google/Gemini keys an SDK is likely to honour; extend it if `agy`
+# documents another.
+#
+# UNVERIFIED: `--dangerously-skip-permissions` is Claude Code's spelling of the
+# YOLO flag. Codex needed a completely different one
+# (--dangerously-bypass-approvals-and-sandbox), so this must be confirmed
+# against a real `agy` before the engine is trusted — if it is wrong, every
+# antigravity worker dies at launch and the only symptom is a dead tmux pane.
+set -euo pipefail
+
+# --- strip API-key billing env (subscription auth only) ----------------------
+for var in GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_API_KEY \
+           GOOGLE_GENERATIVE_AI_API_KEY GOOGLE_CLOUD_API_KEY \
+           GOOGLE_APPLICATION_CREDENTIALS ANTIGRAVITY_API_KEY AGY_API_KEY; do
+  if [[ -n "${!var:-}" ]]; then
+    echo "antigravity-launch: unsetting $var (interactive subscription auth only)" >&2
+    unset "$var"
+  fi
+done
+
+# --- extract --resume; collect passthrough args ------------------------------
+# --label is accepted for launcher-interface symmetry with claude-launch and
+# codex-launch (the caller passes it to all three), but has no use here —
+# agent-worker owns the tmux session — so it is consumed and discarded.
+resume=0
+args=()
+while (($#)); do
+  case "$1" in
+    --label)   : "${2:?antigravity-launch: --label needs a value}"; shift 2 ;;
+    --label=*) shift ;;
+    --resume)  resume=1; shift ;;
+    --)        shift; args+=("$@"); break ;;
+    *)         args+=("$1"); shift ;;
+  esac
+done
+
+# YOLO mode: the analog of Claude's --dangerously-skip-permissions and Codex's
+# --dangerously-bypass-approvals-and-sandbox. A Discord-driven worker needs it
+# because nobody can answer an interactive approval dialog over the bridge.
+yolo=(--dangerously-skip-permissions)
+
+# Resume this directory's most recent session when asked.
+#
+# CAVEAT, unlike codex-launch: that script relies on `codex resume --last`
+# exiting non-zero *before* taking over the terminal, so a non-zero status
+# unambiguously means "nothing to resume". Whether `agy --continue` behaves the
+# same way is unconfirmed. If it takes over the terminal first, then ANY
+# non-zero exit — including the user simply quitting the TUI — falls through
+# and starts a fresh session, and the worker looks like it lost its whole
+# conversation. Verify before relying on resume.
+if (( resume )); then
+  if agy --continue "${yolo[@]}" ${args[@]+"${args[@]}"}; then
+    exit 0
+  fi
+  echo "antigravity-launch: no resumable session for $PWD — starting fresh" >&2
+fi
+exec agy "${yolo[@]}" ${args[@]+"${args[@]}"}

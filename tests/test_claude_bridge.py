@@ -480,6 +480,9 @@ class HarnessForTests(unittest.TestCase):
         self.assertEqual(cb.harness_for({}), "codex")
         self.assertEqual(cb.harness_for({"harness": "claude"}), "claude")
         self.assertEqual(cb.harness_for({"harness": "codex"}), "codex")
+        self.assertEqual(
+            cb.harness_for({"harness": "antigravity"}), "antigravity"
+        )
 
     def test_unknown_or_empty_normalizes_to_codex(self):
         self.assertEqual(cb.harness_for({"harness": "gpt"}), "codex")
@@ -615,6 +618,24 @@ class StartArgsHarnessTests(unittest.TestCase):
     def test_codex_no_resume_omits_flag(self):
         args = cb.start_args("w", "/d", 42, resume=False, harness="codex")
         self.assertNotIn("--resume", args)
+
+    def test_antigravity_uses_worker_launcher_without_claude_flags(self):
+        args = cb.start_args(
+            "w", "/d", 42, resume=True, harness="antigravity"
+        )
+        self.assertEqual(
+            args[args.index("--harness") + 1], "antigravity"
+        )
+        self.assertIn("--resume", args)
+        self.assertNotIn("--append-system-prompt", args)
+        self.assertNotIn("--", args)
+
+
+class AntigravityHarnessTests(unittest.TestCase):
+    def test_prompt_and_model_tag(self):
+        self.assertTrue(cb.screen_is_ready("ready\n❯ ", "antigravity"))
+        self.assertEqual(cb.worker_model_tag("unused", "antigravity"),
+                         "Antigravity")
 
 
 class HandoffPathTests(unittest.TestCase):

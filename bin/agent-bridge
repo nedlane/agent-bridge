@@ -21,20 +21,33 @@ Secrets: ~/.config/claude-workers/discord-bot-token   (Discord bot token)
                                                        BRIDGE_WEBHOOK_SECRET,
                                                        shared with the hooks)
 
-Workers run on either engine: Claude Code (default) or Codex in YOLO mode
-(bypass all approvals + sandbox, the analog of Claude's bypass-permissions).
-`/harness` switches a channel between them; each engine keeps its own
-conversation. The Discord protocol, replies, and every command below work on
-both — Codex's turn-end reply is pushed by its Stop hook (codex-worker-done-relay,
-see docs/agent-control-plane.md), and its protocol is injected as the first
-message rather than a system prompt.
+Workers run on one of three engines: Claude Code (default), Codex, or
+Antigravity — the latter two in YOLO mode (bypass all approvals + sandbox, the
+analog of Claude's bypass-permissions). `/harness` switches a channel between
+them; each engine keeps its own conversation. Claude's protocol is injected as
+a system prompt; Codex's and Antigravity's ride in as the worker's first
+message instead.
+
+Turn-end replies are pushed by an engine-specific Stop hook — Claude's
+claude-worker-done-relay hands the bridge a transcript path, Codex's
+codex-worker-done-relay carries the reply inline (see
+docs/agent-control-plane.md).
+
+ANTIGRAVITY IS NOT AT PARITY: there is no equivalent relay for `agy`, so an
+antigravity worker's turn-end reply is NOT posted automatically. It reaches
+Discord only when the worker calls discord-notify itself, and the
+transcript/inline fallback that covers a worker which stayed quiet does not
+exist. Its TUI readiness detection also reuses Claude's prompt glyph and
+Codex's busy markers, unverified against the real thing. Treat the engine as
+experimental until a relay lands.
 
 Commands are native Discord slash commands (allowed users; synced per guild
 on connect). The `worker` option defaults to the channel's mapped worker:
   /status                  list all workers, their state, and engine
-  /harness <claude|codex> [worker] [handoff]   switch a channel's engine
-                           (codex = YOLO; handoff first captures a note for
-                           the next engine, best-effort)
+  /harness <claude|codex|antigravity> [worker] [handoff]
+                           switch a channel's engine (non-Claude = YOLO;
+                           handoff first captures a note for the next engine,
+                           best-effort)
   /stop /restart /screen [worker]
   /usage [worker]          usage & session cost: plan rate-limit bars + this
                            worker's session cost (owner or a channel's editors;
@@ -278,7 +291,7 @@ def start_args(name, directory, channel_id, resume, profile="owner",
     ]
     if resume:
         args.append("--resume")
-    if harness == "codex":
+    if harness in ("codex", "antigravity"):
         return args
     args.append("--")
     args += profile_args(profile)
@@ -673,7 +686,7 @@ def screen_is_compacting(screen):
 
 # The idle input-prompt glyph differs per engine: Claude Code uses "❯", Codex
 # uses "›". Everything else about readiness converges (see screen_is_ready).
-PROMPT_CHARS = {"claude": "❯", "codex": "›"}
+PROMPT_CHARS = {"claude": "❯", "codex": "›", "antigravity": "❯"}
 
 
 RESTRICTED_PROFILES = ("greeter", "utility")
@@ -694,7 +707,7 @@ def harness_for(repo):
     if (repo or {}).get("profile") in RESTRICTED_PROFILES:
         return "claude"
     h = (repo or {}).get("harness") or "codex"
-    return h if h in ("claude", "codex") else "codex"
+    return h if h in ("claude", "codex", "antigravity") else "codex"
 
 
 def codex_status_tag(screen):
@@ -731,9 +744,11 @@ def codex_status_tag(screen):
 
 
 def worker_model_tag(name, harness):
-    """Short engine/model/speed label for a worker's first Discord reply."""
-    if harness != "codex":
+    """Short engine/model/speed label for a worker's Discord reply."""
+    if harness not in ("codex", "antigravity"):
         return "Claude"
+    if harness == "antigravity":
+        return "Antigravity"
     try:
         screen = worker_screen(name, 40)
     except Exception:
@@ -781,7 +796,7 @@ def composer_is_empty(screen, harness="claude"):
     half-written message and returns True (accept the small risk rather than
     wedge). Claude shows a truly empty "❯" box, so the check is exact there."""
     prompt = PROMPT_CHARS.get(harness, "❯")
-    if harness == "codex":
+    if harness in ("codex", "antigravity"):
         return True
     box = None
     for line in (screen or "").splitlines():
@@ -1148,14 +1163,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not await asyncio.to_thread(worker_alive, name):
             return f"📊 `{name}` isn't running right now.", None
         harness = harness_of(name)
-        if harness == "codex":
-            # Codex's /usage is a different panel and its slash form can *spend*
-            # a usage-limit reset, so the bridge must not auto-invoke it. Point
-            # at /screen instead.
+        if harness in ("codex", "antigravity"):
+            # Only Claude's usage panel is parseable here. Codex's is a
+            # different panel whose slash form can *spend* a usage-limit reset,
+            # so the bridge must not auto-invoke it; Antigravity's is simply
+            # unmapped. Point at /screen instead.
             return (
-                f"📊 usage isn't wired up for Codex workers (Codex's panel works "
-                f"differently, and `/usage` there spends a reset) — use `/screen` "
-                f"to peek at `{name}`.", None,
+                f"📊 usage isn't wired up for **{harness}** workers — use "
+                f"`/screen` to peek at `{name}`.", None,
             )
         screen = await asyncio.to_thread(worker_screen, name, 30)
         if not screen_is_ready(screen, harness):
@@ -1336,7 +1351,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # A fresh Codex session has no injected system prompt, so arm the
             # first-message protocol injection (a resumed one already carries it
             # in its restored history).
-            if harness == "codex" and not resume:
+            if harness in ("codex", "antigravity") and not resume:
                 codex_unprimed.add(name)
             # The resume can auto-compact; wait for a genuinely input-ready
             # prompt before pasting, or this waking message is discarded when
@@ -1403,7 +1418,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         try:
             label = await asyncio.to_thread(worker_model_tag, name, harness)
         except Exception:
-            label = "Codex" if harness == "codex" else "Claude"
+            label = "Codex" if harness == "codex" else ("Antigravity" if harness == "antigravity" else "Claude")
         return f"-# 🤖 {label}\n{text}"
 
     # --- command actions (shared by the slash commands below) ---------------
@@ -1470,7 +1485,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if r.returncode != 0:
             return f"⚠️ clear failed: {r.stderr.strip()}", None
         # Fresh Codex session: re-arm first-message protocol injection.
-        if harness == "codex":
+        if harness in ("codex", "antigravity"):
             codex_unprimed.add(name)
         # Wiped the worker's context — wipe the channel's clutter to match.
         purged, note = await purge_channel(channel_id)
@@ -1526,32 +1541,33 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return " ⚠️ handoff capture failed — switching without it."
 
     async def do_harness(name, engine, handoff=False):
-        """Switch a channel's worker between engines ('claude' or 'codex').
+        """Switch a channel's worker between engines ('claude', 'codex', or 'antigravity').
 
         Not a hot-swap — a live TUI can't change engines — so this persists the
         choice, stops the running worker, and lets the next message start it on
-        the new engine. Claude and Codex keep SEPARATE session stores, so
-        switching to Codex begins a fresh Codex session while Claude's thread
-        stays intact (and vice versa): each engine remembers its own last
-        conversation. Codex always runs in YOLO mode (bypass all approvals +
-        sandbox), the analog of Claude's bypass-permissions.
+        the new engine. Every engine keeps its OWN session store, so switching
+        to Codex begins a fresh Codex session while Claude's thread stays
+        intact (and vice versa): each engine remembers its own last
+        conversation. The non-Claude engines always run in YOLO mode (bypass
+        all approvals + sandbox), the analog of Claude's bypass-permissions.
 
         handoff=True asks the outgoing worker to write a short context note
         for whichever engine starts next before it's stopped (see
         capture_handoff) — best-effort, the switch proceeds either way."""
         engine = (engine or "").strip().lower()
-        if engine not in ("claude", "codex"):
-            return f"⚠️ harness must be `claude` or `codex` (got `{engine}`)", None
+        if engine not in ("claude", "codex", "antigravity"):
+            return f"⚠️ harness must be `claude`, `codex`, or `antigravity` (got `{engine}`)", None
         item = next(
             ((cid, r) for cid, r in cfg["repos"].items() if r["name"] == name), None
         )
         if not item:
             return f"⚠️ no repo channel mapped for `{name}`", None
         _, repo = item
-        if engine == "codex" and repo.get("profile") in RESTRICTED_PROFILES:
+        if engine in ("codex", "antigravity") and repo.get("profile") in RESTRICTED_PROFILES:
             return (
                 f"🚫 `{name}` runs the restricted **{repo['profile']}** profile, "
-                "which only Claude can enforce — Codex runs full-YOLO and would "
+                "which only Claude can enforce — non-Claude harnesses run "
+                "full-YOLO and would "
                 "ignore its guardrails. Keeping it on Claude.", None,
             )
         outgoing_harness = harness_for(repo)
@@ -1576,7 +1592,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             save_config(cfg, config_path)
         codex_unprimed.discard(name)
         last_activity.pop(name, None)
-        note = " **(YOLO mode)**" if engine == "codex" else ""
+        note = " **(YOLO mode)**" if engine in ("codex", "antigravity") else ""
         print(f"[bridge] harness: {name} -> {engine}")
         return (
             f"🔀 `{name}` is now driven by **{engine}**{note}.{handoff_note} Your "
@@ -1937,8 +1953,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         )
         await interaction.followup.send(f"📨 asked `{name}` for a check-in")
 
-    @tree.command(name="harness", description="Switch a channel between Claude and Codex (codex = YOLO mode)")
-    @describe(engine="claude or codex", worker="Worker (defaults to this channel's worker)",
+    @tree.command(name="harness", description="Switch between Claude, Codex, and Antigravity")
+    @describe(engine="claude, codex, or antigravity", worker="Worker (defaults to this channel's worker)",
               handoff="Ask the outgoing worker to write a handoff note for the next engine first (default: off)")
     async def slash_harness(interaction, engine: str, worker: str = None, handoff: bool = False):
         if not (name := await guard(interaction, worker)):
@@ -1952,13 +1968,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        # On Codex, /model opens an interactive picker (no inline arg), so this
-        # types the command; the value is best set in the picker via /screen or
-        # by switching before work. On Claude it sets the model directly.
+        # Outside Claude, /model tends to open an interactive picker (no inline
+        # arg), so this types the command; the value is best set in the picker
+        # via /screen or by switching before work. On Claude it sets the model
+        # directly.
         await deliver(name, f"/model {model}", typed=True)
         engine = harness_of(name)
-        hint = (" — Codex's /model is an interactive picker; use /screen to drive it"
-                if engine == "codex" else "")
+        hint = (f" — {engine}'s `/model` may open an interactive picker; use "
+                "/screen to drive it"
+                if engine in ("codex", "antigravity") else "")
         await interaction.followup.send(f"🔧 sent `/model {model}` to `{name}`{hint}")
 
     @tree.command(name="compact", description="Compact a worker's context")
@@ -2371,7 +2389,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if r.returncode != 0:
                 return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)
             await asyncio.to_thread(disarm_fresh, name)
-            if harness == "codex" and not resume:
+            if harness in ("codex", "antigravity") and not resume:
                 codex_unprimed.add(name)
             last_activity[name] = time.time()
             print(f"[bridge] start event: worker {name} running")
