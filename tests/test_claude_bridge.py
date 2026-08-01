@@ -920,6 +920,13 @@ class SessionLookupTests(unittest.TestCase):
         self.assertEqual(cb.claude_project_slug("/home/n/.local/state/x"),
                          "-home-n--local-state-x")
         self.assertEqual(cb.claude_project_slug("/home/n/x/"), "-home-n-x")
+        # Underscores too. Missing this made /cost report "no session found"
+        # for every worker with one in its path — 9 of the 39 mapped here.
+        self.assertEqual(cb.claude_project_slug("/home/n/uqr_ws"),
+                         "-home-n-uqr-ws")
+        self.assertEqual(
+            cb.claude_project_slug("/home/n/uqr_ws/src/bicycle_model"),
+            "-home-n-uqr-ws-src-bicycle-model")
 
     def test_picks_the_newest_claude_transcript(self):
         with tempfile.TemporaryDirectory() as root:
