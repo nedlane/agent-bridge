@@ -909,6 +909,70 @@ class SystemPromptHandoffTests(unittest.TestCase):
             self.assertEqual(composed.count("finish the auth refactor"), 1)
 
 
+class FastTierPricingTests(unittest.TestCase):
+    """Both providers bill the fast tier at a flat multiple of standard."""
+
+    RATES = {"input": 5e-06, "output": 3e-05, "cache_read": 5e-07,
+             "cache_write": 6.25e-06}
+
+    def test_share_scales_cost_between_standard_and_the_multiple(self):
+        tok = {"input": 1_000_000, "output": 1_000_000,
+               "cache_read": 0, "cache_write": 0}
+        base = cb.token_cost(tok, self.RATES)
+        self.assertAlmostEqual(base, 35.0, places=6)
+        self.assertAlmostEqual(cb.token_cost(tok, self.RATES, 0.0, 2.0), 35.0, places=6)
+        self.assertAlmostEqual(cb.token_cost(tok, self.RATES, 1.0, 2.0), 70.0, places=6)
+        self.assertAlmostEqual(cb.token_cost(tok, self.RATES, 0.5, 2.0), 52.5, places=6)
+
+    def test_share_is_clamped_and_junk_falls_back_to_standard(self):
+        tok = {"output": 1_000_000}
+        self.assertAlmostEqual(cb.token_cost(tok, self.RATES, 5.0, 2.0), 60.0, places=6)
+        self.assertAlmostEqual(cb.token_cost(tok, self.RATES, -1.0, 2.0), 30.0, places=6)
+        self.assertAlmostEqual(cb.token_cost(tok, self.RATES, "junk", 2.0), 30.0, places=6)
+
+    def test_multiplier_comes_from_the_table_and_defaults_off(self):
+        self.assertEqual(cb.fast_multiplier({"fast_multiplier": 2.0}), 2.0)
+        self.assertEqual(cb.fast_multiplier({}), 1.0)
+        self.assertEqual(cb.fast_multiplier(None), 1.0)
+        self.assertEqual(cb.fast_multiplier({"fast_multiplier": "x"}), 1.0)
+
+    def test_shipped_table_carries_the_multiplier(self):
+        p = cb.load_pricing(os.path.join(HERE, "pricing.json"))
+        self.assertEqual(cb.fast_multiplier(p), 2.0)
+
+    def test_codex_priority_share_counts_response_tiers(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "r.jsonl")
+            with open(path, "w") as f:
+                for tier in ("priority", "priority", "priority", "default"):
+                    f.write(json.dumps({"x": {"service_tier": tier}}) + "\n")
+            self.assertAlmostEqual(cb.codex_priority_share(path), 0.75)
+            empty = os.path.join(root, "e.jsonl"); open(empty, "w").close()
+            self.assertEqual(cb.codex_priority_share(empty), 0.0)
+        self.assertEqual(cb.codex_priority_share("/nonexistent"), 0.0)
+
+    def test_claude_fast_share_is_weighted_by_output_tokens(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "t.jsonl")
+            def msg(out, speed):
+                return json.dumps({"type": "assistant", "message": {
+                    "model": "claude-opus-5",
+                    "usage": {"output_tokens": out, "speed": speed}}})
+            with open(path, "w") as f:
+                # 300 fast vs 100 standard -> 0.75 by tokens, not 0.5 by count
+                f.write(msg(300, "fast") + "\n")
+                f.write(msg(100, "standard") + "\n")
+            self.assertAlmostEqual(cb.claude_fast_share(path, 0), 0.75)
+
+    def test_claude_fast_share_zero_when_all_standard(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "t.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "assistant", "message": {
+                    "usage": {"output_tokens": 50, "speed": "standard"}}}) + "\n")
+            self.assertEqual(cb.claude_fast_share(path, 0), 0.0)
+
+
 class SessionLookupTests(unittest.TestCase):
     """Locating a worker's session on disk, for /cost."""
 
@@ -966,7 +1030,7 @@ class SessionLookupTests(unittest.TestCase):
             roots = {"claude": root, "codex": root}
             for h in ("claude", "codex"):
                 self.assertEqual(cb.session_tokens(h, "/w/p", roots),
-                                 (None, None, None))
+                                 (None, None, None, 0.0))
 
 
 class FormatTokensTests(unittest.TestCase):
