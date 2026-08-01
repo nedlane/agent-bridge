@@ -228,8 +228,15 @@ worker from assuming every turn came from the owner.
 
 Limits are optional and disabled by default. Matching rules are cumulative: a
 message must fit the channel-wide cap, the user's aggregate cap across all
-channels, and any user-specific cap inside that channel. Counts persist across
-daemon restarts in `~/.local/state/claude-workers/usage-limits.json`.
+channels, and any user-specific cap inside that channel. Each cap is a sliding
+window, not a lifetime total. Counts persist across daemon restarts in
+`~/.local/state/claude-workers/usage-limits.json`.
+
+The owner (`allowed_users`) is **exempt** — these caps exist to fence guests,
+so a channel-wide cap doesn't throttle you in your own channel. Editing a
+message counts the same as sending one; a refused message gets a ⛔ reaction,
+and the reason is spelled out at most once every 5 minutes per user so a
+capped guest can't farm bot replies.
 
 Each rule accepts `messages` and `window_seconds` (default `3600`), or
 `"blocked": true` to disable that scope entirely. IDs are JSON string keys:
