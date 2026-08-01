@@ -238,8 +238,9 @@ message counts the same as sending one; a refused message gets a ⛔ reaction,
 and the reason is spelled out at most once every 5 minutes per user so a
 capped guest can't farm bot replies.
 
-Each rule accepts `messages` and `window_seconds` (default `3600`), or
-`"blocked": true` to disable that scope entirely. IDs are JSON string keys:
+Each rule accepts `messages`, `cost`, and `window_seconds` (default `3600` for
+messages, `86400` for cost), or `"blocked": true` to disable that scope
+entirely. IDs are JSON string keys:
 
 ```json
 {
@@ -247,10 +248,12 @@ Each rule accepts `messages` and `window_seconds` (default `3600`), or
     "channels": {
       "555555555555555555": {
         "messages": 100,
+        "cost": 5.00,
         "window_seconds": 3600,
         "users": {
           "777777777777777777": {
             "messages": 10,
+            "cost": 1.00,
             "window_seconds": 3600
           }
         }
@@ -260,6 +263,7 @@ Each rule accepts `messages` and `window_seconds` (default `3600`), or
     "users": {
       "777777777777777777": {
         "messages": 50,
+        "cost": 20.00,
         "window_seconds": 86400
       }
     }
@@ -267,9 +271,63 @@ Each rule accepts `messages` and `window_seconds` (default `3600`), or
 }
 ```
 
-Here channel `555...` accepts at most 100 messages/hour total, user `777...`
-gets at most 10/hour in that channel and 50/day across all channels, and
-channel `666...` is disabled globally.
+Here channel `555...` accepts at most 100 messages and $5.00 of usage per hour
+in total, user `777...` gets 10 messages and $1.00/hour in that channel plus 50
+messages and $20.00/day across all channels, and channel `666...` is disabled
+globally.
+
+Anyone can run **`/limits`** in a worker channel to see their own numbers
+against each scope. The reply is ephemeral, so a guest checking their budget
+doesn't broadcast it.
+
+### Token budgets (the `cost` key)
+
+`messages` counts turns; `cost` measures what those turns actually burned.
+They do different jobs and are meant to be used together:
+
+| | `messages` | `cost` |
+|---|---|---|
+| Enforcement | **Pre-hoc** — refuses before anything is spent | **Post-hoc** — refuses the turn *after* the budget is blown |
+| Engines | Claude, Codex, Antigravity | Claude and Codex |
+| Measures | Turns taken | Cost-weighted tokens |
+
+**Cost is inherently post-hoc.** A turn's price isn't known until it has run,
+so overage is bounded by one turn — a user can always blow through their
+budget with a single expensive turn. That's exactly why `messages` stays: it's
+the only control that can refuse *before* spending, and the only one that
+covers every engine.
+
+**Where the numbers come from.** At turn end the bridge reads the same
+transcript window it already parses for the reply — Claude's per-message
+`usage`, or the running `total_token_usage` in Codex's rollout file — and
+prices it against `pricing.json`. The first turn on a transcript the bridge
+hasn't seen yet is free: both engines report cumulatively, so with no prior
+reading to diff against the alternative is billing someone for the entire
+session history. Every subsequent turn is exact.
+
+**Why cost-weighted and not raw tokens.** Cache reads bill at a tenth of the
+input rate but dominate the raw count — a real assistant message here shows
+190,369 cache-read tokens against 1,580 output. Summed raw, cache reads are
+~99% of the number and the budget degenerates into a turn counter that ranks a
+cheap resumed session above an expensive fresh one. Weighting by rate is what
+makes the total track spend.
+
+**The dollars are a weighting, not a bill.** Workers run on Claude and ChatGPT
+subscriptions, not metered API keys, so nothing here is invoiced — the figure
+exists to make burn comparable across engines and users.
+
+Rates live in `pricing.json`, regenerated from a maintained upstream dataset:
+
+```bash
+scripts/refresh-pricing.py           # rewrite pricing.json, then commit it
+scripts/refresh-pricing.py --check   # exit 1 if stale
+```
+
+The bridge loads that file once at startup and never fetches at runtime — it
+has to work offline. If the file is missing or unreadable, cost budgets are
+disabled and the daemon logs it; `messages` caps keep working. A model that
+isn't in the table bills at the table's `fallback` rate rather than at zero, so
+a newly shipped model can't silently escape every budget.
 
 ## Secrets
 
@@ -330,6 +388,7 @@ channel you run it in.
 | `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
+| `/limits` | Show **your own** usage against the limits configured for this channel (messages and cost). Ephemeral; open to anyone who can talk in the channel. |
 | `/checkin [worker]` | Ask a running worker to send a 3–5 line progress update. |
 | `/addrepo <name> <path> [category]` | Create `#<name>` and map it to a repo directory. Optional `category` files it under an existing category (matched loosely, ignoring emoji/case) or creates a new one; omitted, it lands in the default inbox category. |
 | `/close [worker] confirm:<name>` | **Irreversible teardown** — stop the worker, wipe its saved state, and delete its channel. Requires retyping the worker name in `confirm`. |

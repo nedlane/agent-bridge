@@ -63,6 +63,9 @@ print(json.dumps({
     "session_id": hook.get("session_id", ""),
     "transcript_path": hook.get("transcript_path", ""),
     "reply": hook.get("last_assistant_message", "") or "",
+    # The bridge prices the turn from the rollout at transcript_path; the
+    # model names which rate row to use.
+    "model": hook.get("model", "") or "",
 }))' 2>/dev/null)"
 [[ -n "$body" ]] || exit 0
 
