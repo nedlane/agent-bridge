@@ -474,6 +474,67 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cb.load_config(path), cb.default_config())
 
 
+class SenderIdentityTests(unittest.TestCase):
+    def test_sender_tag_carries_name_user_and_channel(self):
+        tag = cb.sender_tag("Christian", 42, 99)
+        self.assertIn("Christian", tag)
+        self.assertIn("user id 42", tag)
+        self.assertIn("channel 99", tag)
+
+
+class UsageLimitTests(unittest.TestCase):
+    def config(self):
+        return {
+            "usage_limits": {
+                "channels": {
+                    "10": {
+                        "messages": 3,
+                        "window_seconds": 60,
+                        "users": {
+                            "7": {"messages": 1, "window_seconds": 60}
+                        },
+                    },
+                    "11": {"blocked": True},
+                },
+                "users": {"7": {"messages": 2, "window_seconds": 60}},
+            }
+        }
+
+    def test_channel_user_cap(self):
+        state = {}
+        self.assertEqual(cb.check_usage_limit(self.config(), state, 10, 7, 100),
+                         (True, None))
+        allowed, reason = cb.check_usage_limit(self.config(), state, 10, 7, 101)
+        self.assertFalse(allowed)
+        self.assertIn("this channel", reason)
+
+    def test_user_cap_across_channels(self):
+        state = {}
+        self.assertTrue(cb.check_usage_limit(self.config(), state, 20, 7, 100)[0])
+        self.assertTrue(cb.check_usage_limit(self.config(), state, 21, 7, 101)[0])
+        allowed, reason = cb.check_usage_limit(self.config(), state, 22, 7, 102)
+        self.assertFalse(allowed)
+        self.assertIn("user limit", reason)
+
+    def test_channel_global_cap_and_block(self):
+        state = {}
+        for uid in (1, 2, 3):
+            self.assertTrue(cb.check_usage_limit(self.config(), state, 10, uid, 100)[0])
+        self.assertFalse(cb.check_usage_limit(self.config(), state, 10, 4, 101)[0])
+        self.assertFalse(cb.check_usage_limit(self.config(), state, 11, 4, 101)[0])
+
+    def test_window_expiry(self):
+        state = {}
+        self.assertTrue(cb.check_usage_limit(self.config(), state, 10, 7, 100)[0])
+        self.assertTrue(cb.check_usage_limit(self.config(), state, 10, 7, 161)[0])
+
+    def test_no_config_is_unlimited(self):
+        state = {}
+        for now in range(100):
+            self.assertEqual(cb.check_usage_limit({}, state, 1, 2, now),
+                             (True, None))
+
+
 class HarnessForTests(unittest.TestCase):
     def test_default_and_explicit(self):
         # Codex is the fleet default; an explicit harness is honored as-is.

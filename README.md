@@ -179,6 +179,7 @@ The bridge reads a single JSON file at `~/.config/claude-bridge/config.json`
 | `repos` | object | Map of **channel id (string)** → repo object (below). |
 | `welcome_channel` | int \| null | Channel id of the public `#welcome` greeter (open to any member). `null` disables it. |
 | `requests_channel` | int \| null | Channel id where guest-access approval cards are posted. `null` disables it. |
+| `usage_limits` | object | Optional persistent message caps by channel, user, and user-within-channel. See below. |
 
 Each entry in `repos` is keyed by the Discord channel id (as a string) and holds:
 
@@ -218,6 +219,50 @@ start with an empty `repos` object. A complete example:
   }
 }
 ```
+
+Every ordinary Discord message is prefixed for the worker with the sender's
+display name, immutable Discord user id, and channel id. This prevents a shared
+worker from assuming every turn came from the owner.
+
+### Usage limits
+
+Limits are optional and disabled by default. Matching rules are cumulative: a
+message must fit the channel-wide cap, the user's aggregate cap across all
+channels, and any user-specific cap inside that channel. Counts persist across
+daemon restarts in `~/.local/state/claude-workers/usage-limits.json`.
+
+Each rule accepts `messages` and `window_seconds` (default `3600`), or
+`"blocked": true` to disable that scope entirely. IDs are JSON string keys:
+
+```json
+{
+  "usage_limits": {
+    "channels": {
+      "555555555555555555": {
+        "messages": 100,
+        "window_seconds": 3600,
+        "users": {
+          "777777777777777777": {
+            "messages": 10,
+            "window_seconds": 3600
+          }
+        }
+      },
+      "666666666666666666": { "blocked": true }
+    },
+    "users": {
+      "777777777777777777": {
+        "messages": 50,
+        "window_seconds": 86400
+      }
+    }
+  }
+}
+```
+
+Here channel `555...` accepts at most 100 messages/hour total, user `777...`
+gets at most 10/hour in that channel and 50/day across all channels, and
+channel `666...` is disabled globally.
 
 ## Secrets
 
