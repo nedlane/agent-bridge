@@ -693,6 +693,21 @@ class SystemPromptHandoffTests(unittest.TestCase):
                 cb.PROTOCOL + "\n\n" + cb.ORCHESTRATOR,
             )
 
+    def test_handoff_is_injected_once_across_both_consumers(self):
+        # handle_repo_message consumes the handoff itself and THEN calls
+        # system_prompt() for an unprimed Codex worker. Both are consumers, so
+        # the note must survive exactly one of them — this pins the one-shot
+        # guarantee that ordering relies on (swap them and it double-injects).
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "w"))
+            with open(cb.handoff_path("w", root), "w") as f:
+                f.write("finish the auth refactor")
+            note = cb.consume_handoff("w", root)
+            self.assertEqual(note, "finish the auth refactor")
+            composed = "Handoff from the previous engine:\n\n" + note
+            composed = cb.system_prompt("w", root) + "\n\n---\n\n" + composed
+            self.assertEqual(composed.count("finish the auth refactor"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

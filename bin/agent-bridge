@@ -222,12 +222,27 @@ DISCORD_TAG = (
 # switching anyway (see capture_handoff in run_bridge).
 HANDOFF_TIMEOUT_SECONDS = 240
 
+# A paste lands before the TUI visibly enters its turn, so an idle reading
+# taken right after delivery means nothing. Wait this long for the worker to
+# pick the prompt up before believing "idle" — if it never looks busy, it
+# either answered instantly or never saw the message, and the file check
+# settles which.
+HANDOFF_PICKUP_SECONDS = 30
+
 HANDOFF_PROMPT = (
     "You're about to be switched to a different engine that keeps a "
     "completely separate conversation — it will remember nothing from this "
     "session. Before that happens, write a concise handoff (current task, "
     "key decisions so far, files touched, next steps) to exactly this "
     "path: {path}\nKeep it under ~400 words."
+)
+
+# The handoff prompt is bridge machinery, not Ned talking — it overrides
+# DISCORD_TAG so the outgoing worker writes the file and stops, instead of
+# also narrating the handoff to a channel that's about to switch engines.
+HANDOFF_TAG = (
+    "[Bridge control message — the engine switch is already in progress. "
+    "Write the file and stop; no Discord reply is needed.]"
 )
 
 
@@ -1364,6 +1379,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # First real message to a fresh Codex worker: prepend the Discord
         # protocol (Codex's stand-in for Claude's --append-system-prompt). One
         # shot — a resumed session already has it in history.
+        #
+        # ORDER MATTERS: system_prompt() consumes a pending handoff too (that's
+        # the Claude injection point). It is a no-op here only because the
+        # block above already consumed and deleted the note. Swap these two and
+        # the handoff gets injected twice.
         if name in codex_unprimed:
             composed = system_prompt(name) + "\n\n---\n\n" + composed
             codex_unprimed.discard(name)
@@ -1456,6 +1476,20 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
 
+    async def wait_busy(name, harness, timeout=HANDOFF_PICKUP_SECONDS):
+        """Poll until the worker's pane stops reading as idle — i.e. it has
+        picked up the message just delivered. Returns False if it never did
+        (answered within one poll, or never saw the paste)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not await asyncio.to_thread(worker_alive, name):
+                return False
+            screen = await asyncio.to_thread(worker_screen, name, 40)
+            if not screen_is_ready(screen, harness):
+                return True
+            await asyncio.sleep(1)
+        return False
+
     async def capture_handoff(name, outgoing_harness):
         """Ask the live worker to write a handoff note for the next engine,
         wait for it to finish, and return a short status suffix. Never
@@ -1465,15 +1499,27 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 os.remove(handoff_path(name))
             except FileNotFoundError:
                 pass
-            await deliver(name, HANDOFF_PROMPT.format(path=handoff_path(name)))
-            if not await wait_ready(
+            await deliver(
+                name, HANDOFF_PROMPT.format(path=handoff_path(name)),
+                tag=HANDOFF_TAG,
+            )
+            # deliver() returns as soon as the paste lands, so poll for the
+            # turn to actually START before waiting for it to end — otherwise
+            # the pre-turn idle prompt reads as "finished", and the stop below
+            # kills the worker in the middle of writing the note.
+            await wait_busy(name, outgoing_harness)
+            finished = await wait_ready(
                 name,
                 timeout=HANDOFF_TIMEOUT_SECONDS,
                 harness=outgoing_harness,
-            ):
-                return " ⚠️ handoff didn't finish in time — switching without it."
+            )
+            # The file is the real signal either way: a worker that wrote the
+            # note and then moved on to something else still handed off, even
+            # though it never went idle inside the window.
             if os.path.isfile(handoff_path(name)):
                 return " 📝 handoff captured for the next engine."
+            if not finished:
+                return " ⚠️ handoff didn't finish in time — switching without it."
             return " ⚠️ didn't write a handoff file — switching without one."
         except Exception as e:
             print(f"[bridge] {name}: handoff capture failed: {e}")
@@ -1514,16 +1560,20 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # Stop the current worker so the next message revives it on the new
         # engine; a stale codex-prime flag from the old engine is cleared.
         handoff_note = ""
-        if await asyncio.to_thread(worker_alive, name):
-            if handoff:
-                handoff_note = await capture_handoff(name, outgoing_harness)
-            await asyncio.to_thread(worker_stop, name)
-        elif handoff:
-            handoff_note = " ℹ️ no running session to capture a handoff from."
-        # Persist the target only after capture. During capture, harness_of()
-        # must continue to describe the outgoing live TUI.
-        repo["harness"] = engine
-        save_config(cfg, config_path)
+        try:
+            if await asyncio.to_thread(worker_alive, name):
+                if handoff:
+                    handoff_note = await capture_handoff(name, outgoing_harness)
+                await asyncio.to_thread(worker_stop, name)
+            elif handoff:
+                handoff_note = " ℹ️ no running session to capture a handoff from."
+        finally:
+            # Persist the target only after capture. During capture,
+            # harness_of() must continue to describe the outgoing live TUI.
+            # In a finally so a failed stop can't silently lose the switch —
+            # the config is the durable record, the running process isn't.
+            repo["harness"] = engine
+            save_config(cfg, config_path)
         codex_unprimed.discard(name)
         last_activity.pop(name, None)
         note = " **(YOLO mode)**" if engine == "codex" else ""
