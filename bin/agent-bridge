@@ -21,13 +21,25 @@ Secrets: ~/.config/claude-workers/discord-bot-token   (Discord bot token)
                                                        BRIDGE_WEBHOOK_SECRET,
                                                        shared with the hooks)
 
-Workers run on either engine: Claude Code (default) or Codex in YOLO mode
-(bypass all approvals + sandbox, the analog of Claude's bypass-permissions).
-`/harness` switches a channel between them; each engine keeps its own
-conversation. The Discord protocol, replies, and every command below work on
-both — Codex's turn-end reply is pushed by its Stop hook (codex-worker-done-relay,
-see docs/agent-control-plane.md), and its protocol is injected as the first
-message rather than a system prompt.
+Workers run on one of three engines: Claude Code (default), Codex, or
+Antigravity — the latter two in YOLO mode (bypass all approvals + sandbox, the
+analog of Claude's bypass-permissions). `/harness` switches a channel between
+them; each engine keeps its own conversation. Claude's protocol is injected as
+a system prompt; Codex's and Antigravity's ride in as the worker's first
+message instead.
+
+Turn-end replies are pushed by an engine-specific Stop hook — Claude's
+claude-worker-done-relay hands the bridge a transcript path, Codex's
+codex-worker-done-relay carries the reply inline (see
+docs/agent-control-plane.md).
+
+ANTIGRAVITY IS NOT AT PARITY: there is no equivalent relay for `agy`, so an
+antigravity worker's turn-end reply is NOT posted automatically. It reaches
+Discord only when the worker calls discord-notify itself, and the
+transcript/inline fallback that covers a worker which stayed quiet does not
+exist. Its TUI readiness detection also reuses Claude's prompt glyph and
+Codex's busy markers, unverified against the real thing. Treat the engine as
+experimental until a relay lands.
 
 Commands are native Discord slash commands (allowed users; synced per guild
 on connect). The `worker` option defaults to the channel's mapped worker:
@@ -1077,13 +1089,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return f"📊 `{name}` isn't running right now.", None
         harness = harness_of(name)
         if harness in ("codex", "antigravity"):
-            # Codex's /usage is a different panel and its slash form can *spend*
-            # a usage-limit reset, so the bridge must not auto-invoke it. Point
-            # at /screen instead.
+            # Only Claude's usage panel is parseable here. Codex's is a
+            # different panel whose slash form can *spend* a usage-limit reset,
+            # so the bridge must not auto-invoke it; Antigravity's is simply
+            # unmapped. Point at /screen instead.
             return (
-                f"📊 usage isn't wired up for Codex workers (Codex's panel works "
-                f"differently, and `/usage` there spends a reset) — use `/screen` "
-                f"to peek at `{name}`.", None,
+                f"📊 usage isn't wired up for **{harness}** workers — use "
+                f"`/screen` to peek at `{name}`.", None,
             )
         screen = await asyncio.to_thread(worker_screen, name, 30)
         if not screen_is_ready(screen, harness):
@@ -1800,12 +1812,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        # On Codex, /model opens an interactive picker (no inline arg), so this
-        # types the command; the value is best set in the picker via /screen or
-        # by switching before work. On Claude it sets the model directly.
+        # Outside Claude, /model tends to open an interactive picker (no inline
+        # arg), so this types the command; the value is best set in the picker
+        # via /screen or by switching before work. On Claude it sets the model
+        # directly.
         await deliver(name, f"/model {model}", typed=True)
         engine = harness_of(name)
-        hint = (" — Codex's /model is an interactive picker; use /screen to drive it"
+        hint = (f" — {engine}'s `/model` may open an interactive picker; use "
+                "/screen to drive it"
                 if engine in ("codex", "antigravity") else "")
         await interaction.followup.send(f"🔧 sent `/model {model}` to `{name}`{hint}")
 
