@@ -32,7 +32,7 @@ message rather than a system prompt.
 Commands are native Discord slash commands (allowed users; synced per guild
 on connect). The `worker` option defaults to the channel's mapped worker:
   /status                  list all workers, their state, and engine
-  /harness <claude|codex> [worker]   switch a channel's engine (codex = YOLO)
+  /harness <claude|codex|antigravity> [worker]   switch a channel's engine (codex/antigravity = YOLO)
   /stop /restart /screen [worker]
   /usage [worker]          usage & session cost: plan rate-limit bars + this
                            worker's session cost (owner or a channel's editors;
@@ -236,7 +236,7 @@ def start_args(name, directory, channel_id, resume, profile="owner",
     ]
     if resume:
         args.append("--resume")
-    if harness == "codex":
+    if harness in ("codex", "antigravity"):
         return args
     args.append("--")
     args += profile_args(profile)
@@ -631,7 +631,7 @@ def screen_is_compacting(screen):
 
 # The idle input-prompt glyph differs per engine: Claude Code uses "❯", Codex
 # uses "›". Everything else about readiness converges (see screen_is_ready).
-PROMPT_CHARS = {"claude": "❯", "codex": "›"}
+PROMPT_CHARS = {"claude": "❯", "codex": "›", "antigravity": "❯"}
 
 
 RESTRICTED_PROFILES = ("greeter", "utility")
@@ -652,7 +652,7 @@ def harness_for(repo):
     if (repo or {}).get("profile") in RESTRICTED_PROFILES:
         return "claude"
     h = (repo or {}).get("harness") or "codex"
-    return h if h in ("claude", "codex") else "codex"
+    return h if h in ("claude", "codex", "antigravity") else "codex"
 
 
 def codex_status_tag(screen):
@@ -690,8 +690,10 @@ def codex_status_tag(screen):
 
 def worker_model_tag(name, harness):
     """Short engine/model/speed label for a worker's first Discord reply."""
-    if harness != "codex":
+    if harness not in ("codex", "antigravity"):
         return "Claude"
+    if harness == "antigravity":
+        return "Antigravity"
     try:
         screen = worker_screen(name, 40)
     except Exception:
@@ -739,7 +741,7 @@ def composer_is_empty(screen, harness="claude"):
     half-written message and returns True (accept the small risk rather than
     wedge). Claude shows a truly empty "❯" box, so the check is exact there."""
     prompt = PROMPT_CHARS.get(harness, "❯")
-    if harness == "codex":
+    if harness in ("codex", "antigravity"):
         return True
     box = None
     for line in (screen or "").splitlines():
@@ -1073,7 +1075,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not await asyncio.to_thread(worker_alive, name):
             return f"📊 `{name}` isn't running right now.", None
         harness = harness_of(name)
-        if harness == "codex":
+        if harness in ("codex", "antigravity"):
             # Codex's /usage is a different panel and its slash form can *spend*
             # a usage-limit reset, so the bridge must not auto-invoke it. Point
             # at /screen instead.
@@ -1261,7 +1263,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # A fresh Codex session has no injected system prompt, so arm the
             # first-message protocol injection (a resumed one already carries it
             # in its restored history).
-            if harness == "codex" and not resume:
+            if harness in ("codex", "antigravity") and not resume:
                 codex_unprimed.add(name)
             # The resume can auto-compact; wait for a genuinely input-ready
             # prompt before pasting, or this waking message is discarded when
@@ -1313,7 +1315,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         try:
             label = await asyncio.to_thread(worker_model_tag, name, harness)
         except Exception:
-            label = "Codex" if harness == "codex" else "Claude"
+            label = "Codex" if harness == "codex" else ("Antigravity" if harness == "antigravity" else "Claude")
         return f"-# 🤖 {label}\n{text}"
 
     # --- command actions (shared by the slash commands below) ---------------
@@ -1380,14 +1382,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if r.returncode != 0:
             return f"⚠️ clear failed: {r.stderr.strip()}", None
         # Fresh Codex session: re-arm first-message protocol injection.
-        if harness == "codex":
+        if harness in ("codex", "antigravity"):
             codex_unprimed.add(name)
         # Wiped the worker's context — wipe the channel's clutter to match.
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
 
     async def do_harness(name, engine):
-        """Switch a channel's worker between engines ('claude' or 'codex').
+        """Switch a channel's worker between engines ('claude', 'codex', or 'antigravity').
 
         Not a hot-swap — a live TUI can't change engines — so this persists the
         choice, stops the running worker, and lets the next message start it on
@@ -1397,15 +1399,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         conversation. Codex always runs in YOLO mode (bypass all approvals +
         sandbox), the analog of Claude's bypass-permissions."""
         engine = (engine or "").strip().lower()
-        if engine not in ("claude", "codex"):
-            return f"⚠️ harness must be `claude` or `codex` (got `{engine}`)", None
+        if engine not in ("claude", "codex", "antigravity"):
+            return f"⚠️ harness must be `claude`, `codex`, or `antigravity` (got `{engine}`)", None
         item = next(
             ((cid, r) for cid, r in cfg["repos"].items() if r["name"] == name), None
         )
         if not item:
             return f"⚠️ no repo channel mapped for `{name}`", None
         _, repo = item
-        if engine == "codex" and repo.get("profile") in RESTRICTED_PROFILES:
+        if engine in ("codex", "antigravity") and repo.get("profile") in RESTRICTED_PROFILES:
             return (
                 f"🚫 `{name}` runs the restricted **{repo['profile']}** profile, "
                 "which only Claude can enforce — Codex runs full-YOLO and would "
@@ -1421,7 +1423,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             await asyncio.to_thread(worker_stop, name)
         codex_unprimed.discard(name)
         last_activity.pop(name, None)
-        note = " **(YOLO mode)**" if engine == "codex" else ""
+        note = " **(YOLO mode)**" if engine in ("codex", "antigravity") else ""
         print(f"[bridge] harness: {name} -> {engine}")
         return (
             f"🔀 `{name}` is now driven by **{engine}**{note}. Your next message "
@@ -1782,8 +1784,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         )
         await interaction.followup.send(f"📨 asked `{name}` for a check-in")
 
-    @tree.command(name="harness", description="Switch a channel between Claude and Codex (codex = YOLO mode)")
-    @describe(engine="claude or codex", worker="Worker (defaults to this channel's worker)")
+    @tree.command(name="harness", description="Switch a channel between Claude, Codex, and Antigravity (codex/antigravity = YOLO mode)")
+    @describe(engine="claude, codex, or antigravity", worker="Worker (defaults to this channel's worker)")
     async def slash_harness(interaction, engine: str, worker: str = None):
         if not (name := await guard(interaction, worker)):
             return
@@ -1802,7 +1804,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await deliver(name, f"/model {model}", typed=True)
         engine = harness_of(name)
         hint = (" — Codex's /model is an interactive picker; use /screen to drive it"
-                if engine == "codex" else "")
+                if engine in ("codex", "antigravity") else "")
         await interaction.followup.send(f"🔧 sent `/model {model}` to `{name}`{hint}")
 
     @tree.command(name="compact", description="Compact a worker's context")
@@ -2215,7 +2217,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if r.returncode != 0:
                 return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)
             await asyncio.to_thread(disarm_fresh, name)
-            if harness == "codex" and not resume:
+            if harness in ("codex", "antigravity") and not resume:
                 codex_unprimed.add(name)
             last_activity[name] = time.time()
             print(f"[bridge] start event: worker {name} running")

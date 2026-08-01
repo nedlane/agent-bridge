@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Launch an interactive Antigravity session for an agent worker — the
+# Antigravity half of the local agent control plane, mirroring claude-launch.
+# `--dangerously-skip-permissions` provides the YOLO mode equivalent for bridge integration.
+#
+#   antigravity-launch --label NAME          # worker session in $PWD
+#   antigravity-launch --label NAME --resume # resume this dir's most recent session
+#
+# Deliberately subscription-only.
+set -euo pipefail
+
+# --- extract --resume; collect passthrough args ------------------------------
+resume=0
+args=()
+while (($#)); do
+  case "$1" in
+    --label)   : "${2:?antigravity-launch: --label needs a value}"; shift 2 ;;
+    --label=*) shift ;;
+    --resume)  resume=1; shift ;;
+    --)        shift; args+=("$@"); break ;;
+    *)         args+=("$1"); shift ;;
+  esac
+done
+
+yolo=(--dangerously-skip-permissions)
+
+if (( resume )); then
+  # Try to resume
+  if agy --continue "${yolo[@]}" ${args[@]+"${args[@]}"}; then
+    exit 0
+  fi
+  echo "antigravity-launch: no resumable session for $PWD — starting fresh" >&2
+fi
+exec agy "${yolo[@]}" ${args[@]+"${args[@]}"}

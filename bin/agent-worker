@@ -181,8 +181,8 @@ cmd_start() {
     esac
   done
   [[ "$chat" =~ ^[^[:space:]]*$ ]] || die "invalid --chat target '$chat'"
-  [[ "$harness" == claude || "$harness" == codex ]] \
-    || die "invalid --harness '$harness' (claude or codex)"
+  [[ "$harness" == claude || "$harness" == codex || "$harness" == antigravity ]] \
+    || die "invalid --harness '$harness' (claude, codex, or antigravity)"
   [[ -d "$dir" ]] || die "no such directory: $dir"
   alive "$name" && die "worker '$name' is already running (try: agent-worker restart $name)"
 
@@ -200,6 +200,12 @@ cmd_start() {
     [[ -x "$launcher" ]] || die "codex-launch not found (run scripts/link.sh)"
     # Codex resume is a launcher flag; the Discord protocol is injected by the
     # bridge as the worker's first message, not a launch flag.
+    (( resume )) && launcher_args+=(--resume)
+  elif [[ "$harness" == antigravity ]]; then
+    command -v agy >/dev/null 2>&1 || die "agy CLI not found on PATH"
+    launcher="$(command -v antigravity-launch || true)"
+    [[ -n "$launcher" ]] || launcher="$(dirname "$(readlink -f "$0")")/antigravity-launch"
+    [[ -x "$launcher" ]] || die "antigravity-launch not found (run scripts/link.sh)"
     (( resume )) && launcher_args+=(--resume)
   else
     command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
