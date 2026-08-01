@@ -418,6 +418,7 @@ channel you run it in.
 |---|---|
 | `/status` | List all workers, their running state, and engine (claude/codex/antigravity). |
 | `/harness <claude\|codex\|antigravity> [worker] [handoff]` | Switch a channel between **Claude Code**, **Codex**, and **Antigravity** (the non-Claude engines run in YOLO mode — bypass all approvals + sandbox, the analog of Claude's bypass-permissions). Stops the worker; the next message starts it on the new engine. Each engine keeps its **own** conversation, so switching back resumes that engine's last thread. `handoff:True` first asks the outgoing worker to write a short handoff note (current task, decisions, next steps) that's injected into the new engine's first turn — best-effort; the switch proceeds either way. Antigravity is **experimental** — see [Antigravity limitations](#antigravity-limitations). |
+| `/fast [worker]` | Toggle Codex Fast mode on or off. Running it once enables faster inference with increased plan usage; running it again returns the worker to standard speed. Codex workers only. |
 | `/stop [worker]` | Stop a worker (state kept; a message revives it). |
 | `/restart [worker]` | Restart a worker, resuming its conversation. |
 | `/screen [worker]` | Post the worker's live TUI screen (image, or a code-block fallback). |

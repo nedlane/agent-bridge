@@ -133,11 +133,9 @@ print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
 
 if [[ "$target" == discord:* ]]; then
   bridge_send "$target" "$message" && exit 0
-  # The bridge is unreachable. Falling back to the main webhook would post this
-  # into the wrong channel — so at least make the misdelivery loud instead of
-  # silent by flagging where it was headed.
-  message="⚠️ [bridge unreachable — this was meant for $target]
-$message"
+  # A known Discord target must fail closed. Falling back to the main webhook
+  # would leak a repo worker's notification into the wrong channel.
+  die "bridge delivery failed for $target; refusing main-channel fallback"
 fi
 
 # Fallback: direct Discord webhook POST (main channel only). Long bodies are

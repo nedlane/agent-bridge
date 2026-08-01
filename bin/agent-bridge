@@ -48,6 +48,7 @@ on connect). The `worker` option defaults to the channel's mapped worker:
                            switch a channel's engine (non-Claude = YOLO;
                            handoff first captures a note for the next engine,
                            best-effort)
+  /fast [worker]           toggle Codex Fast mode on/off
   /stop /restart /screen [worker]
   /usage [worker]          usage & session cost: plan rate-limit bars + this
                            worker's session cost (owner or a channel's editors;
@@ -1042,6 +1043,16 @@ def channel_from_chat(chat):
     return None
 
 
+def worker_notification_channel(cfg, worker, chat):
+    """Resolve a worker notification without trusting its supplied target."""
+    if worker:
+        for channel_id, repo in (cfg.get("repos") or {}).items():
+            if repo.get("name") == worker and str(channel_id).isdigit():
+                return int(channel_id)
+        return None
+    return channel_from_chat(chat)
+
+
 def tag_inbound(text, typed=False, tag=None):
     """Stamp a relayed Discord message so the worker keeps replying on Discord.
 
@@ -1233,7 +1244,9 @@ def screen_is_ready(screen, harness="claude"):
     Codex "Working (… esc to interrupt)"), while a Claude --continue resume
     auto-compacts ("Compacting"), or at a blocking startup dialog — so the
     bridge never pastes the waking message into a TUI that is still loading or
-    showing a dialog and would silently discard it.
+    showing a dialog and would silently discard it. Codex's update menu is
+    also a dialog: its selected option begins with the normal "›" prompt glyph,
+    so the menu must be rejected explicitly rather than mistaken for idle.
 
     A dialog awaiting input is always the bottom-most thing on screen, so the
     dialog markers are only honored in the tail: a dismissed dialog lingers in
@@ -1250,7 +1263,19 @@ def screen_is_ready(screen, harness="claude"):
     tail = "\n".join((screen or "").splitlines()[-15:])
     dialogs = ("Do you trust", "trust this folder",
                "Resume from summary", "Resume full session")
-    return not any(b in tail for b in dialogs)
+    if any(b in tail for b in dialogs):
+        return False
+    # Once dismissed, the compact update menu can remain within the captured
+    # scrollback immediately above the real prompt. It is active only while
+    # its "Press enter" instruction is the bottom-most non-empty line.
+    nonempty = [line for line in tail.splitlines() if line.strip()]
+    update_active = (
+        "Update available!" in tail
+        and "Skip until next version" in tail
+        and nonempty
+        and "Press enter to continue" in nonempty[-1]
+    )
+    return not update_active
 
 
 def composer_is_empty(screen, harness="claude"):
@@ -2186,6 +2211,29 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             "so switching back resumes that engine's last thread.", None,
         )
 
+    async def do_fast(name):
+        """Toggle Codex's Fast service tier for a worker.
+
+        Codex exposes Fast mode as a toggle-only TUI command: invoking `/fast`
+        once enables its faster inference tier and invoking it again returns to
+        the standard tier. Keep this owner-only because Fast mode increases plan
+        usage, and reject Claude workers instead of passing them an unrelated
+        slash command.
+        """
+        repo = repo_by_name(name)
+        if not repo:
+            return f"⚠️ no repo channel mapped for `{name}`", None
+        if harness_for(repo) != "codex":
+            return (
+                f"⚠️ `{name}` is driven by **Claude** — Fast mode is only "
+                "available on Codex workers.", None,
+            )
+        await deliver(name, "/fast", typed=True)
+        return (
+            f"⚡ toggled Codex Fast mode for `{name}`. Run `/fast` again to "
+            "switch back between Fast and standard speed.", None,
+        )
+
     async def do_close(name):
         # Fully retire a worker: stop it, wipe its saved state, and drop its
         # repo mapping. The caller deletes the Discord channel afterwards — so
@@ -2567,6 +2615,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.response.defer(thinking=True)
         await reply(interaction, *await do_harness(name, engine, handoff))
 
+    @tree.command(name="fast", description="Toggle Codex Fast mode on/off")
+    @describe(worker="Codex worker (defaults to this channel's worker)")
+    async def slash_fast(interaction, worker: str = None):
+        if not (name := await guard(interaction, worker)):
+            return
+        await interaction.response.defer(thinking=True)
+        await reply(interaction, *await do_fast(name))
+
     @tree.command(name="model", description="Switch a worker's model")
     @describe(model="e.g. opus, sonnet, haiku", worker="Worker (defaults to this channel's worker)")
     async def slash_model(interaction, model: str, worker: str = None):
@@ -2807,7 +2863,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         etype = event.get("event_type", "")
         if etype == "claude.worker.turn_ended":
             name = event.get("worker", "")
-            channel_id = channel_from_chat(event.get("chat", "")) or channel_for_worker(name)
+            channel_id = worker_notification_channel(
+                cfg, name, event.get("chat", "")
+            )
             path = event.get("transcript_path", "")
             last_activity[name] = time.time()
             # Serialize per transcript: two Stop-hook events for one worker can
@@ -3056,7 +3114,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             worker = event.get("worker", "")
             if worker:
                 notified.add(worker)
-            channel_id = channel_from_chat(event.get("chat", ""))
+            channel_id = worker_notification_channel(
+                cfg, worker, event.get("chat", "")
+            )
             attachments = event.get("attachments") or []
             content = event.get("content") or ""
             if channel_id and (content or attachments):
