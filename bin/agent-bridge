@@ -996,7 +996,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     # --append-system-prompt; the protocol rides in as a user turn instead).
     codex_unprimed = set()
 
-    async def wait_ready(name, timeout=180):
+    async def wait_ready(name, timeout=180, harness=None):
         """Poll until the worker pane is idle and input-ready (or timeout).
 
         agent-worker start returns success even when its own readiness check
@@ -1006,7 +1006,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         compaction from being mistaken for readiness. Returns True if ready,
         False on timeout or if the worker died.
         """
-        harness = harness_of(name)
+        # Handoff capture must check the outgoing TUI even if the channel's
+        # configured target harness changes during the switch.
+        harness = harness or harness_of(name)
         stable = 0
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -1454,7 +1456,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
 
-    async def capture_handoff(name):
+    async def capture_handoff(name, outgoing_harness):
         """Ask the live worker to write a handoff note for the next engine,
         wait for it to finish, and return a short status suffix. Never
         blocks the switch — always returns, whatever happened."""
@@ -1464,7 +1466,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             except FileNotFoundError:
                 pass
             await deliver(name, HANDOFF_PROMPT.format(path=handoff_path(name)))
-            if not await wait_ready(name, timeout=HANDOFF_TIMEOUT_SECONDS):
+            if not await wait_ready(
+                name,
+                timeout=HANDOFF_TIMEOUT_SECONDS,
+                harness=outgoing_harness,
+            ):
                 return " ⚠️ handoff didn't finish in time — switching without it."
             if os.path.isfile(handoff_path(name)):
                 return " 📝 handoff captured for the next engine."
@@ -1502,19 +1508,22 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 "which only Claude can enforce — Codex runs full-YOLO and would "
                 "ignore its guardrails. Keeping it on Claude.", None,
             )
-        if harness_for(repo) == engine:
+        outgoing_harness = harness_for(repo)
+        if outgoing_harness == engine:
             return f"↔️ `{name}` is already on **{engine}** — nothing to change.", None
-        repo["harness"] = engine
-        save_config(cfg, config_path)
         # Stop the current worker so the next message revives it on the new
         # engine; a stale codex-prime flag from the old engine is cleared.
         handoff_note = ""
         if await asyncio.to_thread(worker_alive, name):
             if handoff:
-                handoff_note = await capture_handoff(name)
+                handoff_note = await capture_handoff(name, outgoing_harness)
             await asyncio.to_thread(worker_stop, name)
         elif handoff:
             handoff_note = " ℹ️ no running session to capture a handoff from."
+        # Persist the target only after capture. During capture, harness_of()
+        # must continue to describe the outgoing live TUI.
+        repo["harness"] = engine
+        save_config(cfg, config_path)
         codex_unprimed.discard(name)
         last_activity.pop(name, None)
         note = " **(YOLO mode)**" if engine == "codex" else ""
