@@ -534,6 +534,19 @@ class UsageLimitTests(unittest.TestCase):
             self.assertEqual(cb.check_usage_limit({}, state, 1, 2, now),
                              (True, None))
 
+    def test_state_persists_across_reload(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "usage.json")
+            state = {}
+            self.assertTrue(
+                cb.check_usage_limit(self.config(), state, 10, 7, 100)[0]
+            )
+            cb.save_usage_state(state, path)
+            loaded = cb.load_usage_state(path)
+            self.assertFalse(
+                cb.check_usage_limit(self.config(), loaded, 10, 7, 101)[0]
+            )
+
 
 class HarnessForTests(unittest.TestCase):
     def test_default_and_explicit(self):
