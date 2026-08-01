@@ -612,7 +612,8 @@ def compose_inbound(text, attachment_paths=None, reply_quote=None):
         listed = "\n".join(f"  - {p}" for p in paths)
         noun = "file" if len(paths) == 1 else "files"
         parts.append(
-            f"[Ned attached {len(paths)} {noun} — read {'it' if len(paths) == 1 else 'them'} "
+            f"[The Discord sender attached {len(paths)} {noun} — read "
+            f"{'it' if len(paths) == 1 else 'them'} "
             f"from disk:\n{listed}]"
         )
     return "\n\n".join(parts)
