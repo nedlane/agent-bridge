@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# Never commit a real bridge config — it carries Discord channel/user IDs and
+# local filesystem paths. The real one lives at ~/.config/claude-bridge/
+# config.json (outside this repo); config.example.json is the template.
+config.json
+!config.example.json
