@@ -127,6 +127,19 @@ worker still runs — it just falls back to the worker's own `discord-notify` fo
 replies (no silent-turn safety net). Your base `~/.codex/config.toml` is never
 modified.
 
+Provider quota refusal is the exception to the Stop-hook path: Codex can remain
+on its hard-limit screen without firing Stop at all. The bridge therefore arms
+a lightweight pane watcher for every delivered Claude/Codex turn. A hard-limit
+message is posted once to the mapped Discord channel with its reset time; an
+ordinary approaching-limit reminder is not. If Codex also opens its cheaper-
+model suggestion, `agent-worker` selects **Keep current model** so the harness
+does not silently alter the channel's configured model.
+
+The same startup driver handles Claude's one-time Bypass Permissions warning.
+Because the full-trust worker was explicitly launched with bypass enabled, it
+selects **Yes, I accept** and waits for the real input prompt before the bridge
+pastes the first Discord message.
+
 ## 2c. Antigravity has no relay yet
 
 `/harness antigravity` starts a worker through `antigravity-launch`, and

@@ -85,6 +85,23 @@ PATH that accepts those flags (or restrict yourself to owner channels and adapt
 `start_args()`/`profile_args()` accordingly). This is the one piece a stranger
 cannot get purely from this repo.
 
+### Unattended startup and provider limits
+
+The worker driver handles the provider dialogs that would otherwise strand a
+Discord-only session. On Claude's first full-trust launch it selects **Yes, I
+accept** on the one-time Bypass Permissions warning (the worker was explicitly
+launched in that mode). On Codex's approaching-limit model suggestion it keeps
+the configured model instead of silently switching. Folder-trust, large-resume,
+and Codex update dialogs are handled similarly.
+
+Actual provider quota failures are different from the bridge's configurable
+guest budgets. Claude and Codex can refuse a turn before their Stop hook fires,
+so the bridge watches each delivered turn for the provider's hard-limit screen.
+It posts the reported reset time to that worker's Discord channel once, keeps
+the configured model, and suggests switching model/harness or retrying after
+reset. Ordinary approaching-limit notices and optional reset-credit offers do
+not trigger a false alarm.
+
 ## Standalone install
 
 This installs the bridge directly on a host, without the dotfiles submodule.

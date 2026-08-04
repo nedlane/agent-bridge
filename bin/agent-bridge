@@ -1456,7 +1456,14 @@ def worker_alive(name):
 
 def worker_busy(name):
     r = _run(["agent-worker", "read", name, "30"], timeout=15)
-    return "esc to interrupt" in r.stdout
+    return worker_busy_text(r.stdout)
+
+
+def worker_busy_text(screen):
+    """Provider-neutral running-turn markers in an already captured pane."""
+    return any(marker in (screen or "") for marker in (
+        "esc to interrupt", "Compacting", "Working (",
+    ))
 
 
 def screen_is_compacting(screen):
@@ -1467,6 +1474,52 @@ def screen_is_compacting(screen):
     a plain running turn ("esc to interrupt") is not compaction and queues
     steering fine, so it must not match here."""
     return "Compacting" in screen
+
+
+def provider_usage_limit_notice(screen):
+    """A concise reset hint when a provider has refused work for quota.
+
+    This is intentionally based on the rendered TUI rather than a Stop-hook
+    payload: Codex does not end the turn (and therefore does not fire that
+    hook) when it lands on the usage-limit screen. Returns None for ordinary
+    rate-limit reminders such as "approaching" or reset-credit offers.
+    """
+    flat = " ".join((screen or "").split())
+    if not re.search(r"you(?:'|’)ve hit your (?:usage )?limit", flat,
+                     re.IGNORECASE):
+        return None
+    retry = re.search(
+        r"try again at ([A-Z][a-z]{2} \d{1,2}(?:st|nd|rd|th)?, "
+        r"\d{4} \d{1,2}:\d{2} [AP]M)", flat,
+    )
+    if retry:
+        return f"Provider says to try again at **{retry.group(1)}**."
+    reset = re.search(
+        r"(?:limit )?resets?(?: at| in)? ([^.!?]{1,80})", flat,
+        re.IGNORECASE,
+    )
+    if reset:
+        return f"Provider says the limit resets {reset.group(1).strip()}."
+    return "The provider did not report a reset time."
+
+
+def provider_limit_is_new(hint, baseline_hint=None, noticed_hint=None):
+    """False only for the already-reported limit present before this turn."""
+    return bool(hint and not (
+        hint == baseline_hint and hint == noticed_hint
+    ))
+
+
+def screen_has_rate_limit_dialog(screen):
+    """Whether Codex's approaching-limit model suggestion is active now."""
+    tail = "\n".join((screen or "").splitlines()[-15:])
+    nonempty = [line for line in tail.splitlines() if line.strip()]
+    return bool(
+        "Approaching rate limit" in tail
+        and "Keep current model" in tail
+        and nonempty
+        and "Press enter to confirm" in nonempty[-1]
+    )
 
 
 # The idle input-prompt glyph differs per engine: Claude Code uses "❯", Codex
@@ -1570,17 +1623,24 @@ def screen_is_ready(screen, harness="claude"):
                "Resume from summary", "Resume full session")
     if any(b in tail for b in dialogs):
         return False
-    # Once dismissed, the compact update menu can remain within the captured
-    # scrollback immediately above the real prompt. It is active only while
-    # its "Press enter" instruction is the bottom-most non-empty line.
+    # Once dismissed, these compact menus can remain within the captured
+    # scrollback immediately above the real prompt. They are active only while
+    # their confirmation instruction is the bottom-most non-empty line.
     nonempty = [line for line in tail.splitlines() if line.strip()]
+    bypass_active = (
+        "Yes, I accept" in tail
+        and nonempty
+        and "Enter to confirm" in nonempty[-1]
+        and "Esc to cancel" in nonempty[-1]
+    )
+    rate_limit_active = screen_has_rate_limit_dialog(screen)
     update_active = (
         "Update available!" in tail
         and "Skip until next version" in tail
         and nonempty
         and "Press enter to continue" in nonempty[-1]
     )
-    return not update_active
+    return not (bypass_active or rate_limit_active or update_active)
 
 
 def composer_is_empty(screen, harness="claude"):
@@ -1813,6 +1873,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     codex_totals = {}   # rollout path -> last cumulative token reading
     claude_usage_offsets = {}  # parent path -> child transcript byte offsets
     priced_path = {}    # worker name -> transcript path last priced for it
+    limit_watchers = {} # worker name -> provider-limit polling task
+    limit_noticed = {}  # worker name -> reset hint already posted
     if pricing is None:
         print(f"[bridge] no pricing table at {PRICING_FILE} — cost budgets off")
 
@@ -2124,6 +2186,96 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return f"📊 `{name}` — usage & session cost", [png]
         return f"📊 `{name}` usage:\n```\n{panel}\n```", None
 
+    async def notify_provider_limit(name, channel_id, screen=None):
+        """Post one provider-quota refusal per worker/reset window."""
+        if not channel_id:
+            return False
+        if screen is None:
+            screen = await asyncio.to_thread(worker_screen, name, 80)
+        hint = provider_usage_limit_notice(screen)
+        if not hint:
+            return False
+        if screen_has_rate_limit_dialog(screen):
+            # Preserve the configured model: option 1 silently switches to the
+            # suggested cheaper model, while Down selects "Keep current".
+            await asyncio.to_thread(worker_key, name, "Down", "Enter")
+        if limit_noticed.get(name) != hint:
+            limit_noticed[name] = hint
+            await post(
+                channel_id,
+                f"⛔ `{name}` hit the provider's usage limit and could not "
+                f"continue. {hint} Switch model/harness or retry after the "
+                "reset; the configured model was not changed.",
+            )
+        return True
+
+    async def watch_provider_limit(name, channel_id, baseline_hint=None):
+        """Catch quota failures that do not fire the provider's Stop hook."""
+        task = asyncio.current_task()
+        picked_up = False
+        stale_hint = baseline_hint
+        try:
+            # A turn may legitimately run for hours. The normal Stop event
+            # cancels this task; this long ceiling only bounds a missing-hook
+            # failure without abandoning long agent work.
+            for tick in range(12 * 60 * 60 // 5):
+                # Screen capture is enough on every pass; do the extra tmux
+                # liveness subprocess only once a minute.
+                if tick % 12 == 0 and not await asyncio.to_thread(
+                        worker_alive, name):
+                    return
+                screen = await asyncio.to_thread(worker_screen, name, 80)
+                hint = provider_usage_limit_notice(screen)
+                if hint:
+                    # A previous hard-limit line can remain in scrollback after
+                    # the user switches model/harness. Do not mistake that old
+                    # line for the result of this newly delivered turn.
+                    if provider_limit_is_new(
+                            hint, stale_hint, limit_noticed.get(name)):
+                        await notify_provider_limit(name, channel_id, screen)
+                        return
+                else:
+                    stale_hint = None
+                if worker_busy_text(screen):
+                    picked_up = True
+                elif picked_up and screen_is_ready(screen, harness_of(name)):
+                    return
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if limit_watchers.get(name) is task:
+                limit_watchers.pop(name, None)
+
+    def arm_limit_watcher(name, baseline_screen=None):
+        old = limit_watchers.pop(name, None)
+        if old:
+            old.cancel()
+        channel_id = channel_for_worker(name)
+        if channel_id and harness_of(name) in ("claude", "codex"):
+            limit_watchers[name] = asyncio.create_task(
+                watch_provider_limit(
+                    name, channel_id,
+                    provider_usage_limit_notice(baseline_screen),
+                )
+            )
+
+    def cancel_limit_watcher(name, clear_notice=False):
+        task = limit_watchers.pop(name, None)
+        if task:
+            task.cancel()
+        if clear_notice:
+            limit_noticed.pop(name, None)
+
+    async def scan_existing_provider_limits():
+        """Recover quota screens that predate a bridge restart/reconnect."""
+        for repo in cfg["repos"].values():
+            if harness_for(repo) not in ("claude", "codex"):
+                continue
+            name = repo["name"]
+            if await asyncio.to_thread(worker_alive, name):
+                await notify_provider_limit(name, channel_for_worker(name))
+
     async def deliver(name, text, message=None, typed=False, tag=None):
         # Messages go straight in even mid-turn — Claude Code (and Codex) queue
         # typed-while-running input as steering, which is what check-ins and
@@ -2178,6 +2330,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if message:
                 await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
             return
+        arm_limit_watcher(name, screen)
         if message:
             await message.add_reaction("✅")
 
@@ -2363,6 +2516,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # Shut down now and arm a fresh start: the next message begins a
         # brand-new session with no --continue, without resuming first. The
         # marker survives the stop.
+        cancel_limit_watcher(name, clear_notice=True)
         await asyncio.to_thread(worker_stop, name)
         await asyncio.to_thread(arm_fresh, name)
         # A fresh context deserves a fresh channel — wipe the old chatter.
@@ -2373,6 +2527,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         )
 
     async def do_stop(name):
+        cancel_limit_watcher(name, clear_notice=True)
         await asyncio.to_thread(worker_stop, name)
         return f"🛑 stopped `{name}`", None
 
@@ -2380,6 +2535,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         repo = repo_by_name(name)
         if not repo:
             return f"⚠️ no repo channel mapped for `{name}`", None
+        cancel_limit_watcher(name, clear_notice=True)
         await asyncio.to_thread(worker_stop, name)
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_for_worker(name), True,
@@ -2401,6 +2557,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return f"⚠️ no repo channel mapped for `{name}`", None
         channel_id = channel_for_worker(name)
         harness = harness_for(repo)
+        cancel_limit_watcher(name, clear_notice=True)
         await asyncio.to_thread(worker_stop, name)
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_id, False,
@@ -2504,6 +2661,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return f"↔️ `{name}` is already on **{engine}** — nothing to change.", None
         # Stop the current worker so the next message revives it on the new
         # engine; a stale codex-prime flag from the old engine is cleared.
+        cancel_limit_watcher(name, clear_notice=True)
         handoff_note = ""
         try:
             if await asyncio.to_thread(worker_alive, name):
@@ -2564,6 +2722,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not item:
             return f"⚠️ no repo channel mapped for `{name}`", None
         cid, _ = item
+        cancel_limit_watcher(name, clear_notice=True)
         await asyncio.to_thread(worker_stop, name)
         wiped = await asyncio.to_thread(remove_worker_state, name)
         del cfg["repos"][cid]
@@ -3168,6 +3327,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                       f"(bot missing the applications.commands scope?): {e}")
         print(f"[bridge] connected to Discord as {client.user} "
               f"({len(cfg['repos'])} repo channel(s) mapped, {synced} slash command(s))")
+        asyncio.create_task(scan_existing_provider_limits())
 
     @client.event
     async def on_message(message):
@@ -3268,6 +3428,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # the same pre-advance offset and post the reply twice.
             lock = turn_locks.setdefault(path or name, asyncio.Lock())
             async with lock:
+                # A provider quota refusal can either fire Stop with an empty
+                # reply or strand the TUI without firing Stop at all. Check the
+                # first case here; a per-turn watcher covers the second.
+                limit_hit = await notify_provider_limit(name, channel_id)
+                watcher = limit_watchers.pop(name, None)
+                if watcher:
+                    watcher.cancel()
+                if not limit_hit:
+                    limit_noticed.pop(name, None)
                 # Push-first: if the worker already messaged Ned this turn via
                 # discord-notify, the fallback stays silent — but the transcript
                 # offset is still consumed so a later fallback can't replay this
@@ -3282,7 +3451,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # Price the turn before any branch below advances the offset.
                 await charge_turn(name, channel_id, path,
                                   event.get("model"), codex_reply is not None)
-                if channel_id and worker_spoke:
+                if channel_id and limit_hit:
+                    if codex_reply is None:
+                        _, off = extract_new_reply(path, offsets.get(path, 0))
+                        offsets[path] = off
+                    print(f"[bridge] {name}: provider usage limit notified — "
+                          "fallback silent")
+                elif channel_id and worker_spoke:
                     if codex_reply is None:
                         _, off = extract_new_reply(path, offsets.get(path, 0))
                         offsets[path] = off

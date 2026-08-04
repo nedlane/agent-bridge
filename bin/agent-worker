@@ -89,6 +89,32 @@ dialog_tail() { tail -15 <<<"$1"; }
 # use the phrase "Do you trust…" (Claude: "…this folder?"; Codex: "…the
 # contents of this directory?"), so the shared substring catches both.
 is_trust_dialog() { grep -qE "trust this folder|Do you trust" <<<"$(dialog_tail "$1")"; }
+# Claude's first launch with --dangerously-skip-permissions has a separate,
+# one-time responsibility warning. Its default is "No, exit", so unlike the
+# folder-trust dialog this needs Down before Enter. Require the bottom-line
+# confirmation instruction as well as the option text: after dismissal the
+# warning can linger in scrollback and must not consume a key at the real
+# prompt.
+is_bypass_dialog() {
+  local tail last
+  tail="$(dialog_tail "$1")"
+  last="$(sed '/^[[:space:]]*$/d' <<<"$tail" | tail -1)"
+  grep -qF "Yes, I accept" <<<"$tail" \
+    && [[ "$last" == *"Enter to confirm"*"Esc to cancel"* ]]
+}
+# Codex can put a model-switch recommendation in front of the prompt as usage
+# runs low. Keep the configured model (Down selects option 2) instead of
+# silently changing it; the bridge separately reports an actual hard limit to
+# Discord. As with every compact menu, require its bottom-line instruction so
+# stale scrollback cannot consume keys at the real prompt.
+is_rate_limit_dialog() {
+  local tail last
+  tail="$(dialog_tail "$1")"
+  last="$(sed '/^[[:space:]]*$/d' <<<"$tail" | tail -1)"
+  grep -qF "Approaching rate limit" <<<"$tail" \
+    && grep -qF "Keep current model" <<<"$tail" \
+    && [[ "$last" == *"Press enter to confirm"* ]]
+}
 # A large Claude session resumed with --continue first asks how to resume
 # (summary vs full); its menu cursor is also a "❯", so it must not be mistaken
 # for the idle input prompt — it's a blocking dialog to dismiss. Codex resume
@@ -111,6 +137,7 @@ is_update_dialog() {
 is_ready() {
   grep -qE "❯|›" <<<"$1" \
     && ! is_busy "$1" && ! is_trust_dialog "$1" \
+    && ! is_bypass_dialog "$1" && ! is_rate_limit_dialog "$1" \
     && ! is_resume_dialog "$1" && ! is_update_dialog "$1"
 }
 
@@ -129,10 +156,12 @@ is_paste_chip() { grep -qiE '\[Pasted (text #[0-9]+|content [0-9]+ chars)' <<<"$
 
 # wait_until <name> <timeout> [text] — poll the worker's screen until it is
 # idle at its prompt (or [text] appears). Auto-dismisses the startup dialogs
-# that gate the prompt: the folder-trust dialog (the orchestrator chose the
+# that gate the prompt: Claude's one-time bypass-permissions warning (Down
+# selects "Yes, I accept"), the folder-trust dialog (the orchestrator chose the
 # directory deliberately via --dir), the resume-mode dialog on a large
 # --continue (Enter takes the pre-highlighted "Resume from summary" default),
-# and Codex's update menu (Down Down selects "Skip until next version").
+# Codex's rate-limit model suggestion (Down keeps the current model), and its
+# update menu (Down Down selects "Skip until next version").
 #
 # The done-condition must hold on TWO consecutive polls: right after a send
 # there is a short window where the message is echoed (marker visible) but
@@ -148,6 +177,10 @@ wait_until() {
     done_now=0
     if is_update_dialog "$screen"; then
       tmux send-keys -t "$(pane_for "$name")" Down Down Enter
+    elif is_bypass_dialog "$screen"; then
+      tmux send-keys -t "$(pane_for "$name")" Down Enter
+    elif is_rate_limit_dialog "$screen"; then
+      tmux send-keys -t "$(pane_for "$name")" Down Enter
     elif is_trust_dialog "$screen" || is_resume_dialog "$screen"; then
       tmux send-keys -t "$(pane_for "$name")" Enter
     elif [[ -n "$for_text" ]]; then
@@ -265,8 +298,9 @@ cmd_start() {
   echo "  dir:    $dir"
   echo "  log:    $state/output.log"
 
-  # Block until the worker is at its idle prompt (accepting the folder-trust
-  # dialog on the way), so the caller can send work immediately after.
+  # Block until the worker is at its idle prompt (accepting first-run safety
+  # and folder-trust dialogs on the way), so the caller can send work
+  # immediately after.
   if wait_until "$name" "$START_TIMEOUT"; then
     echo "  state:  ready"
   else

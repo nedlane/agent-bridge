@@ -743,6 +743,32 @@ class ScreenIsReadyHarnessTests(unittest.TestCase):
         screen = "› 1. Yes, continue\nDo you trust the contents of this directory?"
         self.assertFalse(cb.screen_is_ready(screen, "codex"))
 
+    def test_claude_bypass_warning_is_not_an_idle_prompt(self):
+        screen = (
+            "WARNING: Claude Code running in Bypass Permissions mode\n"
+            "❯ 1. No, exit\n"
+            "  2. Yes, I accept\n"
+            "Enter to confirm · Esc to cancel"
+        )
+        self.assertFalse(cb.screen_is_ready(screen, "claude"))
+        dismissed = screen + "\n" + "\n".join(
+            f"boot line {i}" for i in range(16)) + "\n❯ "
+        self.assertTrue(cb.screen_is_ready(dismissed, "claude"))
+
+    def test_codex_rate_limit_model_menu_is_not_an_idle_prompt(self):
+        screen = (
+            "Approaching rate limit\n"
+            "› 1. Switch to gpt-5.6-luna\n"
+            "  2. Keep current model\n"
+            "  3. Keep current model (never show again)\n"
+            "Press enter to confirm or esc to go back"
+        )
+        self.assertTrue(cb.screen_has_rate_limit_dialog(screen))
+        self.assertFalse(cb.screen_is_ready(screen, "codex"))
+        dismissed = screen + "\n\n› "
+        self.assertFalse(cb.screen_has_rate_limit_dialog(dismissed))
+        self.assertTrue(cb.screen_is_ready(dismissed, "codex"))
+
     def test_codex_update_menu_is_not_idle_prompt(self):
         screen = (
             "✨ Update available! 0.145.0 -> 0.146.0\n"
@@ -763,6 +789,39 @@ class ScreenIsReadyHarnessTests(unittest.TestCase):
             "› "
         )
         self.assertTrue(cb.screen_is_ready(screen, "codex"))
+
+
+class ProviderUsageLimitNoticeTests(unittest.TestCase):
+    def test_codex_hard_limit_includes_retry_time(self):
+        screen = (
+            "You've hit your usage limit. Upgrade to Pro, visit settings or "
+            "try again at Aug 8th, 2026 7:51 AM.\n"
+            "Approaching rate limit\n› 1. Switch model"
+        )
+        self.assertEqual(
+            cb.provider_usage_limit_notice(screen),
+            "Provider says to try again at **Aug 8th, 2026 7:51 AM**.",
+        )
+
+    def test_claude_limit_can_report_a_reset_hint(self):
+        self.assertEqual(
+            cb.provider_usage_limit_notice(
+                "You've hit your limit · resets in 2 hr 14 min."),
+            "Provider says the limit resets 2 hr 14 min.",
+        )
+
+    def test_approaching_and_reset_credit_messages_are_not_hard_limits(self):
+        self.assertIsNone(cb.provider_usage_limit_notice(
+            "Approaching rate limit — switch to a cheaper model?"))
+        self.assertIsNone(cb.provider_usage_limit_notice(
+            "You have 3 usage limit resets available. Run /usage to use one."))
+
+    def test_old_reported_limit_in_scrollback_is_not_a_new_turn_failure(self):
+        hint = "Provider says to try again at **Aug 8th, 2026 7:51 AM**."
+        self.assertFalse(cb.provider_limit_is_new(hint, hint, hint))
+        self.assertTrue(cb.provider_limit_is_new(hint, None, hint))
+        self.assertTrue(cb.provider_limit_is_new(hint, hint, None))
+        self.assertFalse(cb.provider_limit_is_new(None, hint, hint))
 
 
 class ComposerIsEmptyHarnessTests(unittest.TestCase):
