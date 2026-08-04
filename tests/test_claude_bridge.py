@@ -1166,6 +1166,118 @@ class ClaudeTurnUsageTests(unittest.TestCase):
         self.assertIsNone(model)
 
 
+class ClaudeSessionUsageTests(unittest.TestCase):
+    def entry(self, out, model, speed="standard", cache_read=0):
+        return json.dumps({
+            "type": "assistant",
+            "message": {"model": model, "usage": {
+                "input_tokens": 2, "output_tokens": out,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": 7,
+                "speed": speed,
+            }},
+        }) + "\n"
+
+    def make_session(self, root):
+        main = os.path.join(root, "session.jsonl")
+        subagents = os.path.join(root, "session", "subagents")
+        workflow = os.path.join(subagents, "workflows", "wf-one")
+        os.makedirs(workflow)
+        child = os.path.join(subagents, "agent-one.jsonl")
+        nested = os.path.join(workflow, "agent-two.jsonl")
+        with open(main, "w") as f:
+            f.write(self.entry(100, "claude-opus-5"))
+        with open(child, "w") as f:
+            f.write(self.entry(40, "claude-sonnet-5", cache_read=30))
+        with open(nested, "w") as f:
+            f.write(self.entry(10, "claude-haiku-4-5", speed="fast"))
+        return main, child, nested
+
+    def test_finds_direct_and_workflow_subagents_but_not_sibling_sessions(self):
+        with tempfile.TemporaryDirectory() as root:
+            main, child, nested = self.make_session(root)
+            sibling = os.path.join(root, "other.jsonl")
+            open(sibling, "w").close()
+            self.assertEqual(
+                set(cb.claude_session_transcripts(main)),
+                {main, child, nested},
+            )
+
+    def test_session_tokens_include_every_subagent_transcript(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, cb.claude_project_slug("/w/p"))
+            os.makedirs(project)
+            main, _, _ = self.make_session(project)
+            tokens, model, path, fast_share = cb.session_tokens(
+                "claude", "/w/p", {"claude": root})
+            self.assertEqual(path, main)
+            self.assertEqual(model, "claude-opus-5")
+            self.assertEqual(tokens["output"], 150)
+            self.assertEqual(tokens["cache_read"], 30)
+            self.assertAlmostEqual(fast_share, 10 / 150)
+
+    def test_prices_each_subagent_with_its_own_model_and_tier(self):
+        with tempfile.TemporaryDirectory() as root:
+            main, _, _ = self.make_session(root)
+            pricing = {
+                "fast_multiplier": 2.0,
+                "fallback": dict.fromkeys(cb.TOKEN_FIELDS, 0.0),
+                "models": {
+                    "claude-opus-5": {"input": 0, "output": 1,
+                                       "cache_read": 0, "cache_write": 0},
+                    "claude-sonnet-5": {"input": 0, "output": 2,
+                                         "cache_read": 0, "cache_write": 0},
+                    "claude-haiku-4-5": {"input": 0, "output": 3,
+                                          "cache_read": 0, "cache_write": 0},
+                },
+            }
+            usage = cb.claude_session_usage(main)
+            # 100*1 parent + 40*2 child + 10*3*2 fast workflow child.
+            self.assertEqual(cb.claude_usage_cost(usage, pricing), 240)
+
+    def test_delta_counts_a_new_subagent_without_rebilling_the_parent(self):
+        with tempfile.TemporaryDirectory() as root:
+            main = os.path.join(root, "session.jsonl")
+            with open(main, "w") as f:
+                f.write(self.entry(100, "claude-opus-5"))
+            baseline = cb.claude_session_usage(main)
+            subagents = os.path.join(root, "session", "subagents")
+            os.makedirs(subagents)
+            child = os.path.join(subagents, "agent-one.jsonl")
+            with open(child, "w") as f:
+                f.write(self.entry(25, "claude-sonnet-5"))
+            current = cb.claude_session_usage(main)
+            pricing = {
+                "fast_multiplier": 2.0,
+                "fallback": dict.fromkeys(cb.TOKEN_FIELDS, 0.0),
+                "models": {
+                    "claude-opus-5": {"input": 0, "output": 10,
+                                       "cache_read": 0, "cache_write": 0},
+                    "claude-sonnet-5": {"input": 0, "output": 2,
+                                         "cache_read": 0, "cache_write": 0},
+                },
+            }
+            self.assertEqual(
+                cb.claude_usage_cost(current, pricing, baseline), 50)
+
+    def test_usage_window_advances_only_past_complete_lines(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "session.jsonl")
+            first = self.entry(100, "claude-opus-5")
+            with open(path, "w") as f:
+                f.write(first)
+                f.write('{"type":"assistant"')
+            groups, offset = cb.claude_usage_window(path)
+            self.assertEqual(groups[("claude-opus-5", False)]["output"], 100)
+            self.assertEqual(offset, len(first.encode()))
+            with open(path, "a") as f:
+                f.write("}\n")  # completes junk JSON without a message/usage
+                f.write(self.entry(25, "claude-sonnet-5"))
+            groups, offset = cb.claude_usage_window(path, offset)
+            self.assertEqual(groups[("claude-sonnet-5", False)]["output"], 25)
+            self.assertEqual(offset, os.path.getsize(path))
+
+
 class CodexSessionTotalsTests(unittest.TestCase):
     def rollout(self, path, readings):
         with open(path, "w") as f:

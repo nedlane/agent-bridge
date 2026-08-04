@@ -329,13 +329,15 @@ a rate limit, and applies on every engine.
 so overage is bounded by one turn — a user can always blow through their
 budget with a single expensive turn.
 
-**Where the numbers come from.** At turn end the bridge reads the same
-transcript window it already parses for the reply — Claude's per-message
-`usage`, or the running `total_token_usage` in Codex's rollout file — and
-prices it against `pricing.json`.
+**Where the numbers come from.** At turn end the bridge reads Claude's
+per-message `usage` from the parent transcript and every nested subagent or
+workflow transcript belonging to that session. Codex supplies a running
+`total_token_usage` in its rollout file. Both are priced against
+`pricing.json`.
 
-Both engines report cumulatively, so a turn is the delta against the previous
-reading, and a session file with no previous reading needs a rule:
+The bridge keeps byte offsets for Claude's append-only transcript files and a
+cumulative reading for Codex, so each turn is the delta from the previous
+reading. A session with no previous reading needs a rule:
 
 - **A new session** (`/clear`, `/fresh`, a harness switch) genuinely starts at
   zero, so it's priced in full from zero. Skipping it would make `/clear` a
@@ -357,9 +359,9 @@ makes the total track spend.
 exactly 2x standard per-token rates — OpenAI's Fast mode (`service_tier`
 `priority`/`fast`, renamed from Priority processing on 2026-07-30) and
 Anthropic's fast mode on Opus 5 ($10/$50 vs $5/$25). `pricing.json` carries
-that as `fast_multiplier`, and cost is blended by the share of work actually
-served fast. Claude records `speed` per message so its share is weighted by
-output tokens; Codex reports only cumulative session totals, so its share is
+that as `fast_multiplier`. Claude records the model and `speed` on every
+message, so parent and subagent work is priced exactly in its own model/tier
+group. Codex reports only cumulative session totals, so its tier share is
 weighted by response count — close, but an approximation. Note the Codex
 worker profile ships with `service_tier = "fast"`, so Codex workers run fast
 by default.
@@ -453,7 +455,7 @@ channel you run it in.
 | `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
-| `/cost [worker]` | What this channel's current worker session has cost so far — priced from the whole transcript, not just turns seen since the daemon started. Shows the token breakdown. Owner or a channel's editors. |
+| `/cost [worker]` | What this channel's current worker session has cost so far — priced from the parent plus all nested subagent/workflow transcripts, not just turns seen since the daemon started. Shows the token breakdown and subagent count. Owner or a channel's editors. |
 | `/limits` | Show **your own** usage against the limits configured for this channel (messages and cost). Ephemeral; open to anyone who can talk in the channel. |
 | `/checkin [worker]` | Ask a running worker to send a 3–5 line progress update. |
 | `/addrepo <name> <path> [category]` | Create `#<name>` and map it to a repo directory. Optional `category` files it under an existing category (matched loosely, ignoring emoji/case) or creates a new one; omitted, it lands in the default inbox category. |

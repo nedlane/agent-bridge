@@ -837,6 +837,56 @@ def claude_turn_usage(transcript_path, offset=0):
     return tokens, model
 
 
+def claude_usage_window(transcript_path, offset=0):
+    """Claude usage after a byte offset, grouped by model and service tier.
+
+    A session can use a different model for each subagent, and fast mode is
+    recorded per assistant message.  Keeping those dimensions separate lets
+    /cost price each chunk at the rate it actually used instead of applying
+    the parent agent's model and blended tier to the whole session. Returns
+    the groups and the offset after the last complete JSONL line.
+    """
+    groups = {}
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(offset)
+            buf = f.read()
+    except OSError:
+        return groups, offset
+    end = buf.rfind(b"\n")
+    if end < 0:
+        return groups, offset
+    for line in buf[: end + 1].splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant":
+            continue
+        message = entry.get("message") or {}
+        usage = message.get("usage") or {}
+        fast = usage.get("speed") == "fast" or usage.get(
+            "service_tier") in ("priority", "fast")
+        key = (message.get("model"), fast)
+        tokens = groups.setdefault(key, dict.fromkeys(TOKEN_FIELDS, 0))
+        for field, source in (
+            ("input", "input_tokens"),
+            ("output", "output_tokens"),
+            ("cache_read", "cache_read_input_tokens"),
+            ("cache_write", "cache_creation_input_tokens"),
+        ):
+            try:
+                tokens[field] += int(usage.get(source) or 0)
+            except (TypeError, ValueError):
+                continue
+    return groups, offset + end + 1
+
+
+def claude_usage_groups(transcript_path, offset=0):
+    """Usage groups only; convenient for whole-session accounting."""
+    return claude_usage_window(transcript_path, offset)[0]
+
+
 CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
 CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 
@@ -868,6 +918,80 @@ def newest_claude_transcript(directory, root=None):
     except OSError:
         return None
     return max(files, key=os.path.getmtime) if files else None
+
+
+def claude_session_transcripts(transcript_path):
+    """The parent transcript and every subagent transcript for its session.
+
+    Claude stores children below ``<session uuid>/subagents`` beside the
+    parent's ``<session uuid>.jsonl``.  Workflows add more nesting below that,
+    so this deliberately walks recursively rather than assuming one level.
+    """
+    if not transcript_path:
+        return []
+    paths = [transcript_path]
+    session_dir = os.path.splitext(transcript_path)[0]
+    subagents = os.path.join(session_dir, "subagents")
+    try:
+        for dirpath, _, names in os.walk(subagents):
+            paths.extend(
+                os.path.join(dirpath, name)
+                for name in sorted(names)
+                if name.endswith(".jsonl")
+            )
+    except OSError:
+        pass
+    return paths
+
+
+def claude_session_usage(transcript_path):
+    """Usage groups for every transcript belonging to a Claude session."""
+    return {
+        path: claude_usage_groups(path)
+        for path in claude_session_transcripts(transcript_path)
+    }
+
+
+def summarize_claude_usage(usage):
+    """Return aggregate tokens, parent model, and output-weighted fast share."""
+    tokens = dict.fromkeys(TOKEN_FIELDS, 0)
+    parent_model = None
+    fast_output = total_output = 0
+    for index, groups in enumerate((usage or {}).values()):
+        for (model, fast), counts in groups.items():
+            if index == 0 and model:
+                parent_model = model
+            for field in TOKEN_FIELDS:
+                try:
+                    tokens[field] += int(counts.get(field) or 0)
+                except (TypeError, ValueError):
+                    continue
+            try:
+                output = max(0, int(counts.get("output") or 0))
+            except (TypeError, ValueError):
+                output = 0
+            total_output += output
+            if fast:
+                fast_output += output
+    return tokens, parent_model, (
+        fast_output / total_output if total_output else 0.0
+    )
+
+
+def claude_usage_cost(usage, pricing, previous=None):
+    """Price Claude usage, optionally as a delta from a prior snapshot."""
+    total = 0.0
+    mult = fast_multiplier(pricing)
+    previous = previous or {}
+    for path, groups in (usage or {}).items():
+        old_groups = previous.get(path) or {}
+        for (model, fast), tokens in groups.items():
+            delta = subtract_tokens(tokens, old_groups.get((model, fast)))
+            total += token_cost(
+                delta, rates_for_model(pricing, model),
+                1.0 if fast else 0.0, mult,
+            )
+    return total
 
 
 def newest_codex_rollout(directory, root=None, scan_limit=300):
@@ -912,8 +1036,8 @@ def session_tokens(harness, directory, roots=None):
     path = newest_claude_transcript(directory, roots.get("claude"))
     if not path:
         return None, None, None, 0.0
-    tokens, model = claude_turn_usage(path, 0)
-    return tokens, model, path, claude_fast_share(path, 0)
+    tokens, model, share = summarize_claude_usage(claude_session_usage(path))
+    return tokens, model, path, share
 
 
 def format_tokens(n):
@@ -1687,6 +1811,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     pricing = load_pricing()
     turn_owner = {}     # worker name -> (channel id, user id) that started it
     codex_totals = {}   # rollout path -> last cumulative token reading
+    claude_usage_offsets = {}  # parent path -> child transcript byte offsets
     priced_path = {}    # worker name -> transcript path last priced for it
     if pricing is None:
         print(f"[bridge] no pricing table at {PRICING_FILE} — cost budgets off")
@@ -1734,10 +1859,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         transcript offset, so the window priced here is exactly the window
         that turn wrote.
 
-        Both engines report cumulatively — Claude by byte offset, Codex by
-        running session totals — so a turn is the delta against the previous
-        reading, and a path with no previous reading needs a rule. There are
-        two such cases and they are NOT the same:
+        Both engines are priced as deltas — Claude from append-only windows in
+        the parent plus all of its subagent transcripts, Codex from running
+        session totals — and a path with no previous reading needs a rule.
+        There are two such cases and they are NOT the same:
 
         - The path changed for a worker we have already priced. That is a new
           session (`/clear`, `/fresh`, a harness switch), which genuinely
@@ -1771,18 +1896,23 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     baseline = dict.fromkeys(TOKEN_FIELDS, 0)
                 tokens = subtract_tokens(totals, baseline)
                 share = codex_priority_share(path)
+                cost = token_cost(tokens, rates_for_model(pricing, model),
+                                  share, fast_multiplier(pricing))
             else:
-                start = offsets.get(path)
-                if start is None:
-                    if not fresh_session:
-                        return
-                    start = 0
-                tokens, seen_model = await asyncio.to_thread(
-                    claude_turn_usage, path, start)
+                unseen = path not in claude_usage_offsets
+                child_offsets = claude_usage_offsets.setdefault(path, {})
+                usage = {}
+                for child_path in claude_session_transcripts(path):
+                    start = child_offsets.get(child_path, 0)
+                    groups, end = await asyncio.to_thread(
+                        claude_usage_window, child_path, start)
+                    child_offsets[child_path] = end
+                    usage[child_path] = groups
+                if unseen and not fresh_session:
+                    return
+                _, seen_model, _ = summarize_claude_usage(usage)
                 model = seen_model or model
-                share = await asyncio.to_thread(claude_fast_share, path, start)
-            cost = token_cost(tokens, rates_for_model(pricing, model),
-                              share, fast_multiplier(pricing))
+                cost = claude_usage_cost(usage, pricing)
             if cost <= 0:
                 return
             channel, user = owner if owner else (channel_id, None)
@@ -2781,8 +2911,30 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 "⚠️ no pricing table loaded — see scripts/refresh-pricing.py")
             return
         harness = harness_for(repo)
-        tokens, model, path, fast_share = await asyncio.to_thread(
-            session_tokens, harness, repo["dir"])
+        subagent_count = 0
+        models = []
+        if harness == "claude":
+            path = await asyncio.to_thread(
+                newest_claude_transcript, repo["dir"])
+            usage = (await asyncio.to_thread(claude_session_usage, path)
+                     if path else None)
+            if usage:
+                tokens, model, fast_share = summarize_claude_usage(usage)
+                subagent_count = max(0, len(usage) - 1)
+                models = list(dict.fromkeys(
+                    group_model
+                    for groups in usage.values()
+                    for group_model, _ in groups
+                    if group_model
+                ))
+                total = claude_usage_cost(usage, pricing)
+            else:
+                tokens = model = None
+                fast_share = 0.0
+        else:
+            tokens, model, path, fast_share = await asyncio.to_thread(
+                session_tokens, harness, repo["dir"])
+            total = None
         if not tokens:
             await interaction.followup.send(
                 f"💰 no session found on disk for `{name}` — it may not have "
@@ -2791,13 +2943,22 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         model = model or (harness == "codex" and "gpt-5.6") or None
         rates = rates_for_model(pricing, model)
         mult = fast_multiplier(pricing)
-        total = token_cost(tokens, rates, fast_share, mult)
-        known = bool((pricing.get("models") or {}).get(str(model or "")))
+        if total is None:
+            total = token_cost(tokens, rates, fast_share, mult)
+        models = models or ([model] if model else [])
+        known = bool(models) and all(
+            (pricing.get("models") or {}).get(str(used_model))
+            for used_model in models
+        )
+        model_label = " + ".join(models) if models else "unknown model"
+        agent_note = (f" · {subagent_count} subagent transcript"
+                      f"{'s' if subagent_count != 1 else ''}"
+                      if subagent_count else "")
         fast_note = (f" · {fast_share:.0%} fast tier @{mult:g}x"
                      if fast_share > 0.005 else "")
         lines = [
             f"💰 `{name}` — **${total:.2f}** this session "
-            f"({model or 'unknown model'}{'' if known else ', fallback rate'})",
+            f"({model_label}{'' if known else ', fallback rate'}{agent_note})",
             f"-# output {format_tokens(tokens['output'])} · "
             f"input {format_tokens(tokens['input'])} · "
             f"cache read {format_tokens(tokens['cache_read'])} · "
@@ -3374,6 +3535,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # cumulative reading here forever.
             for path in [p for p in codex_totals if p and not os.path.exists(p)]:
                 codex_totals.pop(path, None)
+            for path in [p for p in claude_usage_offsets
+                         if p and not os.path.exists(p)]:
+                claude_usage_offsets.pop(path, None)
             idle_s = cfg["idle_minutes"] * 60
             for repo in list(cfg["repos"].values()):
                 name = repo["name"]
