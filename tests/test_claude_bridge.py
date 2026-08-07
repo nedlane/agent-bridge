@@ -12,6 +12,7 @@ import hmac
 import importlib.util
 import json
 import os
+import shlex
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -1705,6 +1706,22 @@ class UsageSummaryTests(unittest.TestCase):
         cfg = {"usage_limits": {"channels": {"10": {"blocked": True}}}}
         self.assertIn("blocked",
                       " ".join(cb.usage_summary(cfg, {}, 10, 7, 100)))
+
+
+class SshWrapTests(unittest.TestCase):
+    def test_wraps_with_ssh_and_quotes(self):
+        out = cb.ssh_wrap("me@hc-002", ["agent-worker", "read", "app", "40"])
+        self.assertEqual(out[:3], ["ssh", "me@hc-002", "--"])
+        # remainder is one shell-quoted string safe to hand to the remote shell
+        self.assertIn("agent-worker read app 40", " ".join(out[3:]))
+
+    def test_forwards_env_prefix(self):
+        out = cb.ssh_wrap("h", ["agent-worker", "send", "a", "hi there"],
+                          env={"CLAUDE_WORKER": "a"})
+        remote = out[3]
+        self.assertTrue(remote.startswith("env CLAUDE_WORKER=a "))
+        # embedded spaces/quotes in the message are preserved through quoting
+        self.assertIn(shlex.quote("hi there"), remote)
 
 
 if __name__ == "__main__":

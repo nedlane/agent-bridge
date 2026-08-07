@@ -92,6 +92,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -1469,6 +1470,21 @@ def _run(args, timeout=180, input_text=None):
         # Surface "agent-worker not on PATH" and hangs as a failed result so
         # callers report them to the channel instead of dying in on_message.
         return subprocess.CompletedProcess(args, 127, stdout="", stderr=str(exc))
+
+
+def ssh_wrap(target, argv, env=None):
+    """argv to run `argv` (an agent-worker command) on `target` over SSH.
+
+    SSH runs its command string in a login shell, so we build ONE shell-safe
+    string (each token shlex-quoted) and forward any needed env explicitly as an
+    `env NAME=VAL` prefix — the caller's environment does not cross SSH.
+    """
+    assignments = "".join(
+        f"{shlex.quote(k)}={shlex.quote(str(v))} " for k, v in (env or {}).items()
+    )
+    prefix = f"env {assignments}" if env else ""
+    remote = prefix + " ".join(shlex.quote(a) for a in argv)
+    return ["ssh", target, "--", remote]
 
 
 def worker_alive(name):
