@@ -247,22 +247,16 @@ cmd_start() {
     launcher="$(command -v codex-launch || true)"
     [[ -n "$launcher" ]] || launcher="$(dirname "$(readlink -f "$0")")/codex-launch"
     [[ -x "$launcher" ]] || die "codex-launch not found (run scripts/link.sh)"
-    # Codex resume is a launcher flag; the Discord protocol is injected by the
-    # bridge as the worker's first message, not a launch flag.
-    (( resume )) && launcher_args+=(--resume)
   elif [[ "$harness" == antigravity ]]; then
     command -v agy >/dev/null 2>&1 || die "agy CLI not found on PATH"
     launcher="$(command -v antigravity-launch || true)"
     [[ -n "$launcher" ]] || launcher="$(dirname "$(readlink -f "$0")")/antigravity-launch"
     [[ -x "$launcher" ]] || die "antigravity-launch not found (run scripts/link.sh)"
-    (( resume )) && launcher_args+=(--resume)
   else
     command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
     launcher="$(command -v claude-launch || true)"
     [[ -n "$launcher" ]] || launcher="${DOTFILES_DIR:-$HOME/dotfiles}/shared/bin/claude-launch"
     [[ -x "$launcher" ]] || die "claude-launch not found (run scripts/link.sh)"
-    # Claude resumes with --continue, passed through claude-launch to claude.
-    (( resume )) && extra=(--continue ${extra[@]+"${extra[@]}"})
   fi
 
   # One shell-safe command string: tmux joins its trailing args with spaces,
@@ -275,10 +269,33 @@ cmd_start() {
   # a worker at an alternate Codex home, e.g. for tests) rides along when set.
   local env_prefix=(env "CLAUDE_WORKER=$name")
   [[ -n "${CODEX_HOME:-}" ]] && env_prefix+=("CODEX_HOME=$CODEX_HOME")
+
+  # Build the launch command string for a given resume choice. Resume is
+  # engine-specific and applied here (not in the launcher-selection block) so
+  # the no-conversation self-heal below can rebuild a fresh (non-resume)
+  # command from the same definition: Claude resumes with --continue, Codex and
+  # Antigravity with a --resume launcher flag; the Discord protocol is injected
+  # by the bridge as the worker's first message, not a launch flag.
+  build_cmd() {  # $1: 1 to resume the prior conversation, 0 for a fresh session
+    local want_resume="$1" la=(${launcher_args[@]+"${launcher_args[@]}"}) \
+          ex=(${extra[@]+"${extra[@]}"})
+    if (( want_resume )); then
+      case "$harness" in
+        claude)            ex=(--continue ${ex[@]+"${ex[@]}"}) ;;
+        codex|antigravity) la+=(--resume) ;;
+      esac
+    fi
+    printf '%q ' "${env_prefix[@]}" "$launcher" \
+      --label "worker:$name" ${la[@]+"${la[@]}"} ${ex[@]+"${ex[@]}"}
+  }
+
+  # Remember the log size before launch so the self-heal only inspects output
+  # this launch produced, never a stale marker from an earlier failed start.
+  # A brand-new worker has no log yet, so default to 0 (whole, empty file).
+  local log_start=0
+  [[ -f "$state/output.log" ]] && log_start="$(wc -c < "$state/output.log")"
   local cmd
-  cmd="$(printf '%q ' "${env_prefix[@]}" "$launcher" \
-    --label "worker:$name" ${launcher_args[@]+"${launcher_args[@]}"} \
-    ${extra[@]+"${extra[@]}"})"
+  cmd="$(build_cmd "$resume")"
   tmux new-session -d -s "$session" -c "$dir" "$cmd"
   tmux pipe-pane -t "=$session:" -o "cat >> $(printf '%q' "$state/output.log")"
 
@@ -301,13 +318,34 @@ cmd_start() {
   # Block until the worker is at its idle prompt (accepting first-run safety
   # and folder-trust dialogs on the way), so the caller can send work
   # immediately after.
-  if wait_until "$name" "$START_TIMEOUT"; then
+  local rc=0
+  wait_until "$name" "$START_TIMEOUT" || rc=$?
+  # Self-heal a dead resume. A worker's meta exists the moment it is
+  # registered, so should_resume() may ask for --continue on a repo that has
+  # no conversation yet (freshly registered, or a cleared session). Only after
+  # wait_until dismisses the startup dialogs does --continue actually run,
+  # print "No conversation found to continue", and exit (rc 1). Rather than
+  # fail — which leaves the bridge's wedge-recovery to relaunch with --continue
+  # again and loop — relaunch once WITHOUT resume for a clean fresh start.
+  # Claude-only: this is the exact string Claude emits; Codex/Antigravity
+  # signal a failed resume differently and are not retried here.
+  if (( rc == 1 )) && (( resume )) && [[ "$harness" == claude ]] \
+     && tail -c "+$((log_start + 1))" "$state/output.log" 2>/dev/null \
+        | grep -qF "No conversation found to continue"; then
+    echo "  note:   no conversation to resume; starting a fresh session" >&2
+    log_start="$(wc -c < "$state/output.log" 2>/dev/null || echo 0)"
+    cmd="$(build_cmd 0)"
+    tmux new-session -d -s "$session" -c "$dir" "$cmd"
+    tmux pipe-pane -t "=$session:" -o "cat >> $(printf '%q' "$state/output.log")"
+    rc=0
+    wait_until "$name" "$START_TIMEOUT" || rc=$?
+  fi
+  if (( rc == 0 )); then
     echo "  state:  ready"
+  elif (( rc == 1 )); then
+    die "worker '$name' exited during startup (check $state/output.log)"
   else
-    case $? in
-      1) die "worker '$name' exited during startup (check $state/output.log)" ;;
-      *) echo "  state:  still starting after ${START_TIMEOUT}s — check with: agent-worker read $name" >&2 ;;
-    esac
+    echo "  state:  still starting after ${START_TIMEOUT}s — check with: agent-worker read $name" >&2
   fi
 }
 

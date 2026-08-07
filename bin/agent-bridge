@@ -2315,9 +2315,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # Carry the channel's capability profile AND engine through the
                 # restart — omitting either would silently relaunch a restricted
                 # (utility/greeter) worker as full-trust owner, or a Codex worker
-                # as Claude.
+                # as Claude. Resume per the worker's own state instead of forcing
+                # it: a worker with no resumable conversation (fresh repo, or a
+                # /fresh-armed one) must NOT be relaunched with --continue, or it
+                # wedges on "No conversation found to continue" and this recovery
+                # loops. agent-worker also self-heals a dead resume, so this is
+                # belt-and-suspenders.
                 r2 = await asyncio.to_thread(
-                    worker_start, name, repo["dir"], channel_id, True,
+                    worker_start, name, repo["dir"], channel_id,
+                    should_resume(worker_has_state(name), fresh_pending(name)),
                     repo.get("profile", "owner"), harness_for(repo),
                 )
                 if r2.returncode == 0:
