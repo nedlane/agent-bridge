@@ -239,7 +239,8 @@ class DirExistsForHostTests(unittest.TestCase):
         finally:
             cb._run = orig
         self.assertEqual(
-            seen["args"], ["ssh", "me@hc-002", "test", "-d", "/srv/repo"]
+            seen["args"],
+            ["ssh", *cb.SSH_OPTS, "me@hc-002", "test", "-d", "/srv/repo"],
         )
         self.assertTrue(result)
 
@@ -1872,15 +1873,36 @@ class UsageSummaryTests(unittest.TestCase):
 class SshWrapTests(unittest.TestCase):
     def test_wraps_with_ssh_and_quotes(self):
         out = cb.ssh_wrap("me@hc-002", ["agent-worker", "read", "app", "40"])
-        self.assertEqual(out[:3], ["ssh", "me@hc-002", "--"])
+        self.assertEqual(out[0], "ssh")
+        n = len(cb.SSH_OPTS)
+        self.assertEqual(out[1:1 + n], cb.SSH_OPTS)
+        self.assertEqual(out[1 + n], "me@hc-002")
+        self.assertEqual(out[2 + n], "--")
         # remainder is one shell-quoted string safe to hand to the remote shell
-        self.assertIn("agent-worker read app 40", " ".join(out[3:]))
+        remote = out[3 + n]
+        self.assertIn("agent-worker read app 40", remote)
+
+    def test_includes_connect_timeout_and_batch_mode(self):
+        out = cb.ssh_wrap("me@hc-002", ["agent-worker", "read", "app", "40"])
+        self.assertEqual(
+            out, ["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+                  "me@hc-002", "--", out[-1]]
+        )
+        self.assertIn("-o ConnectTimeout=8 -o BatchMode=yes", " ".join(out))
+
+    def test_remote_command_sets_path_first(self):
+        out = cb.ssh_wrap("h", ["agent-worker", "status", "app"])
+        remote = out[-1]
+        self.assertTrue(remote.startswith('PATH="$HOME/.local/bin:$PATH" '))
+        self.assertIn("agent-worker status app", remote)
 
     def test_forwards_env_prefix(self):
         out = cb.ssh_wrap("h", ["agent-worker", "send", "a", "hi there"],
                           env={"CLAUDE_WORKER": "a"})
-        remote = out[3]
-        self.assertTrue(remote.startswith("env CLAUDE_WORKER=a "))
+        remote = out[-1]
+        self.assertTrue(
+            remote.startswith('PATH="$HOME/.local/bin:$PATH" env CLAUDE_WORKER=a ')
+        )
         # embedded spaces/quotes in the message are preserved through quoting
         self.assertIn(shlex.quote("hi there"), remote)
 
@@ -1901,7 +1923,11 @@ class RunWorkerCmdTests(unittest.TestCase):
 
     def test_remote_wraps_with_ssh(self):
         cb.run_worker_cmd("me@h", ["agent-worker", "stop", "a"])
-        self.assertEqual(self.seen["args"][:3], ["ssh", "me@h", "--"])
+        args = self.seen["args"]
+        self.assertEqual(args[0], "ssh")
+        n = len(cb.SSH_OPTS)
+        self.assertEqual(args[1:1 + n], cb.SSH_OPTS)
+        self.assertEqual(args[1 + n:3 + n], ["me@h", "--"])
 
 
 class WorkerPollHostAwareTests(unittest.TestCase):
@@ -1928,8 +1954,12 @@ class WorkerPollHostAwareTests(unittest.TestCase):
 
     def test_worker_alive_remote_ssh_wrapped(self):
         cb.worker_alive("app", host_target="me@hc-002")
-        self.assertEqual(self.calls[-1][:3], ["ssh", "me@hc-002", "--"])
-        self.assertIn("agent-worker status app", self.calls[-1][3])
+        args = self.calls[-1]
+        n = len(cb.SSH_OPTS)
+        self.assertEqual(args[0], "ssh")
+        self.assertEqual(args[1:1 + n], cb.SSH_OPTS)
+        self.assertEqual(args[1 + n:3 + n], ["me@hc-002", "--"])
+        self.assertIn("agent-worker status app", args[3 + n])
 
     def test_worker_busy_local_argv_unchanged(self):
         cb.worker_busy("app")
@@ -1937,8 +1967,12 @@ class WorkerPollHostAwareTests(unittest.TestCase):
 
     def test_worker_busy_remote_ssh_wrapped(self):
         cb.worker_busy("app", host_target="me@hc-002")
-        self.assertEqual(self.calls[-1][:3], ["ssh", "me@hc-002", "--"])
-        self.assertIn("agent-worker read app 30", self.calls[-1][3])
+        args = self.calls[-1]
+        n = len(cb.SSH_OPTS)
+        self.assertEqual(args[0], "ssh")
+        self.assertEqual(args[1:1 + n], cb.SSH_OPTS)
+        self.assertEqual(args[1 + n:3 + n], ["me@hc-002", "--"])
+        self.assertIn("agent-worker read app 30", args[3 + n])
 
 
 class InboundAttachmentTests(unittest.TestCase):
@@ -1946,6 +1980,7 @@ class InboundAttachmentTests(unittest.TestCase):
         argv = cb.remote_inbox_scp_argv("me@h", "/tmp/a.png", "app",
                                         "/home/u/.local/state/claude-workers")
         self.assertEqual(argv[0], "scp")
+        self.assertEqual(argv[1:1 + len(cb.SSH_OPTS)], cb.SSH_OPTS)
         self.assertIn("/tmp/a.png", argv)
         self.assertIn("me@h:/home/u/.local/state/claude-workers/app/inbox/", argv)
 

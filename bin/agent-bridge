@@ -163,6 +163,13 @@ REPLY_CAP = 8000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10
 
+# Applied to every ssh/scp invocation that dispatches to a satellite host. A
+# short connect timeout plus BatchMode (disables password/interactive-key
+# prompts, so ssh fails fast instead of hanging) keeps an offline or
+# unreachable satellite from blocking a bridge op for the full default _run
+# timeout (~180s) or wedging on a prompt with no TTY to answer it.
+SSH_OPTS = ["-o", "ConnectTimeout=8", "-o", "BatchMode=yes"]
+
 # Whole-request cap passed to aiohttp's `client_max_size` (it defaults to 1
 # MiB, which — silently, below any of the above — rejects most real
 # attachments before `handle_multipart_event` ever runs). Headroom above one
@@ -482,7 +489,7 @@ def dir_exists_for_host(cfg, host, path):
     target = resolve_host_target(cfg, {"host": host})
     if target is None:
         return os.path.isdir(path)
-    return _run(["ssh", target, "test", "-d", path]).returncode == 0
+    return _run(["ssh", *SSH_OPTS, target, "test", "-d", path]).returncode == 0
 
 
 def format_request_card(discord_id, project, summary):
@@ -1559,16 +1566,22 @@ def _run(args, timeout=180, input_text=None):
 def ssh_wrap(target, argv, env=None):
     """argv to run `argv` (an agent-worker command) on `target` over SSH.
 
-    SSH runs its command string in a login shell, so we build ONE shell-safe
-    string (each token shlex-quoted) and forward any needed env explicitly as an
+    SSH runs its command string in a NON-login, non-interactive shell, so
+    PATH is whatever that shell's non-interactive startup happens to set —
+    `agent-worker` under ~/.local/bin is not guaranteed to be found. We build
+    ONE shell-safe string (each token shlex-quoted), prefix it with an
+    explicit unquoted PATH assignment so $HOME/$PATH expand on the remote
+    regardless of shell, and forward any needed env explicitly as an
     `env NAME=VAL` prefix — the caller's environment does not cross SSH.
     """
     assignments = "".join(
         f"{shlex.quote(k)}={shlex.quote(str(v))} " for k, v in (env or {}).items()
     )
     prefix = f"env {assignments}" if env else ""
-    remote = prefix + " ".join(shlex.quote(a) for a in argv)
-    return ["ssh", target, "--", remote]
+    remote = 'PATH="$HOME/.local/bin:$PATH" ' + prefix + " ".join(
+        shlex.quote(a) for a in argv
+    )
+    return ["ssh", *SSH_OPTS, target, "--", remote]
 
 
 def run_worker_cmd(host_target, argv, timeout=180, input_text=None, env=None):
@@ -1587,7 +1600,7 @@ def remote_inbox_scp_argv(target, local_path, worker, state_root):
     `<state_root>/<worker>/inbox/<file>` is the same path the worker will be
     told about locally — this just makes the file exist there too."""
     dest = f"{target}:{state_root}/{worker}/inbox/"
-    return ["scp", local_path, dest]
+    return ["scp", *SSH_OPTS, local_path, dest]
 
 
 def worker_alive(name, host_target=None):
@@ -2530,7 +2543,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         shells out directly. Returns True on success."""
         remote_inbox = f"{STATE_ROOT}/{worker}/inbox"
         mkdir = await asyncio.to_thread(
-            _run, ["ssh", host_target, "mkdir", "-p", remote_inbox]
+            _run, ["ssh", *SSH_OPTS, host_target, "mkdir", "-p", remote_inbox]
         )
         if mkdir.returncode != 0:
             return False
