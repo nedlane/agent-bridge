@@ -1487,6 +1487,15 @@ def ssh_wrap(target, argv, env=None):
     return ["ssh", target, "--", remote]
 
 
+def run_worker_cmd(host_target, argv, timeout=180, input_text=None, env=None):
+    """Dispatch an agent-worker command to its host. host_target None → local
+    (byte-identical to today); otherwise wrap for SSH."""
+    if host_target is None:
+        return _run(argv, timeout=timeout, input_text=input_text)
+    return _run(ssh_wrap(host_target, argv, env=env), timeout=timeout,
+                input_text=input_text)
+
+
 def worker_alive(name):
     r = _run(["agent-worker", "status", name], timeout=15)
     return "running: yes" in r.stdout
@@ -1727,13 +1736,13 @@ def trim_usage_panel(screen):
     return "\n".join(lines[start:end + 1])
 
 
-def worker_screen(name, lines=40, ansi=False):
+def worker_screen(name, lines=40, ansi=False, host_target=None):
     # ansi=True keeps the pane's colour escapes (for the peek image); the
     # default plain capture is what every screen parser downstream expects.
     args = ["agent-worker", "read", name, str(lines)]
     if ansi:
         args.append("--ansi")
-    r = _run(args, timeout=15)
+    r = run_worker_cmd(host_target, args, timeout=15)
     return r.stdout if r.returncode == 0 else r.stderr
 
 
@@ -1755,31 +1764,32 @@ def render_screen_png(text, path):
 
 
 def worker_start(name, directory, channel_id, resume, profile="owner",
-                 harness="claude"):
-    return _run(
+                 harness="claude", host_target=None):
+    return run_worker_cmd(
+        host_target,
         start_args(name, directory, channel_id, resume, profile, harness),
         timeout=180,
     )
 
 
-def worker_send(name, text, typed=False):
+def worker_send(name, text, typed=False, host_target=None):
     args = ["agent-worker", "send", name]
     if typed:
         args.append("--type")
-    return _run(args + [text], timeout=30)
+    return run_worker_cmd(host_target, args + [text], timeout=30)
 
 
-def worker_key(name, *keys):
+def worker_key(name, *keys, host_target=None):
     """Send raw key names (tmux send-keys: Escape, Enter, C-c, `-l TEXT`, …) to
     the worker's pane. Unlike worker_send, it neither verifies a submit nor
     auto-presses Enter — it's for driving TUI overlays like the /usage panel,
     where worker_send's submit check would loop (the box never clears while the
     panel is up) and wrongly trip the wedge-recovery restart."""
-    return _run(["agent-worker", "key", name, *keys], timeout=15)
+    return run_worker_cmd(host_target, ["agent-worker", "key", name, *keys], timeout=15)
 
 
-def worker_stop(name):
-    return _run(["agent-worker", "stop", name], timeout=30)
+def worker_stop(name, host_target=None):
+    return run_worker_cmd(host_target, ["agent-worker", "stop", name], timeout=30)
 
 
 def worker_has_state(name, state_root=None):
@@ -2171,7 +2181,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not await asyncio.to_thread(worker_alive, name):
             return f"👀 `{name}` isn't running right now.", None
         # Capture with colour for the image; term-shot parses the ANSI escapes.
-        screen = await asyncio.to_thread(worker_screen, name, 40, True)
+        target = resolve_host_target(cfg, repo_by_name(name))
+        screen = await asyncio.to_thread(worker_screen, name, 40, True, target)
         png = os.path.join(STATE_ROOT, name, "peek.png")
         if await asyncio.to_thread(render_screen_png, screen, png):
             return f"👀 `{name}` — live screen", [png]
@@ -2204,7 +2215,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 f"📊 usage isn't wired up for **{harness}** workers — use "
                 f"`/screen` to peek at `{name}`.", None,
             )
-        screen = await asyncio.to_thread(worker_screen, name, 30)
+        target = resolve_host_target(cfg, repo_by_name(name))
+        screen = await asyncio.to_thread(worker_screen, name, 30, False, target)
         if not screen_is_ready(screen, harness):
             return f"📊 `{name}` is busy right now — try `/usage` once it's idle.", None
         if not composer_is_empty(screen, harness):
@@ -2214,9 +2226,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             )
         # Drive the overlay with raw keys (worker_send would try to verify a
         # submit that never clears the box while the panel is up).
-        await asyncio.to_thread(worker_key, name, "-l", "/usage")
+        await asyncio.to_thread(worker_key, name, "-l", "/usage", host_target=target)
         await asyncio.sleep(1.2)
-        await asyncio.to_thread(worker_key, name, "Enter")
+        await asyncio.to_thread(worker_key, name, "Enter", host_target=target)
         # Poll until the panel is up ("Esc to cancel") AND its "what's
         # contributing" breakdown has finished its async load (the panel first
         # shows "Scanning local sessions…"/"Refreshing…" placeholders, then
@@ -2224,14 +2236,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         panel = ""
         for _ in range(20):
             await asyncio.sleep(0.4)
-            cap = await asyncio.to_thread(worker_screen, name, 90)
+            cap = await asyncio.to_thread(worker_screen, name, 90, False, target)
             if "Esc to cancel" in cap:
                 panel = cap
                 if "Scanning" not in cap and "Refreshing" not in cap:
                     break
         # Always dismiss, even on a miss, so the worker is never left with the
         # panel open blocking its input box.
-        await asyncio.to_thread(worker_key, name, "Escape")
+        await asyncio.to_thread(worker_key, name, "Escape", host_target=target)
         if not panel:
             return f"📊 couldn't read `{name}`'s usage panel — try again in a moment.", None
         panel = trim_usage_panel(panel)
@@ -2244,15 +2256,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         """Post one provider-quota refusal per worker/reset window."""
         if not channel_id:
             return False
+        target = resolve_host_target(cfg, repo_by_name(name))
         if screen is None:
-            screen = await asyncio.to_thread(worker_screen, name, 80)
+            screen = await asyncio.to_thread(worker_screen, name, 80, False, target)
         hint = provider_usage_limit_notice(screen)
         if not hint:
             return False
         if screen_has_rate_limit_dialog(screen):
             # Preserve the configured model: option 1 silently switches to the
             # suggested cheaper model, while Down selects "Keep current".
-            await asyncio.to_thread(worker_key, name, "Down", "Enter")
+            await asyncio.to_thread(worker_key, name, "Down", "Enter", host_target=target)
         if limit_noticed.get(name) != hint:
             limit_noticed[name] = hint
             await post(
@@ -2268,6 +2281,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         task = asyncio.current_task()
         picked_up = False
         stale_hint = baseline_hint
+        target = resolve_host_target(cfg, repo_by_name(name))
         try:
             # A turn may legitimately run for hours. The normal Stop event
             # cancels this task; this long ceiling only bounds a missing-hook
@@ -2278,7 +2292,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 if tick % 12 == 0 and not await asyncio.to_thread(
                         worker_alive, name):
                     return
-                screen = await asyncio.to_thread(worker_screen, name, 80)
+                screen = await asyncio.to_thread(worker_screen, name, 80, False, target)
                 hint = provider_usage_limit_notice(screen)
                 if hint:
                     # A previous hard-limit line can remain in scrollback after
@@ -2336,7 +2350,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # course corrections need. A ✅ confirms the message was delivered,
         # whether the worker was idle or mid-turn (a queued steer still sent).
         last_activity[name] = time.time()
-        screen = await asyncio.to_thread(worker_screen, name, 30)
+        repo = repo_by_name(name)
+        target = resolve_host_target(cfg, repo)
+        screen = await asyncio.to_thread(worker_screen, name, 30, False, target)
         # A worker mid-compaction (manual /compact or an auto-compact) is
         # redrawing its input box; a paste — and the message pointing Claude at
         # a just-saved attachment — lands in that transient state and is
@@ -2353,19 +2369,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             )
             return
         text = tag_inbound(text, typed, tag)
-        r = await asyncio.to_thread(worker_send, name, text, typed)
+        r = await asyncio.to_thread(worker_send, name, text, typed, target)
         if r.returncode != 0:
             # A send that lands exactly on a turn boundary can wedge in the
             # TUI's queued-message state (displayed but never submitted, even
             # with Enter retries). Recover deterministically: restart the
             # worker with --continue and re-send once.
-            repo = next(
-                (x for x in cfg["repos"].values() if x["name"] == name), None
-            )
             channel_id = channel_for_worker(name)
             if repo and channel_id:
                 print(f"[bridge] {name}: send wedged, restarting worker to recover")
-                await asyncio.to_thread(worker_stop, name)
+                await asyncio.to_thread(worker_stop, name, target)
                 # Carry the channel's capability profile AND engine through the
                 # restart — omitting either would silently relaunch a restricted
                 # (utility/greeter) worker as full-trust owner, or a Codex worker
@@ -2378,14 +2391,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 r2 = await asyncio.to_thread(
                     worker_start, name, repo["dir"], channel_id,
                     should_resume(worker_has_state(name), fresh_pending(name)),
-                    repo.get("profile", "owner"), harness_for(repo),
+                    repo.get("profile", "owner"), harness_for(repo), target,
                 )
                 if r2.returncode == 0:
                     # The restart resumes and may auto-compact; wait for an
                     # input-ready prompt before re-sending so the recovery
                     # doesn't re-lose the message into a loading TUI.
                     await wait_ready(name)
-                    r = await asyncio.to_thread(worker_send, name, text, typed)
+                    r = await asyncio.to_thread(worker_send, name, text, typed, target)
         if r.returncode != 0:
             if message:
                 await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
@@ -2466,9 +2479,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not await asyncio.to_thread(worker_alive, name):
             resume = should_resume(worker_has_state(name), fresh_pending(name))
             await message.add_reaction("🚀" if resume else "🧼")
+            target = resolve_host_target(cfg, repo)
             r = await asyncio.to_thread(
                 worker_start, name, directory, message.channel.id, resume,
-                repo.get("profile", "owner"), harness,
+                repo.get("profile", "owner"), harness, target,
             )
             if r.returncode != 0:
                 await message.channel.send(
@@ -2577,7 +2591,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # brand-new session with no --continue, without resuming first. The
         # marker survives the stop.
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
+        target = resolve_host_target(cfg, repo_by_name(name))
+        await asyncio.to_thread(worker_stop, name, target)
         await asyncio.to_thread(arm_fresh, name)
         # A fresh context deserves a fresh channel — wipe the old chatter.
         purged, note = await purge_channel(channel_for_worker(name))
@@ -2588,18 +2603,20 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     async def do_stop(name):
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
+        target = resolve_host_target(cfg, repo_by_name(name))
+        await asyncio.to_thread(worker_stop, name, target)
         return f"🛑 stopped `{name}`", None
 
     async def do_restart(name):
         repo = repo_by_name(name)
         if not repo:
             return f"⚠️ no repo channel mapped for `{name}`", None
+        target = resolve_host_target(cfg, repo)
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
+        await asyncio.to_thread(worker_stop, name, target)
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_for_worker(name), True,
-            repo.get("profile", "owner"), harness_for(repo),
+            repo.get("profile", "owner"), harness_for(repo), target,
         )
         # Explicit resume: cancel any armed fresh so it can't re-fire.
         await asyncio.to_thread(disarm_fresh, name)
@@ -2617,11 +2634,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return f"⚠️ no repo channel mapped for `{name}`", None
         channel_id = channel_for_worker(name)
         harness = harness_for(repo)
+        target = resolve_host_target(cfg, repo)
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
+        await asyncio.to_thread(worker_stop, name, target)
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_id, False,
-            repo.get("profile", "owner"), harness,
+            repo.get("profile", "owner"), harness, target,
         )
         await asyncio.to_thread(disarm_fresh, name)
         if r.returncode != 0:
@@ -2727,7 +2745,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if await asyncio.to_thread(worker_alive, name):
                 if handoff:
                     handoff_note = await capture_handoff(name, outgoing_harness)
-                await asyncio.to_thread(worker_stop, name)
+                target = resolve_host_target(cfg, repo)
+                await asyncio.to_thread(worker_stop, name, target)
             elif handoff:
                 handoff_note = " ℹ️ no running session to capture a handoff from."
         finally:
@@ -2781,9 +2800,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         )
         if not item:
             return f"⚠️ no repo channel mapped for `{name}`", None
-        cid, _ = item
+        cid, repo = item
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
+        target = resolve_host_target(cfg, repo)
+        await asyncio.to_thread(worker_stop, name, target)
         wiped = await asyncio.to_thread(remove_worker_state, name)
         del cfg["repos"][cid]
         save_config(cfg, config_path)
@@ -3691,9 +3711,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 return web.json_response({"status": "ok", "note": "already running"})
             resume = should_resume(worker_has_state(name), fresh_pending(name))
             harness = harness_for(repo)
+            target = resolve_host_target(cfg, repo)
             r = await asyncio.to_thread(
                 worker_start, name, repo["dir"], channel_id, resume,
-                repo.get("profile", "owner"), harness,
+                repo.get("profile", "owner"), harness, target,
             )
             if r.returncode != 0:
                 return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)
@@ -3784,7 +3805,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 if await asyncio.to_thread(worker_alive, name) and not (
                     await asyncio.to_thread(worker_busy, name)
                 ):
-                    await asyncio.to_thread(worker_stop, name)
+                    target = resolve_host_target(cfg, repo)
+                    await asyncio.to_thread(worker_stop, name, target)
                     last_activity.pop(name, None)
                     channel_id = channel_for_worker(name)
                     if channel_id:

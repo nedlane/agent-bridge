@@ -1724,5 +1724,24 @@ class SshWrapTests(unittest.TestCase):
         self.assertIn(shlex.quote("hi there"), remote)
 
 
+class RunWorkerCmdTests(unittest.TestCase):
+    def setUp(self):
+        self.seen = {}
+        self._orig = cb._run
+        cb._run = lambda args, timeout=180, input_text=None: self.seen.setdefault("args", args) or \
+            __import__("subprocess").CompletedProcess(args, 0, "", "")
+
+    def tearDown(self):
+        cb._run = self._orig
+
+    def test_local_passes_argv_unchanged(self):
+        cb.run_worker_cmd(None, ["agent-worker", "stop", "a"])
+        self.assertEqual(self.seen["args"], ["agent-worker", "stop", "a"])
+
+    def test_remote_wraps_with_ssh(self):
+        cb.run_worker_cmd("me@h", ["agent-worker", "stop", "a"])
+        self.assertEqual(self.seen["args"][:3], ["ssh", "me@h", "--"])
+
+
 if __name__ == "__main__":
     unittest.main()
