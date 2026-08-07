@@ -105,7 +105,7 @@ fi
 # --- satellite machines (if configured) -----------------------------------------------
 if [[ -r "$bridge_cfg" ]]; then
   # Extract machines from config and probe each one
-  machines_output=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(f"{n}\t{m.get(\"ssh\") or \"\"}") for n,m in (d.get("machines") or {}).items()]' "$bridge_cfg" 2>/dev/null)
+  machines_output=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(n + "\t" + (m.get("ssh") or "")) for n,m in (d.get("machines") or {}).items()]' "$bridge_cfg" 2>/dev/null)
   if [[ -n "$machines_output" ]]; then
     while IFS=$'\t' read -r machine_name machine_target; do
       if [[ -z "$machine_target" ]]; then
