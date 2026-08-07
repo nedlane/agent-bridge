@@ -155,6 +155,14 @@ IGNORE_EMOJI = "🙈"
 DISCORD_LIMIT = 2000
 REPLY_CAP = 8000
 
+# Bounds on multipart /event uploads (the remote-worker attachment path). Even
+# an authenticated caller must not be able to fill dev-box's temp partition, so
+# each `file` part is capped and the number of parts is limited (defense in
+# depth on top of the payload-first HMAC gate). 25 MiB matches Discord's own
+# per-file upload ceiling; 10 parts is well above any real attachment batch.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_PARTS = 10
+
 # Downloaded Discord attachments pile up in each worker's inbox (every file
 # gets a unique name); prune anything older than this on the next download.
 INBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
@@ -1368,6 +1376,20 @@ def verify_signature(body, header, secret):
         return False
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(header, expected)
+
+
+def upload_size_ok(written, chunk_len, cap=None):
+    """Running size guard for a streamed upload part.
+
+    `written` is the bytes committed to disk so far for the current part,
+    `chunk_len` the size of the next chunk about to be written. Returns True if
+    writing that chunk keeps the part at or under `cap`, False if it would
+    exceed it. Pulled out as a pure function so the byte-accumulator logic is
+    unit-testable without an aiohttp request.
+    """
+    if cap is None:
+        cap = MAX_UPLOAD_BYTES
+    return written + chunk_len <= cap
 
 
 def bridge_url_is_local(url):
@@ -3612,25 +3634,51 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             reader = await request.multipart()
             async for part in reader:
                 if part.name == "payload":
+                    # Must arrive (and be verified) before we touch disk. A
+                    # streaming reader yields parts in order and cannot look
+                    # ahead, so a duplicate/late payload after files is treated
+                    # as the first-seen; the file-branch below already rejects
+                    # any `file` part that precedes this.
                     payload_bytes = await part.read(decode=False)
-                else:
-                    fd, tmp = tempfile.mkstemp(
-                        prefix="bridge-upload-",
-                        suffix="-" + os.path.basename(part.filename or "attachment"),
+                    if not verify_signature(
+                        payload_bytes,
+                        request.headers.get("X-Webhook-Signature", ""),
+                        secret,
+                    ):
+                        return web.json_response(
+                            {"error": "bad signature"}, status=401
+                        )
+                    continue
+                # A `file` part. Refuse to write anything to disk until the
+                # payload has arrived and its signature verified — an
+                # unauthenticated caller must never reach tempfile.mkstemp.
+                if payload_bytes is None:
+                    return web.json_response(
+                        {"error": "file part before payload"}, status=400
                     )
-                    with os.fdopen(fd, "wb") as out:
-                        while True:
-                            chunk = await part.read_chunk()
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                    tmp_paths.append(tmp)
+                if len(tmp_paths) >= MAX_UPLOAD_PARTS:
+                    return web.json_response(
+                        {"error": "too many parts"}, status=413
+                    )
+                fd, tmp = tempfile.mkstemp(
+                    prefix="bridge-upload-",
+                    suffix="-" + os.path.basename(part.filename or "attachment"),
+                )
+                tmp_paths.append(tmp)
+                written = 0
+                with os.fdopen(fd, "wb") as out:
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        if not upload_size_ok(written, len(chunk)):
+                            return web.json_response(
+                                {"error": "upload too large"}, status=413
+                            )
+                        out.write(chunk)
+                        written += len(chunk)
             if payload_bytes is None:
                 return web.json_response({"error": "missing payload"}, status=400)
-            if not verify_signature(
-                payload_bytes, request.headers.get("X-Webhook-Signature", ""), secret
-            ):
-                return web.json_response({"error": "bad signature"}, status=401)
             try:
                 event = json.loads(payload_bytes)
             except ValueError:

@@ -87,6 +87,31 @@ class MultipartEventAuthTests(unittest.TestCase):
         )
 
 
+class UploadSizeOkTests(unittest.TestCase):
+    """Pin the per-part byte cap the multipart /event branch uses to bound
+    disk writes (defense in depth once listen_host leaves loopback)."""
+
+    def test_under_cap_ok(self):
+        self.assertTrue(cb.upload_size_ok(0, 100, cap=1000))
+
+    def test_exactly_at_cap_ok(self):
+        # Writing the chunk that lands exactly on the cap is allowed.
+        self.assertTrue(cb.upload_size_ok(900, 100, cap=1000))
+
+    def test_over_cap_rejected(self):
+        self.assertFalse(cb.upload_size_ok(950, 100, cap=1000))
+
+    def test_accumulates_across_chunks(self):
+        # A part staying under the cap chunk-by-chunk still trips once the
+        # running total would exceed it.
+        self.assertTrue(cb.upload_size_ok(500, 400, cap=1000))
+        self.assertFalse(cb.upload_size_ok(900, 200, cap=1000))
+
+    def test_default_cap_is_module_constant(self):
+        self.assertTrue(cb.upload_size_ok(0, cb.MAX_UPLOAD_BYTES))
+        self.assertFalse(cb.upload_size_ok(0, cb.MAX_UPLOAD_BYTES + 1))
+
+
 class BridgeUrlIsLocalTests(unittest.TestCase):
     """The Python helper mirrors the shell check in discord-notify that decides
     JSON-paths vs. multipart-upload transport."""
