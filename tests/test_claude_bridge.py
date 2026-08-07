@@ -97,6 +97,22 @@ class ChannelAllowsTests(unittest.TestCase):
         self.assertFalse(cb.channel_allows(cfg, 300, 8))    # no such channel
 
 
+class ResolveHostTargetTests(unittest.TestCase):
+    def test_absent_host_is_local(self):
+        self.assertIsNone(cb.resolve_host_target({}, {"name": "a"}))
+
+    def test_explicit_local_is_local(self):
+        self.assertIsNone(cb.resolve_host_target({}, {"host": "local"}))
+
+    def test_remote_host_resolves_ssh_target(self):
+        cfg = {"machines": {"mac": {"ssh": "me@hc-002"}}}
+        self.assertEqual(cb.resolve_host_target(cfg, {"host": "mac"}), "me@hc-002")
+
+    def test_unknown_machine_raises(self):
+        with self.assertRaises(KeyError):
+            cb.resolve_host_target({"machines": {}}, {"host": "mac"})
+
+
 class ProfileArgsTests(unittest.TestCase):
     PDIR = "/opt/profiles"
 

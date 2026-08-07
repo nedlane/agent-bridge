@@ -414,6 +414,22 @@ def channel_allows(cfg, channel_id, user_id):
     return bool(repo) and user_id in (repo.get("guests") or [])
 
 
+def resolve_host_target(cfg, repo):
+    """SSH target for a repo's worker, or None when it runs locally.
+
+    A repo with no `host` (or host == "local") runs on this machine, exactly as
+    before. Any other host must name an entry in cfg["machines"] whose "ssh"
+    field is the target this bridge SSHes to.
+    """
+    host = (repo or {}).get("host") or "local"
+    if host == "local":
+        return None
+    machines = cfg.get("machines") or {}
+    if host not in machines:
+        raise KeyError(f"repo host '{host}' has no entry in config 'machines'")
+    return machines[host]["ssh"]
+
+
 def format_request_card(discord_id, project, summary):
     """The approval card posted to #requests. The trailing `req:id:project`
     marker lets the reaction handler recover who/what to grant, so the decision
