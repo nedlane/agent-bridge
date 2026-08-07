@@ -1497,6 +1497,16 @@ def run_worker_cmd(host_target, argv, timeout=180, input_text=None, env=None):
                 input_text=input_text)
 
 
+def remote_inbox_scp_argv(target, local_path, worker, state_root):
+    """argv to scp a locally-saved attachment into a remote worker's inbox.
+
+    Satellites share this machine's STATE_ROOT layout, so
+    `<state_root>/<worker>/inbox/<file>` is the same path the worker will be
+    told about locally — this just makes the file exist there too."""
+    dest = f"{target}:{state_root}/{worker}/inbox/"
+    return ["scp", local_path, dest]
+
+
 def worker_alive(name, host_target=None):
     r = run_worker_cmd(host_target, ["agent-worker", "status", name], timeout=15)
     return "running: yes" in r.stdout
@@ -2429,11 +2439,33 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         with open(dest, "wb") as f:
             f.write(data)
 
-    async def save_attachments(name, message):
+    async def copy_inbound_attachment(host_target, local_path, worker):
+        """Push a locally-saved attachment out to a remote worker's inbox so
+        the worker (running on `host_target`) can read the same path off its
+        own disk. ssh/scp are invoked locally and connect out — they are not
+        agent-worker commands, so this bypasses run_worker_cmd/ssh_wrap and
+        shells out directly. Returns True on success."""
+        remote_inbox = f"{STATE_ROOT}/{worker}/inbox"
+        mkdir = await asyncio.to_thread(
+            _run, ["ssh", host_target, "mkdir", "-p", remote_inbox]
+        )
+        if mkdir.returncode != 0:
+            return False
+        scp = await asyncio.to_thread(
+            _run, remote_inbox_scp_argv(host_target, local_path, worker, STATE_ROOT)
+        )
+        return scp.returncode == 0
+
+    async def save_attachments(name, message, host_target=None):
         """Download a message's Discord attachments into the worker's inbox
         dir and return their local paths, so Claude can Read them off disk.
         A download that fails warns in-channel rather than crashing the handler
-        (which would drop the whole message, reaction and all)."""
+        (which would drop the whole message, reaction and all).
+
+        When `host_target` is not None the worker runs on a remote satellite;
+        after each file lands locally it's also scp'd out to the same
+        STATE_ROOT-relative path on that machine, since satellites share this
+        layout. Local workers (host_target None) are unaffected — no scp."""
         if not message.attachments:
             return []
         inbox = os.path.join(STATE_ROOT, name, "inbox")
@@ -2460,6 +2492,19 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     )
                 except discord.HTTPException:
                     pass
+                continue
+            if host_target is not None:
+                ok = await copy_inbound_attachment(host_target, dest, name)
+                if not ok:
+                    print(f"[bridge] {name}: failed to copy {dest!r} to "
+                          f"{host_target}")
+                    try:
+                        await message.channel.send(
+                            f"⚠️ couldn't copy `{att.filename}` to the remote "
+                            "worker — it may not be able to read it."
+                        )
+                    except discord.HTTPException:
+                        pass
         return paths
 
     async def reply_snippet(message):
@@ -2523,7 +2568,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if message.content.startswith("/"):
             await deliver(name, message.content, message, typed=True)
             return
-        paths = await save_attachments(name, message)
+        paths = await save_attachments(name, message, host_target=target)
         quote = await reply_snippet(message)
         composed = compose_inbound(message.content, paths, quote)
         # A pending /harness handoff rides on the first real message to

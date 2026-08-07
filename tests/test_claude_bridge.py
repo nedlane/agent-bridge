@@ -1799,5 +1799,14 @@ class WorkerPollHostAwareTests(unittest.TestCase):
         self.assertIn("agent-worker read app 30", self.calls[-1][3])
 
 
+class InboundAttachmentTests(unittest.TestCase):
+    def test_scp_argv_targets_remote_inbox(self):
+        argv = cb.remote_inbox_scp_argv("me@h", "/tmp/a.png", "app",
+                                        "/home/u/.local/state/claude-workers")
+        self.assertEqual(argv[0], "scp")
+        self.assertIn("/tmp/a.png", argv)
+        self.assertIn("me@h:/home/u/.local/state/claude-workers/app/inbox/", argv)
+
+
 if __name__ == "__main__":
     unittest.main()
