@@ -111,7 +111,7 @@ if [[ -r "$bridge_cfg" ]]; then
       if [[ -z "$machine_target" ]]; then
         continue
       fi
-      if ssh -o ConnectTimeout=8 -o BatchMode=yes "$machine_target" \
+      if ssh -n -o ConnectTimeout=8 -o BatchMode=yes "$machine_target" \
         'command -v agent-worker >/dev/null 2>&1 && grep -q "BRIDGE_WEBHOOK_URL=http://100.105.249.62:8765" "$HOME/.config/claude-workers/bridge-webhook" 2>/dev/null'; then
         pass "satellite $machine_name ($machine_target): agent-worker present and relays point at the parent"
       else
