@@ -111,6 +111,29 @@ class UploadSizeOkTests(unittest.TestCase):
         self.assertTrue(cb.upload_size_ok(0, cb.MAX_UPLOAD_BYTES))
         self.assertFalse(cb.upload_size_ok(0, cb.MAX_UPLOAD_BYTES + 1))
 
+    def test_payload_cap_via_explicit_cap_arg(self):
+        # handle_multipart_event reuses this same pure helper (with
+        # cap=MAX_PAYLOAD_BYTES) to bound the pre-auth `payload` part read.
+        self.assertTrue(cb.upload_size_ok(0, cb.MAX_PAYLOAD_BYTES, cap=cb.MAX_PAYLOAD_BYTES))
+        self.assertFalse(
+            cb.upload_size_ok(0, cb.MAX_PAYLOAD_BYTES + 1, cap=cb.MAX_PAYLOAD_BYTES)
+        )
+
+
+class RequestSizeConstantsTests(unittest.TestCase):
+    """Pin the whole-request/pre-auth-read bounds so a future edit can't
+    silently reintroduce the aiohttp default-1-MiB coupling bug or widen the
+    pre-auth payload read without deliberately touching these constants."""
+
+    def test_max_request_bytes_has_headroom_over_one_upload(self):
+        self.assertGreater(cb.MAX_REQUEST_BYTES, cb.MAX_UPLOAD_BYTES)
+
+    def test_max_payload_bytes_much_smaller_than_max_request_bytes(self):
+        self.assertLess(cb.MAX_PAYLOAD_BYTES, cb.MAX_REQUEST_BYTES)
+
+    def test_max_upload_bytes_smaller_than_max_request_bytes(self):
+        self.assertLess(cb.MAX_UPLOAD_BYTES, cb.MAX_REQUEST_BYTES)
+
 
 class BridgeUrlIsLocalTests(unittest.TestCase):
     """The Python helper mirrors the shell check in discord-notify that decides

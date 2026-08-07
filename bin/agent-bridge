@@ -163,6 +163,17 @@ REPLY_CAP = 8000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_UPLOAD_PARTS = 10
 
+# Whole-request cap passed to aiohttp's `client_max_size` (it defaults to 1
+# MiB, which — silently, below any of the above — rejects most real
+# attachments before `handle_multipart_event` ever runs). Headroom above one
+# MAX_UPLOAD_BYTES attachment for the payload field and multipart framing.
+MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024
+
+# The signed JSON metadata in the `payload` part is tiny; this tightly bounds
+# the pre-auth in-memory read (that read happens before the HMAC check, so it
+# must stay small regardless of how high MAX_REQUEST_BYTES is).
+MAX_PAYLOAD_BYTES = 256 * 1024
+
 # Downloaded Discord attachments pile up in each worker's inbox (every file
 # gets a unique name); prune anything older than this on the next download.
 INBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
@@ -3639,7 +3650,27 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     # ahead, so a duplicate/late payload after files is treated
                     # as the first-seen; the file-branch below already rejects
                     # any `file` part that precedes this.
-                    payload_bytes = await part.read(decode=False)
+                    #
+                    # Read in bounded chunks rather than `part.read()` in one
+                    # shot: this happens BEFORE the HMAC check below, so an
+                    # unauthenticated caller must not be able to force a large
+                    # in-memory buffer just because MAX_REQUEST_BYTES (sized
+                    # for a 25 MiB attachment) is generous. The signed JSON
+                    # metadata is always tiny, so MAX_PAYLOAD_BYTES is a hard
+                    # cap independent of the overall request size.
+                    buf = []
+                    written = 0
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        if not upload_size_ok(written, len(chunk), cap=MAX_PAYLOAD_BYTES):
+                            return web.json_response(
+                                {"error": "payload too large"}, status=413
+                            )
+                        buf.append(chunk)
+                        written += len(chunk)
+                    payload_bytes = b"".join(buf)
                     if not verify_signature(
                         payload_bytes,
                         request.headers.get("X-Webhook-Signature", ""),
@@ -4038,7 +4069,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                         )
 
     async def main():
-        app = web.Application()
+        app = web.Application(client_max_size=MAX_REQUEST_BYTES)
         app.router.add_post("/event", handle_event)
         runner = web.AppRunner(app)
         await runner.setup()
