@@ -1856,5 +1856,28 @@ class InboundAttachmentTests(unittest.TestCase):
         self.assertIn("me@h:/home/u/.local/state/claude-workers/app/inbox/", argv)
 
 
+class BuildRepoEntryTests(unittest.TestCase):
+    def test_repo_entry_records_host(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1, host="mac")
+        self.assertEqual(entry["host"], "mac")
+
+    def test_default_host_absent_or_local(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1)
+        self.assertIn(entry.get("host", "local"), (None, "local"))
+
+    def test_local_host_omitted(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1, host="local")
+        self.assertNotIn("host", entry)
+
+    def test_none_host_omitted(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1, host=None)
+        self.assertNotIn("host", entry)
+
+    def test_basic_fields(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1)
+        self.assertEqual(entry["name"], "app")
+        self.assertEqual(entry["dir"], "/p")
+
+
 if __name__ == "__main__":
     unittest.main()

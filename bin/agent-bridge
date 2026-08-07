@@ -65,8 +65,10 @@ on connect). The `worker` option defaults to the channel's mapped worker:
                            also wipes the channel's messages)
   /compact [focus] [worker] compact the worker's context
   /checkin [worker]        ask a running worker for a progress update
-  /addrepo <name> <path> [category]   create #<name> + map it; file it under
-                           an existing/new category (default: inbox category)
+  /addrepo <name> <path> [category] [host]   create #<name> + map it; file it
+                           under an existing/new category (default: inbox
+                           category); optional host runs its worker on that
+                           machine (must be in config 'machines', else local)
   /close [worker] confirm:<name>
                            retire a worker: stop it, wipe its saved state, and
                            delete its channel (irreversible; confirm required)
@@ -414,6 +416,23 @@ def channel_allows(cfg, channel_id, user_id):
         return True
     repo = cfg.get("repos", {}).get(str(channel_id))
     return bool(repo) and user_id in (repo.get("guests") or [])
+
+
+def build_repo_entry(name, directory, channel_id=None, host=None, **rest):
+    """Build the repo-mapping dict stored under cfg["repos"][channel_id].
+
+    `channel_id` is accepted for symmetry with callers that key off it, but
+    isn't included in the entry itself (the channel id is the dict key, not a
+    field). `host` is omitted from the entry when absent or "local" so
+    existing single-machine configs stay byte-identical; any other value
+    names an entry in cfg["machines"] (validated by the caller via
+    resolve_host_target before persisting).
+    """
+    entry = {"name": name, "dir": directory}
+    if host and host != "local":
+        entry["host"] = host
+    entry.update(rest)
+    return entry
 
 
 def resolve_host_target(cfg, repo):
@@ -3353,8 +3372,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @tree.command(name="addrepo", description="Create a Discord channel and map a repo to a worker")
     @describe(name="Worker/channel name", path="Absolute path to the repo",
               category="Category to file it under — an existing one, or a new "
-                       "name to create it (default: the inbox category)")
-    async def slash_addrepo(interaction, name: str, path: str, category: str = None):
+                       "name to create it (default: the inbox category)",
+              host="Machine to run this repo's worker on (default: local; "
+                   "must be a name in config 'machines')")
+    async def slash_addrepo(interaction, name: str, path: str, category: str = None, host: str = None):
         if interaction.user.id not in cfg["allowed_users"]:
             await interaction.response.send_message("⛔ not authorized", ephemeral=True)
             return
@@ -3364,10 +3385,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 f"⚠️ no such directory: {directory}", ephemeral=True
             )
             return
+        if host:
+            try:
+                resolve_host_target(cfg, {"host": host})
+            except KeyError as e:
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                return
         await interaction.response.defer(thinking=True)
         cat, created = await resolve_category(interaction.guild, category)
         channel = await interaction.guild.create_text_channel(name, category=cat)
-        cfg["repos"][str(channel.id)] = {"name": name, "dir": directory}
+        cfg["repos"][str(channel.id)] = build_repo_entry(
+            name=name, directory=directory, channel_id=channel.id, host=host
+        )
         save_config(cfg, config_path)
         where = f" in **{cat.name}**{' (new category)' if created else ''}" if cat else ""
         await interaction.followup.send(
@@ -3718,11 +3747,17 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             repo_name = (event.get("name") or "").strip()
             repo_path = os.path.expanduser(event.get("path") or "")
             requested_cat = (event.get("category") or "").strip()
+            host = (event.get("host") or "").strip() or None
             if not repo_name or not os.path.isdir(repo_path):
                 return web.json_response(
                     {"error": f"invalid name or directory: {repo_name!r} {repo_path!r}"},
                     status=400,
                 )
+            if host:
+                try:
+                    resolve_host_target(cfg, {"host": host})
+                except KeyError as e:
+                    return web.json_response({"error": str(e)}, status=400)
             guild = the_guild()
             if guild is None:
                 return web.json_response({"error": "guild not found"}, status=400)
@@ -3730,7 +3765,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if cat is None:
                 return web.json_response({"error": "category not found"}, status=400)
             channel = await guild.create_text_channel(repo_name, category=cat)
-            cfg["repos"][str(channel.id)] = {"name": repo_name, "dir": repo_path}
+            cfg["repos"][str(channel.id)] = build_repo_entry(
+                name=repo_name, directory=repo_path, channel_id=channel.id, host=host
+            )
             save_config(cfg, config_path)
             print(f"[bridge] addrepo: #{channel.name} ({channel.id}) -> {repo_path} "
                   f"[{cat.name}{' new' if created else ''}]")
