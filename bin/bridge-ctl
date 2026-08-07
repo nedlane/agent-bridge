@@ -97,7 +97,16 @@ case "$cmd" in
     [[ -n "$name" && -n "$path" ]] \
       || die "usage: bridge-ctl addrepo <name> <path> [category] [--host <machine>]"
     orig_path="$path"
-    path="$(cd "${path/#\~/$HOME}" 2>/dev/null && pwd)" || die "no such directory: ${orig_path}"
+    if [[ -n "$host" && "$host" != "local" ]]; then
+      # The path lives on the satellite, not here — we can't canonicalize
+      # (~, relative) against this machine's filesystem, so require an
+      # absolute path and pass it through unchanged; the bridge validates
+      # existence on the target host.
+      [[ "$path" == /* ]] \
+        || die "with --host, path must be absolute on the target machine: ${orig_path}"
+    else
+      path="$(cd "${path/#\~/$HOME}" 2>/dev/null && pwd)" || die "no such directory: ${orig_path}"
+    fi
     body="$(NAME="$name" REPO="$path" CATEGORY="$category" HOST="$host" python3 -c '
 import json, os
 req = {"event_type": "claude.bridge.addrepo",

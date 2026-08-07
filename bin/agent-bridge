@@ -470,6 +470,21 @@ def resolve_host_target(cfg, repo):
     return machines[host]["ssh"]
 
 
+def dir_exists_for_host(cfg, host, path):
+    """Whether `path` is a directory on `host` ("local"/None = this machine).
+
+    Local check uses os.path.isdir, exactly as before host-awareness existed.
+    A remote host is resolved via resolve_host_target (raises KeyError for an
+    unknown machine, same as elsewhere) and checked with `ssh <target> test -d
+    <path>` — no local os.path.isdir call, since the path only makes sense on
+    the remote filesystem.
+    """
+    target = resolve_host_target(cfg, {"host": host})
+    if target is None:
+        return os.path.isdir(path)
+    return _run(["ssh", target, "test", "-d", path]).returncode == 0
+
+
 def format_request_card(discord_id, project, summary):
     """The approval card posted to #requests. The trailing `req:id:project`
     marker lets the reaction handler recover who/what to grant, so the decision
@@ -3413,17 +3428,17 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             await interaction.response.send_message("⛔ not authorized", ephemeral=True)
             return
         directory = os.path.expanduser(path)
-        if not os.path.isdir(directory):
-            await interaction.response.send_message(
-                f"⚠️ no such directory: {directory}", ephemeral=True
-            )
-            return
         if host:
             try:
                 resolve_host_target(cfg, {"host": host})
             except KeyError as e:
                 await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
                 return
+        if not await asyncio.to_thread(dir_exists_for_host, cfg, host, directory):
+            await interaction.response.send_message(
+                f"⚠️ no such directory: {directory}", ephemeral=True
+            )
+            return
         await interaction.response.defer(thinking=True)
         cat, created = await resolve_category(interaction.guild, category)
         channel = await interaction.guild.create_text_channel(name, category=cat)
@@ -3827,16 +3842,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             repo_path = os.path.expanduser(event.get("path") or "")
             requested_cat = (event.get("category") or "").strip()
             host = (event.get("host") or "").strip() or None
-            if not repo_name or not os.path.isdir(repo_path):
-                return web.json_response(
-                    {"error": f"invalid name or directory: {repo_name!r} {repo_path!r}"},
-                    status=400,
-                )
             if host:
                 try:
                     resolve_host_target(cfg, {"host": host})
                 except KeyError as e:
                     return web.json_response({"error": str(e)}, status=400)
+            if not repo_name or not await asyncio.to_thread(
+                dir_exists_for_host, cfg, host, repo_path
+            ):
+                return web.json_response(
+                    {"error": f"invalid name or directory: {repo_name!r} {repo_path!r}"},
+                    status=400,
+                )
             guild = the_guild()
             if guild is None:
                 return web.json_response({"error": "guild not found"}, status=400)

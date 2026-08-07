@@ -210,6 +210,52 @@ class ResolveHostTargetTests(unittest.TestCase):
             cb.resolve_host_target({"machines": {}}, {"host": "mac"})
 
 
+class DirExistsForHostTests(unittest.TestCase):
+    def test_local_existing_dir_is_true(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(cb.dir_exists_for_host({}, None, d))
+
+    def test_local_bogus_dir_is_false(self):
+        self.assertFalse(
+            cb.dir_exists_for_host({}, None, "/no/such/dir/ever")
+        )
+
+    def test_explicit_local_host_uses_isdir(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(cb.dir_exists_for_host({}, "local", d))
+
+    def test_remote_host_runs_ssh_test_dash_d(self):
+        cfg = {"machines": {"mac": {"ssh": "me@hc-002"}}}
+        seen = {}
+
+        def fake_run(args, timeout=180, input_text=None):
+            seen["args"] = args
+            return __import__("subprocess").CompletedProcess(args, 0, "", "")
+
+        orig = cb._run
+        cb._run = fake_run
+        try:
+            result = cb.dir_exists_for_host(cfg, "mac", "/srv/repo")
+        finally:
+            cb._run = orig
+        self.assertEqual(
+            seen["args"], ["ssh", "me@hc-002", "test", "-d", "/srv/repo"]
+        )
+        self.assertTrue(result)
+
+    def test_remote_host_nonzero_returncode_is_false(self):
+        cfg = {"machines": {"mac": {"ssh": "me@hc-002"}}}
+        orig = cb._run
+        cb._run = lambda args, timeout=180, input_text=None: __import__(
+            "subprocess"
+        ).CompletedProcess(args, 1, "", "")
+        try:
+            result = cb.dir_exists_for_host(cfg, "mac", "/srv/repo")
+        finally:
+            cb._run = orig
+        self.assertFalse(result)
+
+
 class ProfileArgsTests(unittest.TestCase):
     PDIR = "/opt/profiles"
 
