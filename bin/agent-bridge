@@ -1593,6 +1593,28 @@ def run_worker_cmd(host_target, argv, timeout=180, input_text=None, env=None):
                 input_text=input_text)
 
 
+def format_status_sections(local_stdout, satellites):
+    """Render /status's aggregated roster across the local host and any
+    configured satellites.
+
+    `satellites` is {machine_name: (returncode, stdout)}. When empty (no
+    machines configured — the common case), the output is the exact
+    pre-existing single-block shape with no "local:" header, so callers with
+    zero machines stay byte-identical to the pre-distributed-bridge output.
+    With one or more satellites, a "local:" header is added alongside a
+    labeled section per machine; a nonzero returncode renders as
+    "(unreachable)" instead of (possibly garbage/partial) stdout, so one
+    unreachable satellite doesn't fail the whole command.
+    """
+    if not satellites:
+        return f"```\n{local_stdout}\n```"
+    sections = [f"local:\n{local_stdout}"]
+    for name, (returncode, stdout) in satellites.items():
+        body = stdout if returncode == 0 else "(unreachable)"
+        sections.append(f"{name}:\n{body}")
+    return "```\n" + "\n\n".join(sections) + "\n```"
+
+
 def remote_inbox_scp_argv(target, local_path, worker, state_root):
     """argv to scp a locally-saved attachment into a remote worker's inbox.
 
@@ -2721,12 +2743,21 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     # likes; worker restarts block, so their callers defer the interaction.
     async def do_status():
         r = await asyncio.to_thread(_run, ["agent-worker", "list"], 15)
-        return f"```\n{r.stdout}\n```", None
+        satellites = {}
+        for m, info in (cfg.get("machines") or {}).items():
+            rr = await asyncio.to_thread(
+                run_worker_cmd, info["ssh"], ["agent-worker", "list"], 15,
+            )
+            satellites[m] = (rr.returncode, rr.stdout)
+        return format_status_sections(r.stdout, satellites), None
 
     async def do_status_one(name):
         # A guest sees only their own channel's worker — never the full roster
         # of every repo on the box.
-        r = await asyncio.to_thread(_run, ["agent-worker", "status", name], 15)
+        target = resolve_host_target(cfg, repo_by_name(name) or {})
+        r = await asyncio.to_thread(
+            run_worker_cmd, target, ["agent-worker", "status", name], 15,
+        )
         return f"```\n{r.stdout}\n```", None
 
     async def do_fresh(name):

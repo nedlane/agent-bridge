@@ -1907,6 +1907,40 @@ class SshWrapTests(unittest.TestCase):
         self.assertIn(shlex.quote("hi there"), remote)
 
 
+class FormatStatusSectionsTests(unittest.TestCase):
+    """format_status_sections is the pure formatter behind /status's
+    aggregation across the local host and any configured satellites.
+
+    do_status itself is a closure inside run_bridge and isn't directly
+    unit-testable, but the constraint that matters — byte-identical output
+    for the common local-only case (no machines configured) — lives entirely
+    in this formatting logic, so it's factored out and tested here.
+    """
+
+    def test_no_machines_is_byte_identical_to_bare_block(self):
+        # With zero machines configured, output must match the pre-existing
+        # single-block shape exactly: no "local:" header, nothing extra.
+        out = cb.format_status_sections("roster here", {})
+        self.assertEqual(out, "```\nroster here\n```")
+
+    def test_with_machines_adds_labeled_local_and_satellite_sections(self):
+        out = cb.format_status_sections(
+            "local roster", {"mac": (0, "mac roster"), "pi": (0, "pi roster")}
+        )
+        self.assertEqual(
+            out,
+            "```\nlocal:\nlocal roster\n\nmac:\nmac roster\n\npi:\npi roster\n```",
+        )
+
+    def test_unreachable_satellite_shown_without_failing_whole_command(self):
+        out = cb.format_status_sections(
+            "local roster", {"mac": (1, "connection refused")}
+        )
+        self.assertEqual(
+            out, "```\nlocal:\nlocal roster\n\nmac:\n(unreachable)\n```"
+        )
+
+
 class RunWorkerCmdTests(unittest.TestCase):
     def setUp(self):
         self.seen = {}
