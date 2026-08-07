@@ -8,19 +8,124 @@ screen on stdin, writes a dark-terminal PNG to the path in argv[1]. Exits
 non-zero (and prints why) if Pillow is unavailable, so the caller can fall
 back to text.
 
-  claude-worker read foo 40 | term-shot /tmp/foo.png
+The input may carry ANSI SGR colour/attribute escapes (from `tmux capture-pane
+-e`); they are parsed so the image shows the worker's real colours. Plain text
+with no escapes renders exactly as a single-colour screen, so non-colour
+callers are unaffected.
+
+  claude-worker read foo 40 --ansi | term-shot /tmp/foo.png
 """
+import re
 import sys
 
 FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
     "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/SFNSMono.ttf",
 ]
 FG = (201, 209, 217)   # GitHub-dark foreground
 BG = (13, 17, 23)      # GitHub-dark background
 FONT_SIZE = 18
 PAD = 16
+
+# VS Code dark terminal palette — 0-7 normal, 8-15 bright — legible on BG.
+BASE16 = [
+    (13, 17, 23),   (205, 49, 49),  (13, 188, 121), (229, 229, 16),
+    (36, 114, 200), (188, 63, 188), (17, 168, 205), (201, 209, 217),
+    (102, 102, 102), (241, 76, 76), (35, 209, 139), (245, 245, 67),
+    (59, 142, 234),  (214, 112, 214), (41, 184, 219), (255, 255, 255),
+]
+
+# Any escape sequence: SGR (…m) is parsed for colour; everything else
+# (cursor moves, OSC titles, private modes) is matched so it can be dropped.
+TOKEN = re.compile(
+    r"\x1b\[[0-9;]*m"                       # SGR (colour/attrs)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC …BEL / ST
+    r"|\x1b[\[\]][0-9;?]*[A-Za-z]"          # other CSI/private
+    r"|\x1b."                               # stray two-char escape
+    r"|\n"
+    r"|[^\x1b\n]+"                          # a run of visible text
+)
+
+
+def xterm256(n):
+    if n < 16:
+        return BASE16[n]
+    if n < 232:
+        n -= 16
+        steps = (0, 95, 135, 175, 215, 255)
+        return (steps[(n // 36) % 6], steps[(n // 6) % 6], steps[n % 6])
+    v = 8 + 10 * (n - 232)
+    return (v, v, v)
+
+
+def apply_sgr(params, st):
+    """Mutate render state `st` for one SGR escape's numeric params."""
+    if not params:
+        params = [0]
+    i = 0
+    while i < len(params):
+        p = params[i]
+        if p == 0:
+            st.update(fg=FG, bg=None, bold=False, idx=None)
+        elif p == 1:
+            st["bold"] = True
+            if st["idx"] is not None:
+                st["fg"] = BASE16[st["idx"] + 8]
+        elif p == 22:
+            st["bold"] = False
+            if st["idx"] is not None:
+                st["fg"] = BASE16[st["idx"]]
+        elif 30 <= p <= 37:
+            st["idx"] = p - 30
+            st["fg"] = BASE16[st["idx"] + (8 if st["bold"] else 0)]
+        elif p == 39:
+            st["idx"], st["fg"] = None, FG
+        elif 90 <= p <= 97:
+            st["idx"], st["fg"] = None, BASE16[8 + p - 90]
+        elif 40 <= p <= 47:
+            st["bg"] = BASE16[p - 40]
+        elif p == 49:
+            st["bg"] = None
+        elif 100 <= p <= 107:
+            st["bg"] = BASE16[8 + p - 100]
+        elif p in (38, 48) and i + 1 < len(params):
+            key = "fg" if p == 38 else "bg"
+            mode = params[i + 1]
+            if mode == 5 and i + 2 < len(params):
+                st[key] = xterm256(params[i + 2])
+                if p == 38:
+                    st["idx"] = None
+                i += 2
+            elif mode == 2 and i + 4 < len(params):
+                st[key] = (params[i + 2], params[i + 3], params[i + 4])
+                if p == 38:
+                    st["idx"] = None
+                i += 4
+        i += 1
+
+
+def parse_lines(raw):
+    """Parse ANSI text into lines of (text, fg, bg) spans; SGR state carries
+    across lines, x resets each newline."""
+    st = {"fg": FG, "bg": None, "bold": False, "idx": None}
+    lines, spans = [], []
+    for tok in TOKEN.findall(raw):
+        if tok == "\n":
+            lines.append(spans)
+            spans = []
+        elif tok.startswith("\x1b"):
+            if tok.endswith("m") and tok[1] == "[":
+                body = tok[2:-1]
+                params = [int(x) if x else 0 for x in body.split(";")] if body else []
+                apply_sgr(params, st)
+            # non-SGR escapes are dropped
+        else:
+            spans.append((tok, st["fg"], st["bg"]))
+    lines.append(spans)
+    return lines
 
 
 def load_font():
@@ -42,14 +147,16 @@ def main():
     except ImportError as e:
         sys.exit(f"term-shot: Pillow not available: {e}")
 
-    text = sys.stdin.read().replace("\t", "    ")
-    lines = [ln.rstrip() for ln in text.split("\n")]
-    while lines and not lines[-1]:
+    raw = sys.stdin.read().replace("\t", "    ")
+    lines = parse_lines(raw)
+    # Trim leading/trailing blank lines (a span list is blank if it has no text).
+    blank = lambda spans: not any(t for t, _, _ in spans)
+    while lines and blank(lines[-1]):
         lines.pop()
-    while lines and not lines[0]:
+    while lines and blank(lines[0]):
         lines.pop(0)
     if not lines:
-        lines = ["(blank screen)"]
+        lines = [[("(blank screen)", FG, None)]]
 
     font = load_font()
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
@@ -58,14 +165,20 @@ def main():
     ascent, descent = font.getmetrics()
     line_h = ascent + descent + 3
 
-    cols = max(len(ln) for ln in lines)
+    cols = max((sum(len(t) for t, _, _ in spans) for spans in lines), default=1) or 1
     width = int(PAD * 2 + cell_w * cols) + 2
     height = int(PAD * 2 + line_h * len(lines))
     img = Image.new("RGB", (width, height), BG)
     draw = ImageDraw.Draw(img)
     y = PAD
-    for ln in lines:
-        draw.text((PAD, y), ln, font=font, fill=FG)
+    for spans in lines:
+        x = float(PAD)
+        for text, fg, bg in spans:
+            w = cell_w * len(text)
+            if bg is not None and bg != BG:
+                draw.rectangle([x, y, x + w, y + line_h], fill=bg)
+            draw.text((x, y), text, font=font, fill=fg)
+            x += w
         y += line_h
     img.save(out)
 
