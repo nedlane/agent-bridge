@@ -3531,29 +3531,33 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # turn's text.
                 worker_spoke = name in notified
                 notified.discard(name)
-                # Codex's Stop hook hands us the final assistant message inline
-                # (the relay always sets a "reply" key, empty string included);
-                # Claude's relay never does, so its absence selects the
-                # transcript-parsing path below.
-                codex_reply = event.get("reply")
+                # A relay can hand us the final assistant message inline, computed
+                # where the transcript lives (essential for remote workers whose
+                # transcript the bridge can't read across the network): Codex always
+                # sets a "reply" key (empty string included) and the Claude
+                # done-relay now sets it too whenever its extraction was non-empty.
+                # Its presence selects the inline-post path; its absence (None)
+                # selects the transcript-parsing fallback below — byte-identical to
+                # before this change.
+                inline_reply = event.get("reply")
                 # Price the turn before any branch below advances the offset.
                 await charge_turn(name, channel_id, path,
-                                  event.get("model"), codex_reply is not None)
+                                  event.get("model"), inline_reply is not None)
                 if channel_id and limit_hit:
-                    if codex_reply is None:
+                    if inline_reply is None:
                         _, off = extract_new_reply(path, offsets.get(path, 0))
                         offsets[path] = off
                     print(f"[bridge] {name}: provider usage limit notified — "
                           "fallback silent")
                 elif channel_id and worker_spoke:
-                    if codex_reply is None:
+                    if inline_reply is None:
                         _, off = extract_new_reply(path, offsets.get(path, 0))
                         offsets[path] = off
                     print(f"[bridge] {name}: turn ended, worker already notified — fallback silent")
-                elif channel_id and codex_reply is not None:
-                    # Codex: no transcript parse — the reply rode in on the event.
-                    reply = codex_reply.strip() or "(no new reply text captured — use /screen)"
-                    print(f"[bridge] {name}: codex turn ended, posting "
+                elif channel_id and inline_reply is not None:
+                    # Inline reply rode in on the event — no transcript parse.
+                    reply = inline_reply.strip() or "(no new reply text captured — use /screen)"
+                    print(f"[bridge] {name}: turn ended (inline reply), posting "
                           f"{len(reply)} chars to {channel_id}")
                     await post(channel_id, await tag_reply(name, reply))
                 elif channel_id:

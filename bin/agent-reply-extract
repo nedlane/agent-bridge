@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Print the new assistant reply in a Claude transcript since a stored byte
+offset, then advance the offset. Used by claude-worker-done-relay so reply
+extraction runs where the transcript lives (works for remote workers, whose
+transcript the bridge cannot read across the network).
+
+Usage: agent-reply-extract <transcript_path> <offset_file>
+
+Reads the integer byte offset from <offset_file> (0 if missing/blank/invalid),
+calls the bridge's extract_new_reply(transcript, offset) -> (reply, new_offset),
+writes new_offset back to <offset_file>, and prints reply to stdout (nothing if
+empty). Only complete transcript lines are consumed, so a mid-write trailing
+line is left for the next run (race-safe, same guarantee as the bridge).
+"""
+import importlib.util
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+
+
+def _bridge():
+    # bin/agent-bridge has no .py extension, so load it with an explicit
+    # SourceFileLoader — identical to how tests/test_claude_bridge.py does it.
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-bridge")
+    loader = SourceFileLoader("claude_bridge", path)
+    spec = importlib.util.spec_from_loader("claude_bridge", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _read_offset(off_file):
+    try:
+        with open(off_file) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.stderr.write("usage: agent-reply-extract <transcript_path> <offset_file>\n")
+        return 2
+    transcript, off_file = sys.argv[1], sys.argv[2]
+    start = _read_offset(off_file)
+    cb = _bridge()
+    reply, new_offset = cb.extract_new_reply(transcript, start)
+    with open(off_file, "w") as f:
+        f.write(str(new_offset))
+    if reply:
+        sys.stdout.write(reply)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
