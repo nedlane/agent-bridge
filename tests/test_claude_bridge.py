@@ -517,6 +517,25 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cb.load_config(path), cb.default_config())
 
 
+class ListenHostDefaultTests(unittest.TestCase):
+    def test_defaults_to_loopback(self):
+        self.assertEqual(cb.default_config()["listen_host"], "127.0.0.1")
+
+    def test_load_config_respects_explicit_value(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "config.json")
+            with open(path, "w") as f:
+                json.dump({"listen_host": "100.105.249.62"}, f)
+            cfg = cb.load_config(path)
+            self.assertEqual(cfg["listen_host"], "100.105.249.62")
+
+    def test_load_config_missing_file_defaults_to_loopback(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "does-not-exist.json")
+            cfg = cb.load_config(path)
+            self.assertEqual(cfg["listen_host"], "127.0.0.1")
+
+
 class SenderIdentityTests(unittest.TestCase):
     def test_sender_tag_carries_name_user_and_channel(self):
         tag = cb.sender_tag("Christian", 42, 99)

@@ -481,6 +481,7 @@ def default_config():
         "category_id": 0,
         "allowed_users": [],
         "idle_minutes": 45,
+        "listen_host": "127.0.0.1",
         "listen_port": 8765,
         "repos": {},
         "welcome_channel": None,
@@ -3826,9 +3827,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         app.router.add_post("/event", handle_event)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", int(cfg["listen_port"]))
+        site = web.TCPSite(runner, cfg["listen_host"], int(cfg["listen_port"]))
         await site.start()
-        print(f"[bridge] event listener on 127.0.0.1:{cfg['listen_port']}")
+        print(f"[bridge] event listener on {cfg['listen_host']}:{cfg['listen_port']}")
         asyncio.create_task(reaper())
         await client.start(token)
 
