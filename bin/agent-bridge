@@ -2290,7 +2290,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # Screen capture is enough on every pass; do the extra tmux
                 # liveness subprocess only once a minute.
                 if tick % 12 == 0 and not await asyncio.to_thread(
-                        worker_alive, name):
+                        worker_alive, name, target):
                     return
                 screen = await asyncio.to_thread(worker_screen, name, 80, False, target)
                 hint = provider_usage_limit_notice(screen)
