@@ -1496,13 +1496,13 @@ def run_worker_cmd(host_target, argv, timeout=180, input_text=None, env=None):
                 input_text=input_text)
 
 
-def worker_alive(name):
-    r = _run(["agent-worker", "status", name], timeout=15)
+def worker_alive(name, host_target=None):
+    r = run_worker_cmd(host_target, ["agent-worker", "status", name], timeout=15)
     return "running: yes" in r.stdout
 
 
-def worker_busy(name):
-    r = _run(["agent-worker", "read", name, "30"], timeout=15)
+def worker_busy(name, host_target=None):
+    r = run_worker_cmd(host_target, ["agent-worker", "read", name, "30"], timeout=15)
     return worker_busy_text(r.stdout)
 
 
@@ -2066,7 +2066,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     # --append-system-prompt; the protocol rides in as a user turn instead).
     codex_unprimed = set()
 
-    async def wait_ready(name, timeout=180, harness=None):
+    async def wait_ready(name, timeout=180, harness=None, host_target=None):
         """Poll until the worker pane is idle and input-ready (or timeout).
 
         agent-worker start returns success even when its own readiness check
@@ -2082,9 +2082,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         stable = 0
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not await asyncio.to_thread(worker_alive, name):
+            if not await asyncio.to_thread(worker_alive, name, host_target):
                 return False
-            screen = await asyncio.to_thread(worker_screen, name, 40)
+            screen = await asyncio.to_thread(worker_screen, name, 40, False, host_target)
             if screen_is_ready(screen, harness):
                 stable += 1
                 if stable >= 2:
@@ -2178,10 +2178,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         """Build a worker's live-screen payload as (text, attachments): an
         image (falls back to a code block if rendering is unavailable). Shared
         by the 👀 reaction and the /screen command."""
-        if not await asyncio.to_thread(worker_alive, name):
+        target = resolve_host_target(cfg, repo_by_name(name))
+        if not await asyncio.to_thread(worker_alive, name, target):
             return f"👀 `{name}` isn't running right now.", None
         # Capture with colour for the image; term-shot parses the ANSI escapes.
-        target = resolve_host_target(cfg, repo_by_name(name))
         screen = await asyncio.to_thread(worker_screen, name, 40, True, target)
         png = os.path.join(STATE_ROOT, name, "peek.png")
         if await asyncio.to_thread(render_screen_png, screen, png):
@@ -2203,7 +2203,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         The panel only opens on an idle worker — typing /usage mid-turn would
         inject it into the running conversation as steering — so this bails
         when the worker is busy or has half-written input in the box."""
-        if not await asyncio.to_thread(worker_alive, name):
+        target = resolve_host_target(cfg, repo_by_name(name))
+        if not await asyncio.to_thread(worker_alive, name, target):
             return f"📊 `{name}` isn't running right now.", None
         harness = harness_of(name)
         if harness in ("codex", "antigravity"):
@@ -2215,7 +2216,6 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 f"📊 usage isn't wired up for **{harness}** workers — use "
                 f"`/screen` to peek at `{name}`.", None,
             )
-        target = resolve_host_target(cfg, repo_by_name(name))
         screen = await asyncio.to_thread(worker_screen, name, 30, False, target)
         if not screen_is_ready(screen, harness):
             return f"📊 `{name}` is busy right now — try `/usage` once it's idle.", None
@@ -2341,7 +2341,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if harness_for(repo) not in ("claude", "codex"):
                 continue
             name = repo["name"]
-            if await asyncio.to_thread(worker_alive, name):
+            if await asyncio.to_thread(worker_alive, name,
+                                       resolve_host_target(cfg, repo)):
                 await notify_provider_limit(name, channel_for_worker(name))
 
     async def deliver(name, text, message=None, typed=False, tag=None):
@@ -2359,7 +2360,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # silently discarded. Wait for a genuinely input-ready prompt first,
         # exactly as the cold-start path does. A normal running turn is not
         # compaction and queues steering fine, so it isn't delayed here.
-        if screen_is_compacting(screen) and not await wait_ready(name) and message:
+        if screen_is_compacting(screen) and not await wait_ready(name, host_target=target) and message:
             # Compaction outlasted the wait — a paste now would be silently
             # discarded. Warn instead of a misleading ✅, and let Ned retry
             # once the worker is idle (his upload is already saved to inbox).
@@ -2397,7 +2398,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     # The restart resumes and may auto-compact; wait for an
                     # input-ready prompt before re-sending so the recovery
                     # doesn't re-lose the message into a loading TUI.
-                    await wait_ready(name)
+                    await wait_ready(name, host_target=target)
                     r = await asyncio.to_thread(worker_send, name, text, typed, target)
         if r.returncode != 0:
             if message:
@@ -2476,10 +2477,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     async def handle_repo_message(message, repo):
         name, directory = repo["name"], repo["dir"]
         harness = harness_for(repo)
-        if not await asyncio.to_thread(worker_alive, name):
+        target = resolve_host_target(cfg, repo)
+        if not await asyncio.to_thread(worker_alive, name, target):
             resume = should_resume(worker_has_state(name), fresh_pending(name))
             await message.add_reaction("🚀" if resume else "🧼")
-            target = resolve_host_target(cfg, repo)
             r = await asyncio.to_thread(
                 worker_start, name, directory, message.channel.id, resume,
                 repo.get("profile", "owner"), harness, target,
@@ -2499,7 +2500,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # The resume can auto-compact; wait for a genuinely input-ready
             # prompt before pasting, or this waking message is discarded when
             # the resume/compaction redraw replaces the input box.
-            if not await wait_ready(name):
+            if not await wait_ready(name, host_target=target):
                 await message.channel.send(
                     f"⚠️ `{name}` resumed but isn't input-ready yet (still "
                     "compacting?). Re-send your message in a moment."
@@ -2651,15 +2652,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
 
-    async def wait_busy(name, harness, timeout=HANDOFF_PICKUP_SECONDS):
+    async def wait_busy(name, harness, timeout=HANDOFF_PICKUP_SECONDS,
+                        host_target=None):
         """Poll until the worker's pane stops reading as idle — i.e. it has
         picked up the message just delivered. Returns False if it never did
         (answered within one poll, or never saw the paste)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not await asyncio.to_thread(worker_alive, name):
+            if not await asyncio.to_thread(worker_alive, name, host_target):
                 return False
-            screen = await asyncio.to_thread(worker_screen, name, 40)
+            screen = await asyncio.to_thread(worker_screen, name, 40, False, host_target)
             if not screen_is_ready(screen, harness):
                 return True
             await asyncio.sleep(1)
@@ -2669,6 +2671,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         """Ask the live worker to write a handoff note for the next engine,
         wait for it to finish, and return a short status suffix. Never
         blocks the switch — always returns, whatever happened."""
+        target = resolve_host_target(cfg, repo_by_name(name))
         try:
             try:
                 os.remove(handoff_path(name))
@@ -2682,11 +2685,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # turn to actually START before waiting for it to end — otherwise
             # the pre-turn idle prompt reads as "finished", and the stop below
             # kills the worker in the middle of writing the note.
-            await wait_busy(name, outgoing_harness)
+            await wait_busy(name, outgoing_harness, host_target=target)
             finished = await wait_ready(
                 name,
                 timeout=HANDOFF_TIMEOUT_SECONDS,
                 harness=outgoing_harness,
+                host_target=target,
             )
             # The file is the real signal either way: a worker that wrote the
             # note and then moved on to something else still handed off, even
@@ -2741,11 +2745,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # engine; a stale codex-prime flag from the old engine is cleared.
         cancel_limit_watcher(name, clear_notice=True)
         handoff_note = ""
+        target = resolve_host_target(cfg, repo)
         try:
-            if await asyncio.to_thread(worker_alive, name):
+            if await asyncio.to_thread(worker_alive, name, target):
                 if handoff:
                     handoff_note = await capture_handoff(name, outgoing_harness)
-                target = resolve_host_target(cfg, repo)
                 await asyncio.to_thread(worker_stop, name, target)
             elif handoff:
                 handoff_note = " ℹ️ no running session to capture a handoff from."
@@ -3449,7 +3453,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not repo or not channel_allows(cfg, after.channel.id, after.author.id):
             return
         name = repo["name"]
-        if not await asyncio.to_thread(worker_alive, name):
+        if not await asyncio.to_thread(worker_alive, name,
+                                       resolve_host_target(cfg, repo)):
             return
         # An edit steers a live worker exactly like a new message, so it is
         # charged the same way — otherwise a capped user keeps driving by
@@ -3706,12 +3711,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     {"error": f"no repo channel mapped for worker {name!r}"},
                     status=400,
                 )
-            if await asyncio.to_thread(worker_alive, name):
+            target = resolve_host_target(cfg, repo)
+            if await asyncio.to_thread(worker_alive, name, target):
                 last_activity[name] = time.time()
                 return web.json_response({"status": "ok", "note": "already running"})
             resume = should_resume(worker_has_state(name), fresh_pending(name))
             harness = harness_for(repo)
-            target = resolve_host_target(cfg, repo)
             r = await asyncio.to_thread(
                 worker_start, name, repo["dir"], channel_id, resume,
                 repo.get("profile", "owner"), harness, target,
@@ -3802,10 +3807,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 last = last_activity.get(name)
                 if last is None or time.time() - last < idle_s:
                     continue
-                if await asyncio.to_thread(worker_alive, name) and not (
-                    await asyncio.to_thread(worker_busy, name)
+                target = resolve_host_target(cfg, repo)
+                if await asyncio.to_thread(worker_alive, name, target) and not (
+                    await asyncio.to_thread(worker_busy, name, target)
                 ):
-                    target = resolve_host_target(cfg, repo)
                     await asyncio.to_thread(worker_stop, name, target)
                     last_activity.pop(name, None)
                     channel_id = channel_for_worker(name)

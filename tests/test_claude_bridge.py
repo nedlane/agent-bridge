@@ -1743,5 +1743,42 @@ class RunWorkerCmdTests(unittest.TestCase):
         self.assertEqual(self.seen["args"][:3], ["ssh", "me@h", "--"])
 
 
+class WorkerPollHostAwareTests(unittest.TestCase):
+    """worker_alive/worker_busy default to local (byte-identical to before) and
+    route through run_worker_cmd → ssh_wrap when given a host_target."""
+
+    def setUp(self):
+        self.calls = []
+        self._orig = cb._run
+        # Capture EVERY argv reaching _run and hand back a stub result whose
+        # stdout satisfies both pollers ("running: yes" for alive; the read
+        # capture is passed to worker_busy_text, which is fine empty).
+        cb._run = lambda args, timeout=180, input_text=None: (
+            self.calls.append(args)
+            or __import__("subprocess").CompletedProcess(args, 0, "running: yes", "")
+        )
+
+    def tearDown(self):
+        cb._run = self._orig
+
+    def test_worker_alive_local_argv_unchanged(self):
+        cb.worker_alive("app")
+        self.assertEqual(self.calls[-1], ["agent-worker", "status", "app"])
+
+    def test_worker_alive_remote_ssh_wrapped(self):
+        cb.worker_alive("app", host_target="me@hc-002")
+        self.assertEqual(self.calls[-1][:3], ["ssh", "me@hc-002", "--"])
+        self.assertIn("agent-worker status app", self.calls[-1][3])
+
+    def test_worker_busy_local_argv_unchanged(self):
+        cb.worker_busy("app")
+        self.assertEqual(self.calls[-1], ["agent-worker", "read", "app", "30"])
+
+    def test_worker_busy_remote_ssh_wrapped(self):
+        cb.worker_busy("app", host_target="me@hc-002")
+        self.assertEqual(self.calls[-1][:3], ["ssh", "me@hc-002", "--"])
+        self.assertIn("agent-worker read app 30", self.calls[-1][3])
+
+
 if __name__ == "__main__":
     unittest.main()
