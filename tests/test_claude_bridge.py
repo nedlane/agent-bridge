@@ -65,6 +65,54 @@ class VerifySignatureTests(unittest.TestCase):
         self.assertFalse(cb.verify_signature(body, self._sig(body, ""), ""))
 
 
+class MultipartEventAuthTests(unittest.TestCase):
+    """Pin the HMAC contract the multipart /event branch relies on: it verifies
+    over the raw bytes of the `payload` field exactly as the JSON path verifies
+    over the raw request body. If the multipart branch ever hashed anything but
+    those bytes, this would break."""
+
+    def test_signed_metadata_verifies(self):
+        secret = "s"
+        body = b'{"event_type":"claude.worker.send","chat":"discord:1","content":"x"}'
+        sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        self.assertTrue(cb.verify_signature(body, sig, secret))
+
+    def test_tampered_payload_rejected(self):
+        secret = "s"
+        body = b'{"event_type":"claude.worker.send","content":"x"}'
+        sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        # A byte flipped after signing (e.g. content swapped in flight) fails.
+        self.assertFalse(
+            cb.verify_signature(body.replace(b'"x"', b'"y"'), sig, secret)
+        )
+
+
+class BridgeUrlIsLocalTests(unittest.TestCase):
+    """The Python helper mirrors the shell check in discord-notify that decides
+    JSON-paths vs. multipart-upload transport."""
+
+    def test_loopback_hosts_are_local(self):
+        for url in (
+            "http://127.0.0.1:8787/event",
+            "http://localhost:8787/event",
+            "http://[::1]:8787/event",
+            "http://LOCALHOST/event",
+        ):
+            self.assertTrue(cb.bridge_url_is_local(url), url)
+
+    def test_remote_hosts_are_not_local(self):
+        for url in (
+            "http://100.105.249.62:8787/event",
+            "http://192.168.1.10/event",
+            "https://bridge.example.com/event",
+        ):
+            self.assertFalse(cb.bridge_url_is_local(url), url)
+
+    def test_blank_url_is_not_local(self):
+        self.assertFalse(cb.bridge_url_is_local(""))
+        self.assertFalse(cb.bridge_url_is_local(None))
+
+
 class ChannelAllowsTests(unittest.TestCase):
     def test_welcome_channel_open_to_anyone(self):
         cfg = {"welcome_channel": 555, "allowed_users": [], "repos": {}}

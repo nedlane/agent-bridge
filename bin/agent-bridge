@@ -95,6 +95,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 
 CONFIG_PATH = os.path.expanduser(
@@ -1348,6 +1349,21 @@ def verify_signature(body, header, secret):
         return False
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(header, expected)
+
+
+def bridge_url_is_local(url):
+    """True if the bridge in BRIDGE_WEBHOOK_URL shares this machine's disk.
+
+    discord-notify mirrors this test to decide transport: a loopback host
+    (127.0.0.1 / localhost) means the bridge can read attachment files off our
+    local disk (send paths in JSON), while any other host is a remote parent
+    that cannot (upload the bytes via multipart). Kept here so a stdlib test
+    can pin the exact host set the shell check must match.
+    """
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url or "").hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
 
 
 def read_kv_file(path):
@@ -3537,7 +3553,72 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await peek_screen(payload.channel_id, repo["name"])
 
     # ---- localhost event listener (Stop hook + relays post here) ----------
+    async def dispatch_worker_send(event, attachments):
+        """Post a claude.worker.send event's content + attachments to Discord.
+
+        Shared by the JSON and multipart paths so both reach the channel the
+        same way; the only difference is where `attachments` came from (local
+        paths in the JSON event vs. temp files written from uploaded bytes).
+        """
+        worker = event.get("worker", "")
+        if worker:
+            notified.add(worker)
+        channel_id = worker_notification_channel(cfg, worker, event.get("chat", ""))
+        content = event.get("content") or ""
+        if channel_id and (content or attachments):
+            if worker:
+                content = await tag_reply(worker, content)
+            await post(channel_id, content, attachments)
+
+    async def handle_multipart_event(request):
+        """A remote worker whose files the bridge can't read off disk uploads
+        the bytes here as multipart/form-data: field `payload` is the exact
+        signed JSON metadata (verified over its raw bytes, identically to the
+        JSON path), and each `file` part is an attachment. We stage the uploads
+        to temp files and dispatch through the same Discord-post code, then
+        clean the temp files up."""
+        payload_bytes = None
+        tmp_paths = []
+        try:
+            reader = await request.multipart()
+            async for part in reader:
+                if part.name == "payload":
+                    payload_bytes = await part.read(decode=False)
+                else:
+                    fd, tmp = tempfile.mkstemp(
+                        prefix="bridge-upload-",
+                        suffix="-" + os.path.basename(part.filename or "attachment"),
+                    )
+                    with os.fdopen(fd, "wb") as out:
+                        while True:
+                            chunk = await part.read_chunk()
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                    tmp_paths.append(tmp)
+            if payload_bytes is None:
+                return web.json_response({"error": "missing payload"}, status=400)
+            if not verify_signature(
+                payload_bytes, request.headers.get("X-Webhook-Signature", ""), secret
+            ):
+                return web.json_response({"error": "bad signature"}, status=401)
+            try:
+                event = json.loads(payload_bytes)
+            except ValueError:
+                return web.json_response({"error": "bad json"}, status=400)
+            if event.get("event_type", "") == "claude.worker.send":
+                await dispatch_worker_send(event, tmp_paths)
+            return web.json_response({"status": "ok"})
+        finally:
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
     async def handle_event(request):
+        if (request.content_type or "").startswith("multipart/form-data"):
+            return await handle_multipart_event(request)
         body = await request.read()
         if not verify_signature(
             body, request.headers.get("X-Webhook-Signature", ""), secret
