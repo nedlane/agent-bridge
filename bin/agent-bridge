@@ -2247,6 +2247,20 @@ def prune_old_files(directory, max_age_seconds, now=None):
     return removed
 
 
+def keyed_async_lock(locks, key):
+    """Return one stable asyncio lock per key.
+
+    Discord dispatches message and edit callbacks concurrently.  Keeping lock
+    creation synchronous means the first callback for a worker owns its whole
+    wake/resume/send lifecycle before a later callback can touch the same TUI.
+    """
+    lock = locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[key] = lock
+    return lock
+
+
 def handoff_path(name, state_root=None):
     return os.path.join(state_root or STATE_ROOT, name, "handoff.md")
 
@@ -2308,6 +2322,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     offsets = {}        # transcript path -> bytes already consumed
     notified = set()    # workers that messaged Ned themselves this turn
     turn_locks = {}     # transcript key -> asyncio.Lock (serialize turn_ended)
+    inbound_locks = {}  # worker name -> asyncio.Lock (serialize Discord input)
     usage_state = load_usage_state()
     usage_noticed = {}  # (channel id, user id) -> epoch of last refusal notice
     pricing = load_pricing()
@@ -3903,9 +3918,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return
         repo = repo_for_channel(message.channel.id)
         if repo and channel_allows(cfg, message.channel.id, message.author.id):
-            if not await usage_gate(message):
-                return
-            await handle_repo_message(message, repo)
+            # Hold this from before the first await through start/resume,
+            # auto-compaction and the final send.  Without it, an edit or a
+            # second message can see the newly-created tmux pane while this
+            # waking message is still waiting for compaction, send first, and
+            # have the TUI redraw silently discard the original message.
+            async with keyed_async_lock(inbound_locks, repo["name"]):
+                if not await usage_gate(message):
+                    return
+                await handle_repo_message(message, repo)
 
     @client.event
     async def on_message_edit(before, after):
@@ -3927,20 +3948,25 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not repo or not channel_allows(cfg, after.channel.id, after.author.id):
             return
         name = repo["name"]
-        if not await asyncio.to_thread(worker_alive, name,
-                                       resolve_host_target(cfg, repo)):
-            return
-        # An edit steers a live worker exactly like a new message, so it is
-        # charged the same way — otherwise a capped user keeps driving by
-        # editing instead of sending.
-        if not await usage_gate(after):
-            return
-        await deliver(
-            name, compose_edit(after.content, after.author.display_name), after,
-            typed=False,
-            tag=sender_tag(after.author.display_name, after.author.id,
-                           after.channel.id),
-        )
+        # Queue behind an original message that may currently be reviving and
+        # compacting the worker.  The liveness check belongs inside the lock:
+        # the worker can legitimately be stopped when the edit event arrives
+        # and become live while the original message ahead of it is handled.
+        async with keyed_async_lock(inbound_locks, name):
+            if not await asyncio.to_thread(worker_alive, name,
+                                           resolve_host_target(cfg, repo)):
+                return
+            # An edit steers a live worker exactly like a new message, so it is
+            # charged the same way — otherwise a capped user keeps driving by
+            # editing instead of sending.
+            if not await usage_gate(after):
+                return
+            await deliver(
+                name, compose_edit(after.content, after.author.display_name), after,
+                typed=False,
+                tag=sender_tag(after.author.display_name, after.author.id,
+                               after.channel.id),
+            )
 
     @client.event
     async def on_raw_reaction_add(payload):

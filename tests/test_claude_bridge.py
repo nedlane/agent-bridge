@@ -7,6 +7,7 @@ pure helpers without those third-party packages installed.
 Run: python3 -m unittest discover -s tests -v
 """
 
+import asyncio
 import hashlib
 import hmac
 import importlib.util
@@ -32,6 +33,42 @@ def _load_module():
 
 
 cb = _load_module()
+
+
+class KeyedAsyncLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_same_worker_reuses_lock_and_serializes_callbacks(self):
+        locks = {}
+        order = []
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def first():
+            async with cb.keyed_async_lock(locks, "worker"):
+                order.append("first entered")
+                first_entered.set()
+                await release_first.wait()
+                order.append("first left")
+
+        async def second():
+            await first_entered.wait()
+            async with cb.keyed_async_lock(locks, "worker"):
+                order.append("second entered")
+
+        first_task = asyncio.create_task(first())
+        second_task = asyncio.create_task(second())
+        await first_entered.wait()
+        await asyncio.sleep(0)
+        self.assertEqual(order, ["first entered"])
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+        self.assertEqual(order, ["first entered", "first left", "second entered"])
+
+    async def test_different_workers_get_different_locks(self):
+        locks = {}
+        self.assertIsNot(
+            cb.keyed_async_lock(locks, "one"),
+            cb.keyed_async_lock(locks, "two"),
+        )
 
 
 class VerifySignatureTests(unittest.TestCase):

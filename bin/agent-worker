@@ -426,8 +426,12 @@ cmd_send() {
       tmux send-keys -t "$pane" C-c
       sleep "$SEND_DELAY"
     fi
-    printf '%s' "$text" | tmux load-buffer -b claude-worker-send -
-    tmux paste-buffer -p -d -b claude-worker-send -t "$pane"
+    # A unique buffer prevents simultaneous sends (bridge traffic plus a
+    # direct CLI send) from overwriting each other's staged text before tmux
+    # pastes it.  -d removes this process's buffer immediately after use.
+    local send_buffer="claude-worker-send-$$"
+    printf '%s' "$text" | tmux load-buffer -b "$send_buffer" -
+    tmux paste-buffer -p -d -b "$send_buffer" -t "$pane"
   fi
   for attempt in 1 2 3 4 5 6; do
     sleep "$SEND_DELAY"
