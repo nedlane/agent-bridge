@@ -60,7 +60,11 @@ else
   fail "no Discord bot token ($token_file) — the bridge cannot log in"
 fi
 if [[ -r "$bridge_cfg" ]]; then
-  pass "bridge config present ($bridge_cfg)"
+  if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$bridge_cfg" 2>/dev/null; then
+    pass "bridge config present and valid JSON ($bridge_cfg)"
+  else
+    fail "bridge config is not valid JSON ($bridge_cfg)"
+  fi
 else
   warn "no bridge config ($bridge_cfg) — no repo channels are mapped yet (/addrepo, or see the claude-bridge skill)"
 fi
@@ -72,7 +76,8 @@ fi
 
 # --- worker tooling ----------------------------------------------------------------
 for tool in claude-launch agent-worker claude-worker-todo-relay \
-            claude-worker-done-relay claude-bridge bridge-ctl discord-notify \
+            claude-worker-done-relay codex-worker-done-relay \
+            agent-session-usage claude-bridge bridge-ctl discord-notify \
             agent-checkup; do
   if command -v "$tool" >/dev/null 2>&1; then
     pass "$tool on PATH ($(command -v "$tool"))"
@@ -104,6 +109,15 @@ fi
 
 # --- satellite machines (if configured) -----------------------------------------------
 if [[ -r "$bridge_cfg" ]]; then
+  listen_port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("listen_port") or 8765)' "$bridge_cfg" 2>/dev/null)
+  if curl -fsS -m 5 "http://127.0.0.1:${listen_port:-8765}/healthz" \
+      | python3 -c 'import json,sys; assert json.load(sys.stdin).get("status") == "ok"' \
+      2>/dev/null; then
+    pass "bridge health endpoint responding on 127.0.0.1:${listen_port:-8765}"
+  else
+    warn "bridge health endpoint not responding on 127.0.0.1:${listen_port:-8765}"
+  fi
+
   # Derive the expected parent webhook URL from the bridge config itself,
   # instead of hardcoding the parent's IP/port here.
   parent_url=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("http://" + (d.get("listen_host") or "127.0.0.1") + ":" + str(d.get("listen_port") or 8765) + "/event")' "$bridge_cfg" 2>/dev/null)
@@ -112,15 +126,22 @@ if [[ -r "$bridge_cfg" ]]; then
   # Extract machines from config and probe each one
   machines_output=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(n + "\t" + (m.get("ssh") or "")) for n,m in (d.get("machines") or {}).items()]' "$bridge_cfg" 2>/dev/null)
   if [[ -n "$machines_output" ]]; then
+    for tool in ssh scp; do
+      if command -v "$tool" >/dev/null 2>&1; then
+        pass "$tool installed for satellite dispatch"
+      else
+        fail "$tool not found — remote workers cannot transfer/dispatch"
+      fi
+    done
     while IFS=$'\t' read -r machine_name machine_target; do
       if [[ -z "$machine_target" ]]; then
         continue
       fi
       if ssh -n -o ConnectTimeout=8 -o BatchMode=yes "$machine_target" \
-        "command -v agent-worker >/dev/null 2>&1 && grep -qF 'BRIDGE_WEBHOOK_URL=$parent_url' \"\$HOME/.config/claude-workers/bridge-webhook\" 2>/dev/null"; then
-        pass "satellite $machine_name ($machine_target): agent-worker present and relays point at the parent"
+        "command -v agent-worker agent-session-usage claude-worker-done-relay codex-worker-done-relay >/dev/null 2>&1 && grep -qF 'BRIDGE_WEBHOOK_URL=$parent_url' \"\$HOME/.config/claude-workers/bridge-webhook\" 2>/dev/null"; then
+        pass "satellite $machine_name ($machine_target): worker, usage helper, relays, and parent webhook ready"
       else
-        warn "satellite $machine_name ($machine_target): unreachable, or agent-worker missing, or bridge-webhook not pointed at the parent"
+        warn "satellite $machine_name ($machine_target): unreachable, worker/usage/relay tools missing, or bridge-webhook not pointed at the parent"
       fi
     done <<< "$machines_output"
   fi

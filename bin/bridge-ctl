@@ -13,11 +13,25 @@
 #                                      # 'machines'); omit for local
 #   bridge-ctl start <name>            # start that repo's worker via the
 #                                      # bridge (protocol injected, resumes)
+#   bridge-ctl status [name]           # fleet status, or one worker
+#   bridge-ctl cost <name>             # whole-session token cost (host-aware)
+#   bridge-ctl stop|restart|fresh|clear <name>
+#                                      # lifecycle through the bridge
+#   bridge-ctl harness <name> <engine> [--no-handoff]
+#                                      # switch Claude/Codex/Antigravity
+#   bridge-ctl fast <name>             # toggle Codex Fast tier
+#   bridge-ctl model <name> <model>     # send /model through the worker host
+#   bridge-ctl compact <name> [focus]   # compact context
+#   bridge-ctl checkin <name>           # request a Discord progress update
 #   bridge-ctl peek <name>             # post that worker's live screen into
 #                                      # its channel (same as the 👀 reaction)
 #   bridge-ctl rename <name> <label>   # rename that worker's Discord channel
 #                                      # (display label only; mapping unchanged)
 #   bridge-ctl repos                   # list channel -> repo mappings
+#   bridge-ctl machines                # list configured worker hosts
+#   bridge-ctl addmachine <name> <ssh-target>
+#   bridge-ctl rmmachine <name>         # blocked while repos use the host
+#   bridge-ctl health                  # bridge/Discord liveness summary
 #   bridge-ctl categories              # list Discord categories (name, channel
 #                                      # + worker counts, which is the default)
 #   bridge-ctl addguest <name> <discord_id> [edit|view]
@@ -60,6 +74,33 @@ print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
     -H "X-Webhook-Signature: $sig" -d "$1" "$url" \
     || die "bridge did not accept the request (is the service running?)"
   echo
+}
+
+worker_control() { # worker_control <action> [name] [engine] [handoff]
+  local body
+  body="$(ACTION="$1" NAME="${2:-}" ENGINE="${3:-}" HANDOFF="${4:-}" python3 -c '
+import json, os
+req = {"event_type": "claude.bridge.worker_control",
+       "action": os.environ["ACTION"]}
+if os.environ.get("NAME"):
+    req["name"] = os.environ["NAME"]
+if os.environ.get("ENGINE"):
+    req["engine"] = os.environ["ENGINE"]
+if os.environ.get("HANDOFF"):
+    req["handoff"] = os.environ["HANDOFF"].lower() == "true"
+print(json.dumps(req))')" || die "could not build request"
+  post_event "$body"
+}
+
+worker_control_value() { # worker_control_value <action> <name> <field> <value>
+  local body
+  body="$(ACTION="$1" NAME="$2" FIELD="$3" VALUE="$4" python3 -c '
+import json, os
+req = {"event_type": "claude.bridge.worker_control",
+       "action": os.environ["ACTION"], "name": os.environ["NAME"],
+       os.environ["FIELD"]: os.environ["VALUE"]}
+print(json.dumps(req))')" || die "could not build request"
+  post_event "$body"
 }
 
 cmd="${1:-}"
@@ -127,6 +168,46 @@ import json, os
 print(json.dumps({"event_type": "claude.bridge.start",
                   "name": os.environ["NAME"]}))')" || die "could not build request"
     post_event "$body"
+    ;;
+  status)
+    worker_control status "${2:-}"
+    ;;
+  cost|stop|restart|fresh|clear)
+    name="${2:-}"
+    [[ -n "$name" ]] || die "usage: bridge-ctl $cmd <name>"
+    worker_control "$cmd" "$name"
+    ;;
+  harness)
+    name="${2:-}"
+    engine="${3:-}"
+    option="${4:-}"
+    [[ -n "$name" && -n "$engine" ]] \
+      || die "usage: bridge-ctl harness <name> <claude|codex|antigravity> [--no-handoff]"
+    [[ "$engine" == claude || "$engine" == codex || "$engine" == antigravity ]] \
+      || die "engine must be claude, codex, or antigravity"
+    [[ -z "$option" || "$option" == "--no-handoff" ]] \
+      || die "unknown harness option '$option'"
+    worker_control harness "$name" "$engine" "$([[ "$option" == "--no-handoff" ]] && echo false || echo true)"
+    ;;
+  fast|checkin)
+    name="${2:-}"
+    [[ -n "$name" ]] || die "usage: bridge-ctl $cmd <name>"
+    worker_control "$cmd" "$name"
+    ;;
+  model)
+    name="${2:-}"
+    model="${3:-}"
+    [[ -n "$name" && -n "$model" ]] \
+      || die "usage: bridge-ctl model <name> <model>"
+    worker_control_value model "$name" model "$model"
+    ;;
+  compact)
+    name="${2:-}"
+    [[ -n "$name" ]] || die "usage: bridge-ctl compact <name> [focus]"
+    worker_control_value compact "$name" focus "${3:-}"
+    ;;
+  health)
+    post_event '{"event_type":"claude.bridge.health"}'
     ;;
   peek)
     name="${2:-}"
@@ -235,15 +316,53 @@ for cid, repo in repos.items():
     host = repo.get("host") or "local"
     print(f"{name:<20} {host:<10} discord:{cid}  {rdir}")' "$CONFIG"
     ;;
+  machines)
+    [[ -r "$CONFIG" ]] || die "no bridge config ($CONFIG)"
+    python3 -c '
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+machines = cfg.get("machines") or {}
+repos = list((cfg.get("repos") or {}).values())
+local_name = "local"
+local_target = "(this host)"
+local_count = sum(1 for r in repos
+                  if not r.get("host") or r.get("host") == "local")
+print(f"{local_name:<16} {local_target:<30} {local_count} repo(s)")
+for name, info in machines.items():
+    target = info.get("ssh") or "(missing ssh target)"
+    count = sum(1 for r in repos if r.get("host") == name)
+    print(f"{name:<16} {target:<30} {count} repo(s)")' "$CONFIG"
+    ;;
+  addmachine)
+    name="${2:-}"
+    target="${3:-}"
+    [[ -n "$name" && -n "$target" ]] \
+      || die "usage: bridge-ctl addmachine <name> <ssh-target>"
+    body="$(NAME="$name" TARGET="$target" python3 -c '
+import json, os
+print(json.dumps({"event_type": "claude.bridge.machine_set", "action": "set",
+                  "name": os.environ["NAME"], "ssh": os.environ["TARGET"]}))')" \
+      || die "could not build request"
+    post_event "$body"
+    ;;
+  rmmachine)
+    name="${2:-}"
+    [[ -n "$name" ]] || die "usage: bridge-ctl rmmachine <name>"
+    body="$(NAME="$name" python3 -c '
+import json, os
+print(json.dumps({"event_type": "claude.bridge.machine_set", "action": "remove",
+                  "name": os.environ["NAME"]}))')" || die "could not build request"
+    post_event "$body"
+    ;;
   categories)
     # Categories are live Discord state (not in config), so ask the bridge.
     # Prints JSON: {"categories":[{name, channels, workers, default}, ...]}.
     post_event '{"event_type": "claude.bridge.categories"}'
     ;;
   ''|-h|--help|help)
-    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    die "unknown command '$cmd' (addrepo, start, peek, rename, repos, categories, addguest, request, viewonly, revoke, guests)"
+    die "unknown command '$cmd' (addrepo, start, status, cost, stop, restart, fresh, clear, harness, fast, model, compact, checkin, peek, health, rename, repos, machines, addmachine, rmmachine, categories, addguest, request, viewonly, revoke, guests)"
     ;;
 esac

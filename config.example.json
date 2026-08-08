@@ -4,6 +4,13 @@
   "welcome_channel": 333333333333333333,
   "requests_channel": 444444444444444444,
   "idle_minutes": 120,
+  "listen_host": "127.0.0.1",
+  "listen_port": 8765,
+  "machines": {
+    "mac": {
+      "ssh": "you@mac.example"
+    }
+  },
   "repos": {
     "555555555555555555": {
       "name": "my-project",
@@ -15,7 +22,8 @@
     "666666666666666666": {
       "name": "solo-project",
       "dir": "/home/you/projects/solo-project",
-      "harness": "claude"
+      "harness": "claude",
+      "host": "mac"
     }
   },
   "usage_limits": {

@@ -2,6 +2,7 @@
 """Emit a JSON usage snapshot for a turn-end relay.
 
 Usage: agent-session-usage <claude|codex> <transcript_path>
+       agent-session-usage <claude|codex> --directory <working_directory>
 
 This runs on the worker host, where the transcript actually lives. The parent
 bridge can then price remote turns from the raw token snapshot without assuming
@@ -24,12 +25,26 @@ def _bridge():
 
 
 def main():
-    if len(sys.argv) != 3 or sys.argv[1] not in ("claude", "codex"):
+    if len(sys.argv) not in (3, 4) or sys.argv[1] not in ("claude", "codex"):
         sys.stderr.write(
-            "usage: agent-session-usage <claude|codex> <transcript_path>\n"
+            "usage: agent-session-usage <claude|codex> "
+            "<transcript_path>|--directory <working_directory>\n"
         )
         return 2
-    payload = _bridge().session_usage_event(sys.argv[1], sys.argv[2])
+    cb = _bridge()
+    if len(sys.argv) == 4 and sys.argv[2] == "--directory":
+        payload = cb.session_usage_for_directory(sys.argv[1], sys.argv[3])
+        if payload is None:
+            return 1
+    elif len(sys.argv) == 3:
+        payload = cb.session_usage_event(sys.argv[1], sys.argv[2])
+        payload["transcript_path"] = sys.argv[2]
+    else:
+        sys.stderr.write(
+            "usage: agent-session-usage <claude|codex> "
+            "<transcript_path>|--directory <working_directory>\n"
+        )
+        return 2
     json.dump(payload, sys.stdout, separators=(",", ":"))
     return 0
 

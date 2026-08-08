@@ -211,7 +211,9 @@ The bridge reads a single JSON file at `~/.config/claude-bridge/config.json`
 | `category_id` | int | Channel id of the **Claude** category new repo channels are created under. |
 | `allowed_users` | int[] | Owner Discord user ids. Gate config/roster-changing slash commands and every owner-only action (reaction decisions, guest management). A channel's editor guests can additionally run the read-only and worker-control commands on their own channel (see below). |
 | `idle_minutes` | int | Idle workers are stopped after this many minutes (default `45`). The next message revives them with `--continue`. |
-| `listen_port` | int | Port of the localhost signed-event listener (default `8765`). Must match the port in `bridge-webhook`. |
+| `listen_host` | string | Bind address for the event and health listener (default `127.0.0.1`). Use a tailnet address or `0.0.0.0` only when satellites must reach it; signed writes still require the shared HMAC secret. |
+| `listen_port` | int | Port of the signed-event listener (default `8765`). Must match the port in `bridge-webhook`. `GET /healthz` exposes a non-secret liveness summary on the same listener. |
+| `machines` | object | Optional logical host names mapped to `{ "ssh": "user@target" }`. Repos select one with `host`; absent means local. |
 | `repos` | object | Map of **channel id (string)** → repo object (below). |
 | `welcome_channel` | int \| null | Channel id of the public `#welcome` greeter (open to any member). `null` disables it. |
 | `requests_channel` | int \| null | Channel id where guest-access approval cards are posted. `null` disables it. |
@@ -223,6 +225,8 @@ Each entry in `repos` is keyed by the Discord channel id (as a string) and holds
 |---|---|---|
 | `name` | string | Worker/channel name (tmux session `cw-<name>`, state dir). |
 | `dir` | string | Absolute path to the repo the worker runs in. |
+| `host` | string | Optional key in `machines`; absent or `local` runs on the bridge host. |
+| `harness` | string | `claude` (default), `codex`, or experimental `antigravity`. |
 | `profile` | string | Capability profile: `owner` (default), `collab`, `utility`, or `greeter`. |
 | `guests` | int[] | Editor guest ids (View + Send — can drive the worker). Optional. |
 | `viewers` | int[] | View-only guest ids (can watch, can't drive). Optional. |
@@ -236,9 +240,13 @@ start with an empty `repos` object. A complete example:
   "category_id": 111111111111111111,
   "allowed_users": [222222222222222222],
   "idle_minutes": 45,
+  "listen_host": "127.0.0.1",
   "listen_port": 8765,
   "welcome_channel": 333333333333333333,
   "requests_channel": 444444444444444444,
+  "machines": {
+    "mac": { "ssh": "you@mac.example" }
+  },
   "repos": {
     "555555555555555555": {
       "name": "myrepo",
@@ -247,7 +255,8 @@ start with an empty `repos` object. A complete example:
     },
     "666666666666666666": {
       "name": "shared-thing",
-      "dir": "/home/you/guest-workspaces/shared-thing",
+      "dir": "/Users/you/projects/shared-thing",
+      "host": "mac",
       "profile": "collab",
       "guests": [777777777777777777],
       "viewers": [888888888888888888]
@@ -255,6 +264,38 @@ start with an empty `repos` object. A complete example:
   }
 }
 ```
+
+### Satellite workers
+
+A repo can run on another SSH-reachable machine while the parent bridge and
+Discord bot stay on one host. Configure a logical machine name, then assign it
+when creating the repo:
+
+```json
+{
+  "listen_host": "100.64.0.10",
+  "machines": {
+    "mac": { "ssh": "you@mac" }
+  }
+}
+```
+
+```bash
+bridge-ctl addmachine mac you@mac
+bridge-ctl addrepo ios-app /Users/you/projects/ios-app --host mac
+```
+
+The satellite needs `agent-worker`, `agent-session-usage`, both done relays,
+`discord-notify`, the chosen provider CLI, and tmux on `PATH`. Its
+`~/.config/claude-workers/bridge-webhook` must point back to the parent's
+tailnet-reachable `/event` URL and use the same secret. Run `agent-checkup` on
+the parent: it verifies SSH reachability, all required remote helpers, and the
+webhook target.
+
+Lifecycle, colour peeks, inbound/outbound attachments, harness handoffs, reply
+relays, provider-limit notifications, per-turn budgets, and `/cost` all resolve
+state/session data on the worker's own host. Home directories and XDG state
+paths do not need to match between machines.
 
 Every ordinary Discord message is prefixed for the worker with the sender's
 display name, immutable Discord user id, and channel id. This prevents a shared
@@ -346,11 +387,12 @@ a rate limit, and applies on every engine.
 so overage is bounded by one turn — a user can always blow through their
 budget with a single expensive turn.
 
-**Where the numbers come from.** At turn end the bridge reads Claude's
+**Where the numbers come from.** At turn end a host-local relay reads Claude's
 per-message `usage` from the parent transcript and every nested subagent or
 workflow transcript belonging to that session. Codex supplies a running
-`total_token_usage` in its rollout file. Both are priced against
-`pricing.json`.
+`total_token_usage` in its rollout file. The relay transports compact raw-token
+snapshots to the parent, so remote workers are metered without copying session
+files. Both are priced against `pricing.json`.
 
 The bridge keeps byte offsets for Claude's append-only transcript files and a
 cumulative reading for Codex, so each turn is the delta from the previous
@@ -472,10 +514,10 @@ channel you run it in.
 | `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |
-| `/cost [worker]` | What this channel's current worker session has cost so far — priced from the parent plus all nested subagent/workflow transcripts, not just turns seen since the daemon started. Shows the token breakdown and subagent count. Owner or a channel's editors. |
+| `/cost [worker]` | What this channel's current worker session has cost so far — priced on the worker's host from the parent plus all nested subagent/workflow transcripts, not just turns seen since the daemon started. Works for local and satellite workers; shows the token breakdown and subagent count. Owner or a channel's editors. |
 | `/limits` | Show **your own** usage against the limits configured for this channel (messages and cost). Ephemeral; open to anyone who can talk in the channel. |
 | `/checkin [worker]` | Ask a running worker to send a 3–5 line progress update. |
-| `/addrepo <name> <path> [category]` | Create `#<name>` and map it to a repo directory. Optional `category` files it under an existing category (matched loosely, ignoring emoji/case) or creates a new one; omitted, it lands in the default inbox category. |
+| `/addrepo <name> <path> [category] [host]` | Create `#<name>` and map it to a repo directory. Optional `category` files it under an existing category (matched loosely, ignoring emoji/case) or creates a new one; omitted, it lands in the default inbox category. Optional `host` names a configured satellite machine. |
 | `/close [worker] confirm:<name>` | **Irreversible teardown** — stop the worker, wipe its saved state, and delete its channel. Requires retyping the worker name in `confirm`. |
 | `/addguest <name> <discord_id> [edit\|view]` | Grant a guest edit (View+Send) or view (read-only) access to one channel. |
 | `/lockdown` | Drop **all** guests everywhere to view-only in one shot (leaves the owner untouched). |
@@ -520,6 +562,34 @@ Notes:
   is typed straight into the worker as keystrokes, so any Claude Code slash
   command (`/help`, `/context`, …) still works from Discord.
 
+## Shell control with `bridge-ctl`
+
+`bridge-ctl` is the signed, screen-independent control surface for operators,
+scripts, and workers. It talks to the same bridge actions as Discord, so remote
+placement, protocol injection, channel cleanup, and harness handoffs stay
+consistent:
+
+```bash
+bridge-ctl health
+bridge-ctl status [worker]
+bridge-ctl cost <worker>
+bridge-ctl start|stop|restart|fresh|clear <worker>
+bridge-ctl harness <worker> <claude|codex|antigravity> [--no-handoff]
+bridge-ctl fast <worker>
+bridge-ctl checkin <worker>
+bridge-ctl model <worker> <model>
+bridge-ctl compact <worker> [focus]
+bridge-ctl peek <worker>
+bridge-ctl repos
+bridge-ctl machines
+bridge-ctl addmachine <name> <ssh-target>
+bridge-ctl rmmachine <name>
+```
+
+`health` reports daemon uptime and Discord readiness. `status` without a worker
+aggregates local and satellite rosters. `fresh` and `clear` intentionally have
+the same channel-purge behavior as their Discord commands.
+
 ## Guest access & the public front desk
 
 The bridge has a lightweight "front desk" for letting other server members work
@@ -563,8 +633,8 @@ CI (`.github/workflows/ci.yml`) runs, on every push and pull request:
 
 - `bash -n` syntax checks over the shell tools,
 - **ShellCheck** over the shell tools,
-- `py_compile` over `bin/agent-bridge`,
-- `jq` validation of every `claude-profiles/*.json`,
+- `py_compile` over every Python tool in `bin/`,
+- `jq` validation of `config.example.json`, pricing, and every profile JSON,
 - the **`tests/` unit suite** (`python3 -m unittest discover -s tests`),
 - **Ruff** error-lint (`E9,F63,F7,F82`) over the daemon and tests — real-error
   rules only, so it never reddens CI over formatting.

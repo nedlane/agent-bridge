@@ -209,6 +209,13 @@ class ResolveHostTargetTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             cb.resolve_host_target({"machines": {}}, {"host": "mac"})
 
+    def test_machine_entry_validation(self):
+        self.assertIsNone(cb.machine_entry_error("mac-mini", "you@mac"))
+        self.assertIsNotNone(cb.machine_entry_error("local", "you@mac"))
+        self.assertIsNotNone(cb.machine_entry_error("bad name", "you@mac"))
+        self.assertIsNotNone(cb.machine_entry_error("mac", "-oProxyCommand=x"))
+        self.assertIsNotNone(cb.machine_entry_error("mac", "you@mac extra"))
+
 
 class DirExistsForHostTests(unittest.TestCase):
     def test_local_existing_dir_is_true(self):
@@ -637,7 +644,8 @@ class ConfigTests(unittest.TestCase):
     def test_defaults_shape(self):
         cfg = cb.default_config()
         for key in ("category_id", "allowed_users", "idle_minutes",
-                    "listen_port", "repos", "welcome_channel", "requests_channel"):
+                    "listen_host", "listen_port", "machines", "repos",
+                    "welcome_channel", "requests_channel"):
             self.assertIn(key, cfg)
 
     def test_save_then_load_round_trip(self):
@@ -1270,6 +1278,23 @@ class SessionLookupTests(unittest.TestCase):
                 self.assertEqual(cb.session_tokens(h, "/w/p", roots),
                                  (None, None, None, 0.0))
 
+    def test_directory_snapshot_is_json_safe_and_carries_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = os.path.join(root, cb.claude_project_slug("/w/p"))
+            os.makedirs(project)
+            path = os.path.join(project, "session.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({
+                    "type": "assistant",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 1, "output_tokens": 2}},
+                }) + "\n")
+            snapshot = cb.session_usage_for_directory(
+                "claude", "/w/p", {"claude": root})
+            self.assertEqual(snapshot["transcript_path"], path)
+            self.assertEqual(snapshot["engine"], "claude")
+            json.dumps(snapshot)
+
 
 class FormatTokensTests(unittest.TestCase):
     def test_scales_readably(self):
@@ -1278,6 +1303,55 @@ class FormatTokensTests(unittest.TestCase):
         self.assertEqual(cb.format_tokens(1_200_000), "1.2M")
         self.assertEqual(cb.format_tokens(0), "0")
         self.assertEqual(cb.format_tokens(None), "0")
+
+
+class SessionCostReportTests(unittest.TestCase):
+    PRICING = {
+        "fast_multiplier": 2.0,
+        "fallback": dict.fromkeys(cb.TOKEN_FIELDS, 0.0),
+        "models": {
+            "claude-opus-5": {
+                "input": 0.0, "output": 0.01,
+                "cache_read": 0.0, "cache_write": 0.0,
+            },
+            "gpt-5.6": {
+                "input": 0.0, "output": 0.02,
+                "cache_read": 0.0, "cache_write": 0.0,
+            },
+        },
+    }
+
+    def test_claude_report_prices_relay_snapshot(self):
+        snapshot = {
+            "engine": "claude",
+            "transcripts": [{
+                "path": "/remote/session.jsonl",
+                "groups": [{
+                    "model": "claude-opus-5", "fast": False,
+                    "tokens": {"input": 2, "output": 7,
+                               "cache_read": 0, "cache_write": 0},
+                }],
+            }],
+        }
+        out = cb.format_session_cost("app", "claude", snapshot, self.PRICING)
+        self.assertIn("**$0.07**", out)
+        self.assertIn("output 7", out)
+        self.assertIn("claude-opus-5", out)
+
+    def test_codex_report_includes_fast_tier(self):
+        snapshot = {
+            "engine": "codex", "model": "gpt-5.6", "fast_share": 0.5,
+            "totals": {"input": 0, "output": 10,
+                       "cache_read": 0, "cache_write": 0},
+        }
+        out = cb.format_session_cost("app", "codex", snapshot, self.PRICING)
+        self.assertIn("**$0.30**", out)
+        self.assertIn("50% fast tier @2x", out)
+
+    def test_missing_or_unmetered_snapshot_has_no_report(self):
+        self.assertIsNone(cb.format_session_cost("a", "claude", None, self.PRICING))
+        self.assertIsNone(cb.format_session_cost(
+            "a", "antigravity", {"totals": {}}, self.PRICING))
 
 
 class PricingTableTests(unittest.TestCase):
@@ -1982,6 +2056,27 @@ class FormatStatusSectionsTests(unittest.TestCase):
         )
 
 
+class HealthSnapshotTests(unittest.TestCase):
+    def test_reports_readiness_uptime_and_counts(self):
+        out = cb.health_snapshot(
+            True,
+            {"repos": {"1": {}, "2": {}}, "machines": {"mac": {}}},
+            started_at=100,
+            now=145,
+            watchers=3,
+        )
+        self.assertEqual(out, {
+            "status": "ok", "discord": "ready", "uptime_seconds": 45,
+            "repos": 2, "machines": 1, "running_watchers": 3,
+        })
+
+    def test_public_shape_omits_watcher_detail(self):
+        out = cb.health_snapshot(False, {}, started_at=200, now=100)
+        self.assertEqual(out["discord"], "connecting")
+        self.assertEqual(out["uptime_seconds"], 0)
+        self.assertNotIn("running_watchers", out)
+
+
 class RunWorkerCmdTests(unittest.TestCase):
     def setUp(self):
         self.seen = {}
@@ -2105,6 +2200,47 @@ class RemoteWorkerStateTests(unittest.TestCase):
         remote = "\n".join(call[-1] for call in self.calls)
         self.assertIn("agent-worker state app read handoff.md", remote)
         self.assertIn("agent-worker state app purge", remote)
+
+
+class WorkerSessionUsageHostTests(unittest.TestCase):
+    def setUp(self):
+        self.orig = cb._run
+
+    def tearDown(self):
+        cb._run = self.orig
+
+    def test_remote_usage_runs_helper_on_satellite(self):
+        calls = []
+        payload = {"engine": "codex", "totals": {
+            "input": 4, "output": 2, "cache_read": 1, "cache_write": 0}}
+
+        def fake(args, timeout=180, input_text=None):
+            calls.append(args)
+            return __import__("subprocess").CompletedProcess(
+                args, 0, json.dumps(payload), "")
+
+        cb._run = fake
+        got, error = cb.worker_session_usage("codex", "/remote/repo", "me@mac")
+        self.assertEqual(got, payload)
+        self.assertIsNone(error)
+        self.assertIn(
+            "agent-session-usage codex --directory /remote/repo", calls[0][-1])
+
+    def test_remote_no_session_is_not_an_error(self):
+        cb._run = lambda args, timeout=180, input_text=None: (
+            __import__("subprocess").CompletedProcess(args, 1, "", ""))
+        snapshot, error = cb.worker_session_usage(
+            "claude", "/remote/repo", "me@mac")
+        self.assertIsNone(snapshot)
+        self.assertIsNone(error)
+
+    def test_remote_invalid_json_is_reported(self):
+        cb._run = lambda args, timeout=180, input_text=None: (
+            __import__("subprocess").CompletedProcess(args, 0, "not-json", ""))
+        snapshot, error = cb.worker_session_usage(
+            "claude", "/remote/repo", "me@mac")
+        self.assertIsNone(snapshot)
+        self.assertIn("invalid JSON", error)
 
 
 class BuildRepoEntryTests(unittest.TestCase):

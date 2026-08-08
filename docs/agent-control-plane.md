@@ -10,9 +10,9 @@ interactive Claude Code session on this machine, and — most importantly — th
 Discord channel  (one channel per repo, under a "Claude" category)
       │
       ▼
-agent-bridge           discord.py client + a signed localhost HTTP listener
-                       (aiohttp) bound to 127.0.0.1:<listen_port>, default 8765
-      │  forwards your message with `agent-worker send`
+agent-bridge           discord.py client + signed HTTP listener (+ /healthz)
+                       local by default; tailnet-bindable for satellites
+      │  forwards locally, or over SSH to a configured worker host
       ▼
 agent-worker          worker lifecycle over a tmux session named `cw-<name>`
       │  launches / resumes the session (Claude Code via claude-launch, or
@@ -37,6 +37,11 @@ Two things flow back to Discord, and both are driven by **Claude Code hooks**
 - **Live task checklists** — a **PostToolUse** hook
   (`claude-worker-todo-relay`) fires on every todo/task update and relays the
   current checklist into Discord as checkboxes.
+
+On a satellite worker, reply extraction and usage collection happen beside the
+transcript. The done relay includes the reply plus a compact token snapshot in
+its signed event; this keeps replies, `/cost`, subagent accounting, and guest
+budgets at parity without mounting the satellite's session files on the parent.
 
 Idle workers (idle longer than `idle_minutes`) are stopped; the next message
 revives them with `claude --continue`, restoring the conversation from Claude

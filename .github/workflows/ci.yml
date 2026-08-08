@@ -21,6 +21,7 @@ jobs:
       - name: Validate Bash syntax
         run: |
           for f in bin/*; do
+            [[ -f "$f" ]] || continue
             head -1 "$f" | grep -qE 'python' && continue
             bash -n "$f"
           done
@@ -28,18 +29,25 @@ jobs:
       - name: ShellCheck (shell tools only)
         run: |
           for f in bin/*; do
+            [[ -f "$f" ]] || continue
             head -1 "$f" | grep -qE 'zsh|python' && continue
             shellcheck "$f"
           done
 
-      - name: Validate agent-bridge Python syntax
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bin/agent-bridge
+      - name: Validate Python tool syntax
+        run: |
+          for f in bin/*; do
+            [[ -f "$f" ]] || continue
+            head -1 "$f" | grep -qE 'python' || continue
+            PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$f"
+          done
 
       - name: Validate profile JSON
         run: |
           for f in claude-profiles/*.json; do
             jq empty "$f"
           done
+          jq empty config.example.json
           jq empty pricing.json
 
       - name: Validate refresh-pricing.py syntax
@@ -54,9 +62,14 @@ jobs:
       - name: Ruff (Python error lint)
         run: |
           pip install ruff
-          # Pass bin/agent-bridge explicitly: ruff lints files given by path
-          # regardless of extension, so the extensionless script is covered.
+          # Pass extensionless Python tools explicitly: ruff lints files given
+          # by path regardless of extension.
           # E9/F63/F7/F82 catch real errors (syntax, undefined names,
           # f-string/assert bugs) only — no style noise, so CI never reddens
           # over formatting.
-          ruff check --select E9,F63,F7,F82 bin/agent-bridge tests
+          python_tools=()
+          for f in bin/*; do
+            [[ -f "$f" ]] || continue
+            head -1 "$f" | grep -qE 'python' && python_tools+=("$f")
+          done
+          ruff check --select E9,F63,F7,F82 "${python_tools[@]}" tests

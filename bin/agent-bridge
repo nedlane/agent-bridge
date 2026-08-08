@@ -220,9 +220,9 @@ Otherwise work silently. No progress spam. Long tasks (multiple hours) are
 expected - do not stop early to report, do not ask for permission to
 continue.
 You can also operate the bridge with tools (never by reading screens or
-internals): `bridge-ctl addrepo <name> </abs/path> [category]` creates a new
-repo channel/conversation and maps it (optional [category] files it under an
-existing or new category); `bridge-ctl repos` lists mappings;
+internals): `bridge-ctl addrepo <name> </abs/path> [category] [--host machine]`
+creates and maps a repo conversation; `bridge-ctl repos` / `machines` list the
+fleet; `bridge-ctl status|cost <name>` inspects a worker;
 `discord-notify -t discord:<channel_id> "..."` messages a specific channel.
 Your discord-notify and claude-bridge skills document the rest."""
 
@@ -235,6 +235,12 @@ messaging you (named in each message's envelope) will ask you in natural
 language to run this machine's Claude-worker control plane; translate their
 requests into these tools instead of telling them which bot commands to type:
   bridge-ctl repos                        existing repo channels/workers
+  bridge-ctl machines                     configured local/satellite hosts
+  bridge-ctl addmachine <name> <ssh-target>   register/update a satellite
+  bridge-ctl rmmachine <name>             remove an unused satellite
+  bridge-ctl health                       daemon + Discord liveness
+  bridge-ctl status [name]                fleet or one-worker status
+  bridge-ctl cost <name>                  whole-session cost on its host
   bridge-ctl categories                   existing Discord categories (name,
                                           channel/worker counts, the default) —
                                           check here before picking a [category]
@@ -245,6 +251,12 @@ requests into these tools instead of telling them which bot commands to type:
                                           new one; omit for the default inbox
   bridge-ctl start <name>                 start that repo's worker (it gets
                                           this same Discord protocol)
+  bridge-ctl stop|restart|fresh|clear <name>   lifecycle via the bridge
+  bridge-ctl harness <name> <engine> [--no-handoff]   switch engines
+  bridge-ctl fast <name>                  toggle Codex Fast mode
+  bridge-ctl model <name> <model>         switch the provider model
+  bridge-ctl compact <name> [focus]         compact context
+  bridge-ctl checkin <name>                 request a progress update
   agent-worker list / status <name> / read <name> [lines]
   agent-worker send <name> "msg"         instruct a running worker
                                           (--type for /slash commands)
@@ -477,6 +489,18 @@ def resolve_host_target(cfg, repo):
     return machines[host]["ssh"]
 
 
+def machine_entry_error(name, ssh_target):
+    """Validation error for a logical satellite mapping, or None."""
+    if name == "local":
+        return "machine name 'local' is reserved for the bridge host"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name or ""):
+        return "machine name must use letters, digits, '.', '_', or '-'"
+    if not ssh_target or ssh_target.startswith("-") or any(
+            c.isspace() for c in ssh_target):
+        return "SSH target must be one non-option token (for example user@host)"
+    return None
+
+
 def dir_exists_for_host(cfg, host, path):
     """Whether `path` is a directory on `host` ("local"/None = this machine).
 
@@ -544,6 +568,7 @@ def default_config():
         "idle_minutes": 45,
         "listen_host": "127.0.0.1",
         "listen_port": 8765,
+        "machines": {},
         "repos": {},
         "welcome_channel": None,
         "requests_channel": None,
@@ -1242,6 +1267,79 @@ def subtract_tokens(current, previous):
     }
 
 
+def session_usage_for_directory(harness, directory, roots=None):
+    """JSON-safe whole-session snapshot located by working directory."""
+    roots = roots or {}
+    if harness == "codex":
+        path = newest_codex_rollout(directory, roots.get("codex"))
+    else:
+        path = newest_claude_transcript(directory, roots.get("claude"))
+    if not path:
+        return None
+    snapshot = session_usage_event(harness, path)
+    snapshot["transcript_path"] = path
+    return snapshot
+
+
+def format_session_cost(name, harness, snapshot, pricing):
+    """Render /cost from a local or remotely relayed usage snapshot."""
+    if not isinstance(snapshot, dict) or pricing is None:
+        return None
+    subagent_count = 0
+    models = []
+    total = None
+    if harness == "claude":
+        usage = claude_usage_from_event(snapshot)
+        if not usage:
+            return None
+        tokens, model, fast_share = summarize_claude_usage(usage)
+        subagent_count = max(0, len(usage) - 1)
+        models = list(dict.fromkeys(
+            group_model
+            for groups in usage.values()
+            for group_model, _ in groups
+            if group_model
+        ))
+        total = claude_usage_cost(usage, pricing)
+    elif harness == "codex":
+        tokens = snapshot.get("totals")
+        if not isinstance(tokens, dict):
+            return None
+        model = snapshot.get("model") or "gpt-5.6"
+        try:
+            fast_share = float(snapshot.get("fast_share") or 0.0)
+        except (TypeError, ValueError):
+            fast_share = 0.0
+    else:
+        return None
+    model = model or None
+    rates = rates_for_model(pricing, model)
+    mult = fast_multiplier(pricing)
+    if total is None:
+        total = token_cost(tokens, rates, fast_share, mult)
+    models = models or ([model] if model else [])
+    known = bool(models) and all(
+        (pricing.get("models") or {}).get(str(used_model))
+        for used_model in models
+    )
+    model_label = " + ".join(models) if models else "unknown model"
+    agent_note = (f" · {subagent_count} subagent transcript"
+                  f"{'s' if subagent_count != 1 else ''}"
+                  if subagent_count else "")
+    fast_note = (f" · {fast_share:.0%} fast tier @{mult:g}x"
+                 if fast_share > 0.005 else "")
+    return "\n".join([
+        f"💰 `{name}` — **${total:.2f}** this session "
+        f"({model_label}{'' if known else ', fallback rate'}{agent_note})",
+        f"-# output {format_tokens(tokens.get('output'))} · "
+        f"input {format_tokens(tokens.get('input'))} · "
+        f"cache read {format_tokens(tokens.get('cache_read'))} · "
+        f"cache write {format_tokens(tokens.get('cache_write'))}{fast_note}",
+        "-# Workers run on subscriptions, so this is a cost-weighting for "
+        "comparing burn, not a bill.",
+    ])
+
+
 def usage_costs(entries, cutoff):
     """Surviving (timestamp, cost) pairs from a persisted cost ledger."""
     kept = []
@@ -1642,6 +1740,33 @@ def run_worker_cmd(host_target, argv, timeout=180, input_text=None, env=None):
                 input_text=input_text)
 
 
+def worker_session_usage(harness, directory, host_target=None):
+    """Whole-session usage on the host that owns the worker.
+
+    Returns (snapshot, error). Local reads stay in-process; remote reads run
+    the same helper over SSH and transport only compact JSON token totals.
+    """
+    if host_target is None:
+        return session_usage_for_directory(harness, directory), None
+    r = run_worker_cmd(
+        host_target,
+        ["agent-session-usage", harness, "--directory", directory],
+        timeout=30,
+    )
+    if r.returncode == 1:
+        return None, None
+    if r.returncode != 0:
+        return None, (r.stderr.strip() or
+                      f"remote usage helper exited {r.returncode}")
+    try:
+        payload = json.loads(r.stdout)
+    except ValueError:
+        return None, "remote usage helper returned invalid JSON"
+    if not isinstance(payload, dict):
+        return None, "remote usage helper returned an invalid payload"
+    return payload, None
+
+
 def format_status_sections(local_stdout, satellites):
     """Render /status's aggregated roster across the local host and any
     configured satellites.
@@ -1662,6 +1787,21 @@ def format_status_sections(local_stdout, satellites):
         body = stdout if returncode == 0 else "(unreachable)"
         sections.append(f"{name}:\n{body}")
     return "```\n" + "\n\n".join(sections) + "\n```"
+
+
+def health_snapshot(discord_ready, cfg, started_at, now=None, watchers=None):
+    """JSON-safe daemon health shared by /healthz and signed diagnostics."""
+    now = time.time() if now is None else now
+    result = {
+        "status": "ok",
+        "discord": "ready" if discord_ready else "connecting",
+        "uptime_seconds": max(0, int(now - started_at)),
+        "repos": len((cfg or {}).get("repos") or {}),
+        "machines": len((cfg or {}).get("machines") or {}),
+    }
+    if watchers is not None:
+        result["running_watchers"] = int(watchers)
+    return result
 
 
 def remote_inbox_scp_argv(target, local_path, remote_inbox):
@@ -2162,6 +2302,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     intents.message_content = True
     intents.reactions = True
     client = discord.Client(intents=intents)
+    started_at = time.time()
 
     last_activity = {}  # worker name -> epoch seconds
     offsets = {}        # transcript path -> bytes already consumed
@@ -2516,6 +2657,27 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return f"📊 `{name}` — usage & session cost", [png]
         return f"📊 `{name}` usage:\n```\n{panel}\n```", None
 
+    async def render_cost(name):
+        """Whole-session cost from whichever host owns the worker."""
+        repo = repo_by_name(name)
+        if not repo:
+            return f"⚠️ no repo channel mapped for `{name}`"
+        if pricing is None:
+            return "⚠️ no pricing table loaded — see scripts/refresh-pricing.py"
+        harness = harness_for(repo)
+        if harness not in ("claude", "codex"):
+            return f"💰 session costing isn't available for **{harness}** workers."
+        target = resolve_host_target(cfg, repo)
+        snapshot, error = await asyncio.to_thread(
+            worker_session_usage, harness, repo["dir"], target)
+        if error:
+            return f"⚠️ couldn't read `{name}` usage on its worker host: {error}"
+        report = format_session_cost(name, harness, snapshot, pricing)
+        if report:
+            return report
+        return (f"💰 no session found on disk for `{name}` — it may not have "
+                "run yet on this engine.")
+
     async def notify_provider_limit(name, channel_id, screen=None):
         """Post one provider-quota refusal per worker/reset window."""
         if not channel_id:
@@ -2632,7 +2794,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 f"⚠️ `{name}` is still compacting, so your message wasn't "
                 "delivered — re-send it in a moment."
             )
-            return
+            return False
         text = tag_inbound(text, typed, tag)
         r = await asyncio.to_thread(worker_send, name, text, typed, target)
         if r.returncode != 0:
@@ -2671,10 +2833,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if r.returncode != 0:
             if message:
                 await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
-            return
+            return False
         arm_limit_watcher(name, screen)
         if message:
             await message.add_reaction("✅")
+        return True
 
     async def fetch_attachment(att, dest):
         """Download one Discord attachment to `dest`.
@@ -3005,10 +3168,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                                name, "handoff.md", target))
             if not destination:
                 return " ⚠️ couldn't resolve the handoff path — switching without it."
-            await deliver(
+            delivered = await deliver(
                 name, HANDOFF_PROMPT.format(path=destination),
                 tag=HANDOFF_TAG,
             )
+            if not delivered:
+                return " ⚠️ couldn't deliver the handoff request — switching without it."
             # deliver() returns as soon as the paste lands, so poll for the
             # turn to actually START before waiting for it to end — otherwise
             # the pre-turn idle prompt reads as "finished", and the stop below
@@ -3126,11 +3291,44 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 f"⚠️ `{name}` is driven by **Claude** — Fast mode is only "
                 "available on Codex workers.", None,
             )
-        await deliver(name, "/fast", typed=True)
+        if not await deliver(name, "/fast", typed=True):
+            return f"⚠️ couldn't deliver `/fast` to `{name}`", None
         return (
             f"⚡ toggled Codex Fast mode for `{name}`. Run `/fast` again to "
             "switch back between Fast and standard speed.", None,
         )
+
+    async def do_model(name, model):
+        model = (model or "").strip()
+        if not model:
+            return "⚠️ model is required", None
+        if not await deliver(name, f"/model {model}", typed=True):
+            return f"⚠️ couldn't deliver `/model {model}` to `{name}`", None
+        engine = harness_of(name)
+        hint = (f" — {engine}'s `/model` may open an interactive picker; use "
+                "/screen to drive it"
+                if engine in ("codex", "antigravity") else "")
+        return f"🔧 sent `/model {model}` to `{name}`{hint}", None
+
+    async def do_compact(name, focus=None):
+        focus = (focus or "").strip()
+        if not await deliver(
+            name, "/compact" + (f" {focus}" if focus else ""), typed=True
+        ):
+            return f"⚠️ couldn't deliver `/compact` to `{name}`", None
+        return f"🗜️ compacting `{name}`", None
+
+    async def do_checkin(name, requester="Operator"):
+        requester = clean_display_name(requester)
+        delivered = await deliver(
+            name,
+            f"{requester} is asking for a check-in right now: send them 3-5 "
+            "lines of progress (current step, what's left, any blockers) via "
+            "discord-notify, then continue the task.",
+        )
+        if not delivered:
+            return f"⚠️ couldn't deliver the check-in request to `{name}`", None
+        return f"📨 asked `{name}` for a check-in", None
 
     async def do_close(name):
         # Fully retire a worker: stop it, wipe its saved state, and drop its
@@ -3489,71 +3687,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        repo = repo_by_name(name)
-        if not repo:
-            await interaction.followup.send(f"⚠️ no repo channel mapped for `{name}`")
-            return
-        if pricing is None:
-            await interaction.followup.send(
-                "⚠️ no pricing table loaded — see scripts/refresh-pricing.py")
-            return
-        harness = harness_for(repo)
-        subagent_count = 0
-        models = []
-        if harness == "claude":
-            path = await asyncio.to_thread(
-                newest_claude_transcript, repo["dir"])
-            usage = (await asyncio.to_thread(claude_session_usage, path)
-                     if path else None)
-            if usage:
-                tokens, model, fast_share = summarize_claude_usage(usage)
-                subagent_count = max(0, len(usage) - 1)
-                models = list(dict.fromkeys(
-                    group_model
-                    for groups in usage.values()
-                    for group_model, _ in groups
-                    if group_model
-                ))
-                total = claude_usage_cost(usage, pricing)
-            else:
-                tokens = model = None
-                fast_share = 0.0
-        else:
-            tokens, model, path, fast_share = await asyncio.to_thread(
-                session_tokens, harness, repo["dir"])
-            total = None
-        if not tokens:
-            await interaction.followup.send(
-                f"💰 no session found on disk for `{name}` — it may not have "
-                "run yet on this engine.")
-            return
-        model = model or (harness == "codex" and "gpt-5.6") or None
-        rates = rates_for_model(pricing, model)
-        mult = fast_multiplier(pricing)
-        if total is None:
-            total = token_cost(tokens, rates, fast_share, mult)
-        models = models or ([model] if model else [])
-        known = bool(models) and all(
-            (pricing.get("models") or {}).get(str(used_model))
-            for used_model in models
-        )
-        model_label = " + ".join(models) if models else "unknown model"
-        agent_note = (f" · {subagent_count} subagent transcript"
-                      f"{'s' if subagent_count != 1 else ''}"
-                      if subagent_count else "")
-        fast_note = (f" · {fast_share:.0%} fast tier @{mult:g}x"
-                     if fast_share > 0.005 else "")
-        lines = [
-            f"💰 `{name}` — **${total:.2f}** this session "
-            f"({model_label}{'' if known else ', fallback rate'}{agent_note})",
-            f"-# output {format_tokens(tokens['output'])} · "
-            f"input {format_tokens(tokens['input'])} · "
-            f"cache read {format_tokens(tokens['cache_read'])} · "
-            f"cache write {format_tokens(tokens['cache_write'])}{fast_note}",
-            "-# Workers run on subscriptions, so this is a cost-weighting for "
-            "comparing burn, not a bill.",
-        ]
-        await interaction.followup.send("\n".join(lines))
+        await interaction.followup.send(await render_cost(name))
 
     @tree.command(name="limits",
                   description="Show how much of your usage limit you've used here")
@@ -3580,14 +3714,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not (name := await guard(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        who = clean_display_name(interaction.user.display_name)
-        await deliver(
-            name,
-            f"{who} is asking for a check-in right now: send them 3-5 lines of "
-            "progress (current step, what's left, any blockers) via "
-            "discord-notify, then continue the task.",
+        await reply(
+            interaction,
+            *await do_checkin(name, interaction.user.display_name),
         )
-        await interaction.followup.send(f"📨 asked `{name}` for a check-in")
 
     @tree.command(name="harness", description="Switch between Claude, Codex, and Antigravity")
     @describe(engine="claude, codex, or antigravity", worker="Worker name (defaults to this channel's worker)",
@@ -3612,16 +3742,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        # Outside Claude, /model tends to open an interactive picker (no inline
-        # arg), so this types the command; the value is best set in the picker
-        # via /screen or by switching before work. On Claude it sets the model
-        # directly.
-        await deliver(name, f"/model {model}", typed=True)
-        engine = harness_of(name)
-        hint = (f" — {engine}'s `/model` may open an interactive picker; use "
-                "/screen to drive it"
-                if engine in ("codex", "antigravity") else "")
-        await interaction.followup.send(f"🔧 sent `/model {model}` to `{name}`{hint}")
+        await reply(interaction, *await do_model(name, model))
 
     @tree.command(name="compact", description="Compact a worker's context")
     @describe(focus="Optional focus for the compaction", worker="Worker name (defaults to this channel's worker)")
@@ -3629,8 +3750,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not (name := await guard(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        await deliver(name, "/compact" + (f" {focus}" if focus else ""), typed=True)
-        await interaction.followup.send(f"🗜️ compacting `{name}`")
+        await reply(interaction, *await do_compact(name, focus))
 
     @tree.command(name="addrepo", description="Create a Discord channel and map a repo to a worker")
     @describe(name="Worker/channel name", path="Absolute path to the repo",
@@ -3954,6 +4074,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 except OSError:
                     pass
 
+    async def handle_health(_request):
+        """Unauthenticated liveness endpoint with no secrets or repo details."""
+        return web.json_response(
+            health_snapshot(client.is_ready(), cfg, started_at))
+
     async def handle_event(request):
         if (request.content_type or "").startswith("multipart/form-data"):
             return await handle_multipart_event(request)
@@ -4055,6 +4180,78 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     if not reply:
                         reply = "(no new reply text captured — use /screen)"
                     await post(channel_id, await tag_reply(name, reply))
+        elif etype == "claude.bridge.health":
+            return web.json_response(health_snapshot(
+                client.is_ready(), cfg, started_at,
+                watchers=len(limit_watchers)))
+        elif etype == "claude.bridge.worker_control":
+            action = (event.get("action") or "").strip().lower()
+            name = (event.get("name") or "").strip()
+            if action == "status" and not name:
+                text, _ = await do_status()
+            else:
+                if not repo_by_name(name):
+                    return web.json_response(
+                        {"error": f"no repo channel mapped for worker {name!r}"},
+                        status=400,
+                    )
+                if action == "status":
+                    text, _ = await do_status_one(name)
+                elif action == "cost":
+                    text = await render_cost(name)
+                elif action == "stop":
+                    text, _ = await do_stop(name)
+                elif action == "restart":
+                    text, _ = await do_restart(name)
+                elif action == "fresh":
+                    text, _ = await do_fresh(name)
+                elif action == "clear":
+                    text, _ = await do_clear(name)
+                elif action == "harness":
+                    text, _ = await do_harness(
+                        name, event.get("engine"),
+                        bool(event.get("handoff", True)),
+                    )
+                elif action == "fast":
+                    text, _ = await do_fast(name)
+                elif action == "model":
+                    text, _ = await do_model(name, event.get("model"))
+                elif action == "compact":
+                    text, _ = await do_compact(name, event.get("focus"))
+                elif action == "checkin":
+                    text, _ = await do_checkin(
+                        name, event.get("requester") or "Operator")
+                else:
+                    return web.json_response(
+                        {"error": f"unknown worker action {action!r}"}, status=400)
+            return web.json_response({"status": "ok", "message": text})
+        elif etype == "claude.bridge.machine_set":
+            action = (event.get("action") or "set").strip().lower()
+            name = (event.get("name") or "").strip()
+            if action == "remove":
+                if name not in (cfg.get("machines") or {}):
+                    return web.json_response(
+                        {"error": f"unknown machine {name!r}"}, status=400)
+                users = [r["name"] for r in cfg["repos"].values()
+                         if r.get("host") == name]
+                if users:
+                    return web.json_response({
+                        "error": f"machine {name!r} still owns: {', '.join(users)}"
+                    }, status=409)
+                del cfg["machines"][name]
+                save_config(cfg, config_path)
+                return web.json_response({
+                    "status": "ok", "message": f"removed machine {name!r}"})
+            target = (event.get("ssh") or "").strip()
+            error = machine_entry_error(name, target)
+            if error:
+                return web.json_response({"error": error}, status=400)
+            cfg.setdefault("machines", {})[name] = {"ssh": target}
+            save_config(cfg, config_path)
+            return web.json_response({
+                "status": "ok",
+                "message": f"machine {name!r} -> {target}",
+            })
         elif etype == "claude.bridge.addrepo":
             repo_name = (event.get("name") or "").strip()
             repo_path = os.path.expanduser(event.get("path") or "")
@@ -4316,6 +4513,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     async def main():
         app = web.Application(client_max_size=MAX_REQUEST_BYTES)
+        app.router.add_get("/healthz", handle_health)
         app.router.add_post("/event", handle_event)
         runner = web.AppRunner(app)
         await runner.setup()
