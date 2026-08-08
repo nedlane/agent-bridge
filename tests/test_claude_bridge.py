@@ -1578,6 +1578,47 @@ class CodexSessionTotalsTests(unittest.TestCase):
         self.assertEqual(cb.subtract_tokens({"output": 5}, None)["output"], 5)
 
 
+class RelayedSessionUsageTests(unittest.TestCase):
+    def test_claude_snapshot_round_trips_json_and_preserves_groups(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "session.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "model": "claude-opus-5",
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 7,
+                            "cache_read_input_tokens": 11,
+                            "cache_creation_input_tokens": 3,
+                            "speed": "fast",
+                        },
+                    },
+                }) + "\n")
+            event = cb.session_usage_event("claude", path)
+            restored = cb.claude_usage_from_event(json.loads(json.dumps(event)))
+            group = restored[path][("claude-opus-5", True)]
+            self.assertEqual(group, {
+                "input": 2, "output": 7,
+                "cache_read": 11, "cache_write": 3,
+            })
+
+    def test_codex_snapshot_carries_cumulative_totals(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "rollout.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "token_count", "info": {"total_token_usage": {
+                        "input_tokens": 10, "cached_input_tokens": 4,
+                        "output_tokens": 3,
+                    }}}}) + "\n")
+            event = cb.session_usage_event("codex", path)
+            self.assertEqual(event["engine"], "codex")
+            self.assertEqual(event["totals"]["input"], 6)
+            self.assertEqual(event["totals"]["cache_read"], 4)
+
+
 class LedgerSurvivesWorkerLifecycleTests(unittest.TestCase):
     """A worker restart must never reset someone's usage.
 
@@ -2011,12 +2052,59 @@ class WorkerPollHostAwareTests(unittest.TestCase):
 
 class InboundAttachmentTests(unittest.TestCase):
     def test_scp_argv_targets_remote_inbox(self):
-        argv = cb.remote_inbox_scp_argv("me@h", "/tmp/a.png", "app",
-                                        "/home/u/.local/state/claude-workers")
+        argv = cb.remote_inbox_scp_argv(
+            "me@h", "/tmp/a.png",
+            "/Users/u/Library/State/claude-workers/app/inbox")
         self.assertEqual(argv[0], "scp")
         self.assertEqual(argv[1:1 + len(cb.SSH_OPTS)], cb.SSH_OPTS)
         self.assertIn("/tmp/a.png", argv)
-        self.assertIn("me@h:/home/u/.local/state/claude-workers/app/inbox/", argv)
+        self.assertIn(
+            "me@h:/Users/u/Library/State/claude-workers/app/inbox/", argv)
+
+
+class RemoteWorkerStateTests(unittest.TestCase):
+    def setUp(self):
+        self.orig = cb._run
+        self.calls = []
+
+        def fake(args, timeout=180, input_text=None):
+            self.calls.append(args)
+            remote = args[-1] if args and args[0] == "ssh" else ""
+            if " state app path handoff.md" in remote:
+                stdout = "/Users/u/state/claude-workers/app/handoff.md\n"
+            elif " state app read handoff.md" in remote:
+                stdout = "handoff body"
+            else:
+                stdout = ""
+            return __import__("subprocess").CompletedProcess(args, 0, stdout, "")
+
+        cb._run = fake
+
+    def tearDown(self):
+        cb._run = self.orig
+
+    def test_state_and_fresh_checks_dispatch_to_satellite(self):
+        self.assertTrue(cb.worker_has_state("app", host_target="me@mac"))
+        self.assertTrue(cb.fresh_pending("app", host_target="me@mac"))
+        remote = "\n".join(call[-1] for call in self.calls)
+        self.assertIn("agent-worker state app has", remote)
+        self.assertIn("agent-worker state app fresh-pending", remote)
+
+    def test_remote_path_is_reported_by_satellite(self):
+        self.assertEqual(
+            cb.remote_worker_state_path("app", "handoff.md", "me@mac"),
+            "/Users/u/state/claude-workers/app/handoff.md",
+        )
+
+    def test_purge_and_read_dispatch_to_satellite(self):
+        self.assertEqual(
+            cb.read_worker_state_file("app", "handoff.md", "me@mac"),
+            "handoff body",
+        )
+        self.assertTrue(cb.purge_worker_state("app", "me@mac"))
+        remote = "\n".join(call[-1] for call in self.calls)
+        self.assertIn("agent-worker state app read handoff.md", remote)
+        self.assertIn("agent-worker state app purge", remote)
 
 
 class BuildRepoEntryTests(unittest.TestCase):

@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Emit a JSON usage snapshot for a turn-end relay.
+
+Usage: agent-session-usage <claude|codex> <transcript_path>
+
+This runs on the worker host, where the transcript actually lives. The parent
+bridge can then price remote turns from the raw token snapshot without assuming
+a shared home directory or copying session files.
+"""
+import importlib.util
+import json
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+
+
+def _bridge():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-bridge")
+    loader = SourceFileLoader("agent_bridge_usage", path)
+    spec = importlib.util.spec_from_loader("agent_bridge_usage", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def main():
+    if len(sys.argv) != 3 or sys.argv[1] not in ("claude", "codex"):
+        sys.stderr.write(
+            "usage: agent-session-usage <claude|codex> <transcript_path>\n"
+        )
+        return 2
+    payload = _bridge().session_usage_event(sys.argv[1], sys.argv[2])
+    json.dump(payload, sys.stdout, separators=(",", ":"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

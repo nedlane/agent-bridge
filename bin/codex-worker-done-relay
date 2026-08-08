@@ -43,11 +43,21 @@ url="$(sed -n 's/^BRIDGE_WEBHOOK_URL=//p' "$CFG" | head -1)"
 secret="$(sed -n 's/^BRIDGE_WEBHOOK_SECRET=//p' "$CFG" | head -1)"
 [[ -n "$url" && -n "$secret" ]] || exit 0
 
+transcript_path="$(HOOK_JSON="$hook_json" python3 -c '
+import json, os
+try: print(json.loads(os.environ.get("HOOK_JSON") or "{}").get("transcript_path", "") or "")
+except ValueError: pass' 2>/dev/null)"
+usage_json=""
+if [[ -n "$transcript_path" ]]; then
+  usage_json="$("$(dirname "$0")/agent-session-usage" codex \
+                 "$transcript_path" 2>/dev/null || true)"
+fi
+
 # Build the event from the hook input. stop_hook_active marks a continuation
 # triggered by a previous Stop hook — relaying those would loop. The Codex Stop
 # payload includes last_assistant_message, forwarded as `reply` so the bridge
 # posts it directly (the transcript_path is passed too, as a fallback handle).
-body="$(HOOK_JSON="$hook_json" WORKER="$worker" DIR="$dir" CHAT="$chat" python3 -c '
+body="$(HOOK_JSON="$hook_json" WORKER="$worker" DIR="$dir" CHAT="$chat" USAGE_JSON="$usage_json" python3 -c '
 import json, os, sys
 try:
     hook = json.loads(os.environ.get("HOOK_JSON") or "{}")
@@ -55,7 +65,7 @@ except ValueError:
     hook = {}
 if hook.get("stop_hook_active"):
     sys.exit(0)
-print(json.dumps({
+payload = {
     "event_type": "claude.worker.turn_ended",
     "worker": os.environ["WORKER"],
     "dir": os.environ["DIR"],
@@ -63,10 +73,18 @@ print(json.dumps({
     "session_id": hook.get("session_id", ""),
     "transcript_path": hook.get("transcript_path", ""),
     "reply": hook.get("last_assistant_message", "") or "",
+    "engine": "codex",
     # The bridge prices the turn from the rollout at transcript_path; the
     # model names which rate row to use.
     "model": hook.get("model", "") or "",
-}))' 2>/dev/null)"
+}
+try:
+    usage = json.loads(os.environ.get("USAGE_JSON") or "")
+except ValueError:
+    usage = None
+if isinstance(usage, dict):
+    payload["usage"] = usage
+print(json.dumps(payload))' 2>/dev/null)"
 [[ -n "$body" ]] || exit 0
 
 sig="$(printf '%s' "$body" | SECRET="$secret" python3 -c '

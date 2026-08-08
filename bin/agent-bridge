@@ -1036,6 +1036,55 @@ def claude_session_usage(transcript_path):
     }
 
 
+def session_usage_event(harness, transcript_path):
+    """JSON-safe cumulative usage snapshot for a turn-end relay.
+
+    The relay runs on the worker host, where the session file and any Claude
+    subagent transcripts exist. Shipping raw token counts lets the parent
+    price remote turns without sharing filesystems or copying transcripts.
+    """
+    if harness == "codex":
+        return {
+            "engine": "codex",
+            "totals": codex_session_totals(transcript_path),
+            "fast_share": codex_priority_share(transcript_path),
+        }
+    transcripts = []
+    for path, groups in claude_session_usage(transcript_path).items():
+        transcripts.append({
+            "path": path,
+            "groups": [
+                {
+                    "model": model,
+                    "fast": fast,
+                    "tokens": tokens,
+                }
+                for (model, fast), tokens in groups.items()
+            ],
+        })
+    return {"engine": "claude", "transcripts": transcripts}
+
+
+def claude_usage_from_event(payload):
+    """Restore claude_session_usage's tuple-keyed shape from relay JSON."""
+    usage = {}
+    if not isinstance(payload, dict):
+        return usage
+    for transcript in payload.get("transcripts") or []:
+        if not isinstance(transcript, dict) or not transcript.get("path"):
+            continue
+        groups = {}
+        for group in transcript.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            groups[(group.get("model"), bool(group.get("fast")))] = {
+                field: max(0, int((group.get("tokens") or {}).get(field) or 0))
+                for field in TOKEN_FIELDS
+            }
+        usage[transcript["path"]] = groups
+    return usage
+
+
 def summarize_claude_usage(usage):
     """Return aggregate tokens, parent model, and output-weighted fast share."""
     tokens = dict.fromkeys(TOKEN_FIELDS, 0)
@@ -1615,13 +1664,13 @@ def format_status_sections(local_stdout, satellites):
     return "```\n" + "\n\n".join(sections) + "\n```"
 
 
-def remote_inbox_scp_argv(target, local_path, worker, state_root):
+def remote_inbox_scp_argv(target, local_path, remote_inbox):
     """argv to scp a locally-saved attachment into a remote worker's inbox.
 
-    Satellites share this machine's STATE_ROOT layout, so
-    `<state_root>/<worker>/inbox/<file>` is the same path the worker will be
-    told about locally — this just makes the file exist there too."""
-    dest = f"{target}:{state_root}/{worker}/inbox/"
+    `remote_inbox` is reported by agent-worker on the satellite, rather than
+    assembled from the parent's STATE_ROOT. That keeps this correct when the
+    two hosts use different homes or XDG state directories."""
+    dest = f"{target}:{remote_inbox}/"
     return ["scp", *SSH_OPTS, local_path, dest]
 
 
@@ -1921,7 +1970,11 @@ def worker_stop(name, host_target=None):
     return run_worker_cmd(host_target, ["agent-worker", "stop", name], timeout=30)
 
 
-def worker_has_state(name, state_root=None):
+def worker_has_state(name, state_root=None, host_target=None):
+    if host_target is not None:
+        r = run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "has"], timeout=15)
+        return r.returncode == 0
     state_root = state_root or os.path.expanduser("~/.local/state/claude-workers")
     return os.path.isfile(os.path.join(state_root, name, "meta"))
 
@@ -1930,29 +1983,46 @@ def fresh_marker_path(name, state_root=None):
     return os.path.join(state_root or STATE_ROOT, name, "no-resume")
 
 
-def fresh_pending(name, state_root=None):
+def fresh_pending(name, state_root=None, host_target=None):
     """True when /fresh was armed: the worker was shut down and its next
     start must begin a brand-new session instead of --continue-resuming the
     old conversation."""
+    if host_target is not None:
+        r = run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "fresh-pending"],
+            timeout=15,
+        )
+        return r.returncode == 0
     return os.path.isfile(fresh_marker_path(name, state_root))
 
 
-def arm_fresh(name, state_root=None):
+def arm_fresh(name, state_root=None, host_target=None):
     """Mark the worker so its next start skips --continue. The marker is a file
     beside the worker's state (which `agent-worker stop` keeps), so the lazy
     revive on the next message reads it and starts clean."""
+    if host_target is not None:
+        return run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "fresh-arm"],
+            timeout=15,
+        ).returncode == 0
     path = fresh_marker_path(name, state_root)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w").close()
 
 
-def disarm_fresh(name, state_root=None):
+def disarm_fresh(name, state_root=None, host_target=None):
     """Consume the fresh marker — called once the worker has (re)started, so a
     one-shot /fresh doesn't wipe every subsequent revive."""
+    if host_target is not None:
+        return run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "fresh-disarm"],
+            timeout=15,
+        ).returncode == 0
     try:
         os.remove(fresh_marker_path(name, state_root))
     except FileNotFoundError:
         pass
+    return True
 
 
 def should_resume(has_state, fresh):
@@ -1974,6 +2044,46 @@ def remove_worker_state(name, state_root=None):
         return False
     shutil.rmtree(path, ignore_errors=True)
     return True
+
+
+def purge_worker_state(name, host_target=None):
+    """Remove state on the host that owns the worker."""
+    if host_target is None:
+        return remove_worker_state(name)
+    r = run_worker_cmd(
+        host_target, ["agent-worker", "state", name, "purge"], timeout=30)
+    return r.returncode == 0
+
+
+def remote_worker_state_path(name, leaf, host_target):
+    """Ask a satellite for a state-file path; never infer its home locally."""
+    r = run_worker_cmd(
+        host_target, ["agent-worker", "state", name, "path", leaf], timeout=15)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def read_worker_state_file(name, leaf, host_target=None):
+    if host_target is None:
+        try:
+            with open(os.path.join(STATE_ROOT, name, leaf)) as f:
+                return f.read()
+        except OSError:
+            return None
+    r = run_worker_cmd(
+        host_target, ["agent-worker", "state", name, "read", leaf], timeout=15)
+    return r.stdout if r.returncode == 0 else None
+
+
+def remove_worker_state_file(name, leaf, host_target=None):
+    if host_target is None:
+        try:
+            os.remove(os.path.join(STATE_ROOT, name, leaf))
+        except FileNotFoundError:
+            pass
+        return True
+    r = run_worker_cmd(
+        host_target, ["agent-worker", "state", name, "remove", leaf], timeout=15)
+    return r.returncode == 0
 
 
 def prune_old_files(directory, max_age_seconds, now=None):
@@ -2063,6 +2173,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     turn_owner = {}     # worker name -> (channel id, user id) that started it
     codex_totals = {}   # rollout path -> last cumulative token reading
     claude_usage_offsets = {}  # parent path -> child transcript byte offsets
+    claude_usage_snapshots = {}  # parent path -> last relayed cumulative usage
     priced_path = {}    # worker name -> transcript path last priced for it
     limit_watchers = {} # worker name -> provider-limit polling task
     limit_noticed = {}  # worker name -> reset hint already posted
@@ -2105,7 +2216,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await asyncio.to_thread(save_usage_state, usage_state)
         return True
 
-    async def charge_turn(name, channel_id, path, model, codex):
+    async def charge_turn(name, channel_id, path, model, engine, usage_event=None):
         """Price the turn that just ended and bill whoever started it.
 
         Called inside the turn lock and BEFORE the reply paths advance the
@@ -2135,10 +2246,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # A worker we've priced before that has moved to a new file is
             # mid-fleet-life, not mid-cold-start: its new session starts at 0.
             known_worker = name in priced_path
-            fresh_session = known_worker and priced_path[name] != path
+            previous_path = priced_path.get(name)
+            fresh_session = known_worker and previous_path != path
+            if fresh_session and previous_path:
+                codex_totals.pop(previous_path, None)
+                claude_usage_offsets.pop(previous_path, None)
+                claude_usage_snapshots.pop(previous_path, None)
             priced_path[name] = path
-            if codex:
-                totals = await asyncio.to_thread(codex_session_totals, path)
+            if engine == "codex":
+                relayed = usage_event if isinstance(usage_event, dict) else {}
+                totals = relayed.get("totals")
+                if not isinstance(totals, dict):
+                    totals = await asyncio.to_thread(codex_session_totals, path)
                 if totals is None:
                     return
                 baseline = codex_totals.get(path)
@@ -2148,24 +2267,40 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                         return
                     baseline = dict.fromkeys(TOKEN_FIELDS, 0)
                 tokens = subtract_tokens(totals, baseline)
-                share = codex_priority_share(path)
+                try:
+                    share = float(relayed.get("fast_share"))
+                except (TypeError, ValueError):
+                    share = await asyncio.to_thread(codex_priority_share, path)
                 cost = token_cost(tokens, rates_for_model(pricing, model),
                                   share, fast_multiplier(pricing))
             else:
-                unseen = path not in claude_usage_offsets
-                child_offsets = claude_usage_offsets.setdefault(path, {})
-                usage = {}
-                for child_path in claude_session_transcripts(path):
-                    start = child_offsets.get(child_path, 0)
-                    groups, end = await asyncio.to_thread(
-                        claude_usage_window, child_path, start)
-                    child_offsets[child_path] = end
-                    usage[child_path] = groups
-                if unseen and not fresh_session:
-                    return
-                _, seen_model, _ = summarize_claude_usage(usage)
-                model = seen_model or model
-                cost = claude_usage_cost(usage, pricing)
+                relayed_usage = claude_usage_from_event(usage_event)
+                if relayed_usage:
+                    baseline = claude_usage_snapshots.get(path)
+                    claude_usage_snapshots[path] = relayed_usage
+                    if baseline is None:
+                        if not fresh_session:
+                            return
+                        baseline = {}
+                    _, seen_model, _ = summarize_claude_usage(relayed_usage)
+                    model = seen_model or model
+                    cost = claude_usage_cost(
+                        relayed_usage, pricing, previous=baseline)
+                else:
+                    unseen = path not in claude_usage_offsets
+                    child_offsets = claude_usage_offsets.setdefault(path, {})
+                    usage = {}
+                    for child_path in claude_session_transcripts(path):
+                        start = child_offsets.get(child_path, 0)
+                        groups, end = await asyncio.to_thread(
+                            claude_usage_window, child_path, start)
+                        child_offsets[child_path] = end
+                        usage[child_path] = groups
+                    if unseen and not fresh_session:
+                        return
+                    _, seen_model, _ = summarize_claude_usage(usage)
+                    model = seen_model or model
+                    cost = claude_usage_cost(usage, pricing)
             if cost <= 0:
                 return
             channel, user = owner if owner else (channel_id, None)
@@ -2520,10 +2655,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # belt-and-suspenders.
                 r2 = await asyncio.to_thread(
                     worker_start, name, repo["dir"], channel_id,
-                    should_resume(worker_has_state(name), fresh_pending(name)),
+                    should_resume(
+                        worker_has_state(name, host_target=target),
+                        fresh_pending(name, host_target=target),
+                    ),
                     repo.get("profile", "owner"), harness_for(repo), target,
                 )
                 if r2.returncode == 0:
+                    await asyncio.to_thread(disarm_fresh, name, None, target)
                     # The restart resumes and may auto-compact; wait for an
                     # input-ready prompt before re-sending so the recovery
                     # doesn't re-lose the message into a loading TUI.
@@ -2560,19 +2699,24 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     async def copy_inbound_attachment(host_target, local_path, worker):
         """Push a locally-saved attachment out to a remote worker's inbox so
         the worker (running on `host_target`) can read the same path off its
-        own disk. ssh/scp are invoked locally and connect out — they are not
-        agent-worker commands, so this bypasses run_worker_cmd/ssh_wrap and
-        shells out directly. Returns True on success."""
-        remote_inbox = f"{STATE_ROOT}/{worker}/inbox"
+        own disk. Ask agent-worker to create and report its host-local inbox;
+        the parent must not assume that its own STATE_ROOT exists there.
+        Returns the remote file path on success, or None."""
         mkdir = await asyncio.to_thread(
-            _run, ["ssh", *SSH_OPTS, host_target, "mkdir", "-p", remote_inbox]
+            run_worker_cmd, host_target,
+            ["agent-worker", "state", worker, "ensure-inbox"], 15,
         )
         if mkdir.returncode != 0:
-            return False
+            return None
+        remote_inbox = mkdir.stdout.strip()
+        if not remote_inbox:
+            return None
         scp = await asyncio.to_thread(
-            _run, remote_inbox_scp_argv(host_target, local_path, worker, STATE_ROOT)
+            _run, remote_inbox_scp_argv(host_target, local_path, remote_inbox)
         )
-        return scp.returncode == 0
+        if scp.returncode != 0:
+            return None
+        return os.path.join(remote_inbox, os.path.basename(local_path))
 
     async def save_attachments(name, message, host_target=None):
         """Download a message's Discord attachments into the worker's inbox
@@ -2581,9 +2725,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         (which would drop the whole message, reaction and all).
 
         When `host_target` is not None the worker runs on a remote satellite;
-        after each file lands locally it's also scp'd out to the same
-        STATE_ROOT-relative path on that machine, since satellites share this
-        layout. Local workers (host_target None) are unaffected — no scp."""
+        after each file lands locally it's also scp'd into the inbox path
+        reported by that satellite. Local workers are unaffected — no scp."""
         if not message.attachments:
             return []
         inbox = os.path.join(STATE_ROOT, name, "inbox")
@@ -2612,8 +2755,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     pass
                 continue
             if host_target is not None:
-                ok = await copy_inbound_attachment(host_target, dest, name)
-                if not ok:
+                remote_path = await copy_inbound_attachment(
+                    host_target, dest, name)
+                if not remote_path:
                     print(f"[bridge] {name}: failed to copy {dest!r} to "
                           f"{host_target}")
                     try:
@@ -2623,6 +2767,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                         )
                     except discord.HTTPException:
                         pass
+                else:
+                    # The prompt is interpreted on the worker host, so name
+                    # the copied file there rather than the parent's temp path.
+                    paths[-1] = remote_path
         return paths
 
     async def reply_snippet(message):
@@ -2643,7 +2791,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         harness = harness_for(repo)
         target = resolve_host_target(cfg, repo)
         if not await asyncio.to_thread(worker_alive, name, target):
-            resume = should_resume(worker_has_state(name), fresh_pending(name))
+            resume = should_resume(
+                worker_has_state(name, host_target=target),
+                fresh_pending(name, host_target=target),
+            )
             await message.add_reaction("🚀" if resume else "🧼")
             r = await asyncio.to_thread(
                 worker_start, name, directory, message.channel.id, resume,
@@ -2655,7 +2806,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 )
                 return
             # Started — consume any armed /fresh so it only skips resume once.
-            await asyncio.to_thread(disarm_fresh, name)
+            await asyncio.to_thread(disarm_fresh, name, None, target)
             # A fresh Codex session has no injected system prompt, so arm the
             # first-message protocol injection (a resumed one already carries it
             # in its restored history).
@@ -2767,7 +2918,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         cancel_limit_watcher(name, clear_notice=True)
         target = resolve_host_target(cfg, repo_by_name(name))
         await asyncio.to_thread(worker_stop, name, target)
-        await asyncio.to_thread(arm_fresh, name)
+        await asyncio.to_thread(arm_fresh, name, None, target)
         # A fresh context deserves a fresh channel — wipe the old chatter.
         purged, note = await purge_channel(channel_for_worker(name))
         return (
@@ -2793,7 +2944,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             repo.get("profile", "owner"), harness_for(repo), target,
         )
         # Explicit resume: cancel any armed fresh so it can't re-fire.
-        await asyncio.to_thread(disarm_fresh, name)
+        await asyncio.to_thread(disarm_fresh, name, None, target)
         return (
             f"🔄 restarted `{name}`" if r.returncode == 0
             else f"⚠️ restart failed: {r.stderr.strip()}", None,
@@ -2815,7 +2966,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             worker_start, name, repo["dir"], channel_id, False,
             repo.get("profile", "owner"), harness, target,
         )
-        await asyncio.to_thread(disarm_fresh, name)
+        await asyncio.to_thread(disarm_fresh, name, None, target)
         if r.returncode != 0:
             return f"⚠️ clear failed: {r.stderr.strip()}", None
         # Fresh Codex session: re-arm first-message protocol injection.
@@ -2846,12 +2997,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         blocks the switch — always returns, whatever happened."""
         target = resolve_host_target(cfg, repo_by_name(name))
         try:
-            try:
-                os.remove(handoff_path(name))
-            except FileNotFoundError:
-                pass
+            await asyncio.to_thread(
+                remove_worker_state_file, name, "handoff.md", target)
+            destination = (handoff_path(name) if target is None else
+                           await asyncio.to_thread(
+                               remote_worker_state_path,
+                               name, "handoff.md", target))
+            if not destination:
+                return " ⚠️ couldn't resolve the handoff path — switching without it."
             await deliver(
-                name, HANDOFF_PROMPT.format(path=handoff_path(name)),
+                name, HANDOFF_PROMPT.format(path=destination),
                 tag=HANDOFF_TAG,
             )
             # deliver() returns as soon as the paste lands, so poll for the
@@ -2868,7 +3023,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # The file is the real signal either way: a worker that wrote the
             # note and then moved on to something else still handed off, even
             # though it never went idle inside the window.
-            if os.path.isfile(handoff_path(name)):
+            content = await asyncio.to_thread(
+                read_worker_state_file, name, "handoff.md", target)
+            if content is not None:
+                # Handoffs are consumed later from the parent's durable state,
+                # even when the outgoing worker wrote them on a satellite.
+                if target is not None:
+                    local_path = handoff_path(name)
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, "w") as f:
+                        f.write(content)
+                    await asyncio.to_thread(
+                        remove_worker_state_file, name, "handoff.md", target)
                 return " 📝 handoff captured for the next engine."
             if not finished:
                 return " ⚠️ handoff didn't finish in time — switching without it."
@@ -2981,11 +3147,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         cancel_limit_watcher(name, clear_notice=True)
         target = resolve_host_target(cfg, repo)
         await asyncio.to_thread(worker_stop, name, target)
-        wiped = await asyncio.to_thread(remove_worker_state, name)
+        wiped = await asyncio.to_thread(purge_worker_state, name, target)
         del cfg["repos"][cid]
         save_config(cfg, config_path)
         last_activity.pop(name, None)
         notified.discard(name)
+        old_path = priced_path.pop(name, None)
+        if old_path:
+            codex_totals.pop(old_path, None)
+            claude_usage_offsets.pop(old_path, None)
+            claude_usage_snapshots.pop(old_path, None)
         print(f"[bridge] close: retired worker {name} (channel {cid})")
         summary = (
             f"🗑️ Closed `{name}` — worker stopped, "
@@ -3833,9 +4004,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # selects the transcript-parsing fallback below — byte-identical to
                 # before this change.
                 inline_reply = event.get("reply")
+                engine = event.get("engine") or harness_for(
+                    repo_by_name(name) or {})
                 # Price the turn before any branch below advances the offset.
                 await charge_turn(name, channel_id, path,
-                                  event.get("model"), inline_reply is not None)
+                                  event.get("model"), engine,
+                                  event.get("usage"))
                 if channel_id and limit_hit:
                     if inline_reply is None:
                         _, off = extract_new_reply(path, offsets.get(path, 0))
@@ -4023,7 +4197,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if await asyncio.to_thread(worker_alive, name, target):
                 last_activity[name] = time.time()
                 return web.json_response({"status": "ok", "note": "already running"})
-            resume = should_resume(worker_has_state(name), fresh_pending(name))
+            resume = should_resume(
+                worker_has_state(name, host_target=target),
+                fresh_pending(name, host_target=target),
+            )
             harness = harness_for(repo)
             r = await asyncio.to_thread(
                 worker_start, name, repo["dir"], channel_id, resume,
@@ -4031,7 +4208,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             )
             if r.returncode != 0:
                 return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)
-            await asyncio.to_thread(disarm_fresh, name)
+            await asyncio.to_thread(disarm_fresh, name, None, target)
             if harness in ("codex", "antigravity") and not resume:
                 codex_unprimed.add(name)
             last_activity[name] = time.time()
@@ -4104,11 +4281,19 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # codex_totals is keyed by rollout path and leaks the same way —
             # a Codex worker that gets /clear'd strands its old session's
             # cumulative reading here forever.
-            for path in [p for p in codex_totals if p and not os.path.exists(p)]:
+            active_usage_paths = set(priced_path.values())
+            for path in [p for p in codex_totals
+                         if p and p not in active_usage_paths
+                         and not os.path.exists(p)]:
                 codex_totals.pop(path, None)
             for path in [p for p in claude_usage_offsets
-                         if p and not os.path.exists(p)]:
+                         if p and p not in active_usage_paths
+                         and not os.path.exists(p)]:
                 claude_usage_offsets.pop(path, None)
+            for path in [p for p in claude_usage_snapshots
+                         if p and p not in active_usage_paths
+                         and not os.path.exists(p)]:
+                claude_usage_snapshots.pop(path, None)
             idle_s = cfg["idle_minutes"] * 60
             for repo in list(cfg["repos"].values()):
                 name = repo["name"]

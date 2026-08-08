@@ -22,6 +22,7 @@
 #   agent-worker key   <name> <key>...     # send raw keys (Escape, C-c, …)
 #   agent-worker list
 #   agent-worker status <name>
+#   agent-worker state <name> <operation> # bridge lifecycle/file primitives
 #   agent-worker restart <name>            # same name, same recorded dir
 #   agent-worker stop <name>
 #
@@ -517,6 +518,50 @@ cmd_status() {
   fi
 }
 
+cmd_state() {
+  # Host-local state primitives used by agent-bridge. Keeping these behind
+  # agent-worker means a parent never has to guess a satellite's $HOME,
+  # XDG_STATE_HOME, or CLAUDE_WORKERS_STATE.
+  require_name "${1:-}"
+  local name="$1" operation="${2:-}" leaf="${3:-}" state="$STATE_ROOT/$1"
+  case "$operation" in
+    has)
+      [[ -f "$state/meta" ]]
+      ;;
+    fresh-pending)
+      [[ -f "$state/no-resume" ]]
+      ;;
+    fresh-arm)
+      mkdir -p "$state"
+      : > "$state/no-resume"
+      ;;
+    fresh-disarm)
+      rm -f "$state/no-resume"
+      ;;
+    purge)
+      alive "$name" && die "worker '$name' is still running"
+      [[ -d "$state" ]] || return 1
+      rm -rf -- "$state"
+      ;;
+    path|read|remove)
+      [[ -n "$leaf" && "$leaf" != */* && "$leaf" != "." && "$leaf" != ".." ]] \
+        || die "state $operation needs one safe file name"
+      case "$operation" in
+        path) printf '%s\n' "$state/$leaf" ;;
+        read) [[ -f "$state/$leaf" ]] && cat "$state/$leaf" ;;
+        remove) rm -f -- "$state/$leaf" ;;
+      esac
+      ;;
+    ensure-inbox)
+      mkdir -p "$state/inbox"
+      printf '%s\n' "$state/inbox"
+      ;;
+    *)
+      die "usage: agent-worker state <name> <has|fresh-pending|fresh-arm|fresh-disarm|purge|path|read|remove|ensure-inbox> [file]"
+      ;;
+  esac
+}
+
 cmd_stop() {
   require_name "${1:-}"
   local name="$1"
@@ -544,7 +589,7 @@ cmd_restart() {
 cmd="${1:-}"
 shift || true
 case "$cmd" in
-  start|send|wait|read|key|list|status|stop|restart) "cmd_$cmd" "$@" ;;
+  start|send|wait|read|key|list|status|state|stop|restart) "cmd_$cmd" "$@" ;;
   ''|-h|--help|help) usage ;;
   *) die "unknown command '$cmd' (see agent-worker --help)" ;;
 esac

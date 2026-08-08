@@ -6,13 +6,16 @@ transcript the bridge cannot read across the network).
 
 Usage: agent-reply-extract <transcript_path> <offset_file>
 
-Reads the integer byte offset from <offset_file> (0 if missing/blank/invalid),
+Reads a transcript-aware byte offset from <offset_file> (0 if missing/invalid),
 calls the bridge's extract_new_reply(transcript, offset) -> (reply, new_offset),
-writes new_offset back to <offset_file>, and prints reply to stdout (nothing if
-empty). Only complete transcript lines are consumed, so a mid-write trailing
-line is left for the next run (race-safe, same guarantee as the bridge).
+writes the transcript identity plus new_offset back, and prints reply to stdout
+(nothing if empty). An offset from another transcript, or one beyond a truncated
+file's EOF, resets to zero. Only complete transcript lines are consumed, so a
+mid-write trailing line is left for the next run (race-safe, same guarantee as
+the bridge).
 """
 import importlib.util
+import json
 import os
 import sys
 from importlib.machinery import SourceFileLoader
@@ -29,11 +32,20 @@ def _bridge():
     return mod
 
 
-def _read_offset(off_file):
+def _read_offset(off_file, transcript):
     try:
         with open(off_file) as f:
-            return int(f.read().strip() or 0)
-    except (OSError, ValueError):
+            saved = json.load(f)
+        if saved.get("transcript") != os.path.realpath(transcript):
+            return 0
+        offset = int(saved.get("offset") or 0)
+        if offset < 0 or offset > os.path.getsize(transcript):
+            return 0
+        return offset
+    except (OSError, TypeError, ValueError, AttributeError):
+        # Legacy files contained only an integer. Their transcript identity is
+        # unknowable, so reset once during the format upgrade rather than risk
+        # carrying an old session's beyond-EOF offset forever.
         return 0
 
 
@@ -42,11 +54,14 @@ def main():
         sys.stderr.write("usage: agent-reply-extract <transcript_path> <offset_file>\n")
         return 2
     transcript, off_file = sys.argv[1], sys.argv[2]
-    start = _read_offset(off_file)
+    start = _read_offset(off_file, transcript)
     cb = _bridge()
     reply, new_offset = cb.extract_new_reply(transcript, start)
     with open(off_file, "w") as f:
-        f.write(str(new_offset))
+        json.dump({
+            "transcript": os.path.realpath(transcript),
+            "offset": new_offset,
+        }, f)
     if reply:
         sys.stdout.write(reply)
     return 0
