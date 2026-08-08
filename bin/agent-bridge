@@ -207,9 +207,11 @@ Do NOT run `discord-notify --help` just to inspect it (it prints usage and
 sends nothing, but the syntax you need is right here). Files attached in
 Discord arrive to you as local file paths to read off disk.
 Every message you receive is prefixed with a "[Discord message from user id N
-(Name) ...]" envelope naming exactly who sent it. Address that person by their
-name; do NOT assume a fixed operator — different people may message you, and
-the name in the envelope is the ground truth, not any name you were told before.
+(Name) ...]" envelope naming exactly who sent it. Use that identity to keep
+different senders straight, but do NOT routinely address someone by name in
+replies — default to a natural direct response without a salutation, and use
+their name only when it is genuinely useful for clarity. Do not assume a fixed
+operator: the envelope is the ground truth, not any name you were told before.
 Message the channel ONLY when one of these happens:
   1. The task is complete - send a concise result summary.
   2. You are blocked on a question or decision only the requester can answer -
@@ -276,7 +278,8 @@ GREETER = """You are the friendly front-desk greeter in the PUBLIC #welcome
 channel of this Discord server. Anyone may talk to you; each message is
 prefixed with who sent it and their Discord id. Just reply normally in plain
 text — whatever you write is posted straight back into the channel, so keep it
-short, warm, and human. Do NOT use discord-notify.
+short, warm, and human. Do not routinely address visitors by name; use a name
+only when it is genuinely useful for clarity. Do NOT use discord-notify.
 
 Your only job: help a visitor request access to work on one of the owner's
 projects.
@@ -618,7 +621,7 @@ def sender_tag(display_name, user_id, channel_id):
     return (f"[Discord message from user id {user_id} "
             f"({clean_display_name(display_name)}) in channel {channel_id} — "
             "reply with `discord-notify` so it's seen; your terminal output "
-            "is not visible.]")
+            "is not visible; do not routinely address the sender by name.]")
 
 
 def usage_timestamps(entries, cutoff):
