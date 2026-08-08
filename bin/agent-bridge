@@ -65,8 +65,10 @@ on connect). The `worker` option defaults to the channel's mapped worker:
                            also wipes the channel's messages)
   /compact [focus] [worker] compact the worker's context
   /checkin [worker]        ask a running worker for a progress update
-  /addrepo <name> <path> [category]   create #<name> + map it; file it under
-                           an existing/new category (default: inbox category)
+  /addrepo <name> <path> [category] [host]   create #<name> + map it; file it
+                           under an existing/new category (default: inbox
+                           category); optional host runs its worker on that
+                           machine (must be in config 'machines', else local)
   /close [worker] confirm:<name>
                            retire a worker: stop it, wipe its saved state, and
                            delete its channel (irreversible; confirm required)
@@ -92,8 +94,10 @@ import hmac
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 
 CONFIG_PATH = os.path.expanduser(
@@ -150,6 +154,32 @@ IGNORE_EMOJI = "🙈"
 
 DISCORD_LIMIT = 2000
 REPLY_CAP = 8000
+
+# Bounds on multipart /event uploads (the remote-worker attachment path). Even
+# an authenticated caller must not be able to fill dev-box's temp partition, so
+# each `file` part is capped and the number of parts is limited (defense in
+# depth on top of the payload-first HMAC gate). 25 MiB matches Discord's own
+# per-file upload ceiling; 10 parts is well above any real attachment batch.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_PARTS = 10
+
+# Applied to every ssh/scp invocation that dispatches to a satellite host. A
+# short connect timeout plus BatchMode (disables password/interactive-key
+# prompts, so ssh fails fast instead of hanging) keeps an offline or
+# unreachable satellite from blocking a bridge op for the full default _run
+# timeout (~180s) or wedging on a prompt with no TTY to answer it.
+SSH_OPTS = ["-o", "ConnectTimeout=8", "-o", "BatchMode=yes"]
+
+# Whole-request cap passed to aiohttp's `client_max_size` (it defaults to 1
+# MiB, which — silently, below any of the above — rejects most real
+# attachments before `handle_multipart_event` ever runs). Headroom above one
+# MAX_UPLOAD_BYTES attachment for the payload field and multipart framing.
+MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 1024 * 1024
+
+# The signed JSON metadata in the `payload` part is tiny; this tightly bounds
+# the pre-auth in-memory read (that read happens before the HMAC check, so it
+# must stay small regardless of how high MAX_REQUEST_BYTES is).
+MAX_PAYLOAD_BYTES = 256 * 1024
 
 # Downloaded Discord attachments pile up in each worker's inbox (every file
 # gets a unique name); prune anything older than this on the next download.
@@ -414,6 +444,54 @@ def channel_allows(cfg, channel_id, user_id):
     return bool(repo) and user_id in (repo.get("guests") or [])
 
 
+def build_repo_entry(name, directory, channel_id=None, host=None, **rest):
+    """Build the repo-mapping dict stored under cfg["repos"][channel_id].
+
+    `channel_id` is accepted for symmetry with callers that key off it, but
+    isn't included in the entry itself (the channel id is the dict key, not a
+    field). `host` is omitted from the entry when absent or "local" so
+    existing single-machine configs stay byte-identical; any other value
+    names an entry in cfg["machines"] (validated by the caller via
+    resolve_host_target before persisting).
+    """
+    entry = {"name": name, "dir": directory}
+    if host and host != "local":
+        entry["host"] = host
+    entry.update(rest)
+    return entry
+
+
+def resolve_host_target(cfg, repo):
+    """SSH target for a repo's worker, or None when it runs locally.
+
+    A repo with no `host` (or host == "local") runs on this machine, exactly as
+    before. Any other host must name an entry in cfg["machines"] whose "ssh"
+    field is the target this bridge SSHes to.
+    """
+    host = (repo or {}).get("host") or "local"
+    if host == "local":
+        return None
+    machines = cfg.get("machines") or {}
+    if host not in machines:
+        raise KeyError(f"repo host '{host}' has no entry in config 'machines'")
+    return machines[host]["ssh"]
+
+
+def dir_exists_for_host(cfg, host, path):
+    """Whether `path` is a directory on `host` ("local"/None = this machine).
+
+    Local check uses os.path.isdir, exactly as before host-awareness existed.
+    A remote host is resolved via resolve_host_target (raises KeyError for an
+    unknown machine, same as elsewhere) and checked with `ssh <target> test -d
+    <path>` — no local os.path.isdir call, since the path only makes sense on
+    the remote filesystem.
+    """
+    target = resolve_host_target(cfg, {"host": host})
+    if target is None:
+        return os.path.isdir(path)
+    return _run(["ssh", *SSH_OPTS, target, "test", "-d", path]).returncode == 0
+
+
 def format_request_card(discord_id, project, summary):
     """The approval card posted to #requests. The trailing `req:id:project`
     marker lets the reaction handler recover who/what to grant, so the decision
@@ -464,6 +542,7 @@ def default_config():
         "category_id": 0,
         "allowed_users": [],
         "idle_minutes": 45,
+        "listen_host": "127.0.0.1",
         "listen_port": 8765,
         "repos": {},
         "welcome_channel": None,
@@ -957,6 +1036,55 @@ def claude_session_usage(transcript_path):
     }
 
 
+def session_usage_event(harness, transcript_path):
+    """JSON-safe cumulative usage snapshot for a turn-end relay.
+
+    The relay runs on the worker host, where the session file and any Claude
+    subagent transcripts exist. Shipping raw token counts lets the parent
+    price remote turns without sharing filesystems or copying transcripts.
+    """
+    if harness == "codex":
+        return {
+            "engine": "codex",
+            "totals": codex_session_totals(transcript_path),
+            "fast_share": codex_priority_share(transcript_path),
+        }
+    transcripts = []
+    for path, groups in claude_session_usage(transcript_path).items():
+        transcripts.append({
+            "path": path,
+            "groups": [
+                {
+                    "model": model,
+                    "fast": fast,
+                    "tokens": tokens,
+                }
+                for (model, fast), tokens in groups.items()
+            ],
+        })
+    return {"engine": "claude", "transcripts": transcripts}
+
+
+def claude_usage_from_event(payload):
+    """Restore claude_session_usage's tuple-keyed shape from relay JSON."""
+    usage = {}
+    if not isinstance(payload, dict):
+        return usage
+    for transcript in payload.get("transcripts") or []:
+        if not isinstance(transcript, dict) or not transcript.get("path"):
+            continue
+        groups = {}
+        for group in transcript.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            groups[(group.get("model"), bool(group.get("fast")))] = {
+                field: max(0, int((group.get("tokens") or {}).get(field) or 0))
+                for field in TOKEN_FIELDS
+            }
+        usage[transcript["path"]] = groups
+    return usage
+
+
 def summarize_claude_usage(usage):
     """Return aggregate tokens, parent model, and output-weighted fast share."""
     tokens = dict.fromkeys(TOKEN_FIELDS, 0)
@@ -1332,6 +1460,35 @@ def verify_signature(body, header, secret):
     return hmac.compare_digest(header, expected)
 
 
+def upload_size_ok(written, chunk_len, cap=None):
+    """Running size guard for a streamed upload part.
+
+    `written` is the bytes committed to disk so far for the current part,
+    `chunk_len` the size of the next chunk about to be written. Returns True if
+    writing that chunk keeps the part at or under `cap`, False if it would
+    exceed it. Pulled out as a pure function so the byte-accumulator logic is
+    unit-testable without an aiohttp request.
+    """
+    if cap is None:
+        cap = MAX_UPLOAD_BYTES
+    return written + chunk_len <= cap
+
+
+def bridge_url_is_local(url):
+    """True if the bridge in BRIDGE_WEBHOOK_URL shares this machine's disk.
+
+    discord-notify mirrors this test to decide transport: a loopback host
+    (127.0.0.1 / localhost) means the bridge can read attachment files off our
+    local disk (send paths in JSON), while any other host is a remote parent
+    that cannot (upload the bytes via multipart). Kept here so a stdlib test
+    can pin the exact host set the shell check must match.
+    """
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url or "").hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
 def read_kv_file(path):
     kv = {}
     try:
@@ -1455,13 +1612,75 @@ def _run(args, timeout=180, input_text=None):
         return subprocess.CompletedProcess(args, 127, stdout="", stderr=str(exc))
 
 
-def worker_alive(name):
-    r = _run(["agent-worker", "status", name], timeout=15)
+def ssh_wrap(target, argv, env=None):
+    """argv to run `argv` (an agent-worker command) on `target` over SSH.
+
+    SSH runs its command string in a NON-login, non-interactive shell, so
+    PATH is whatever that shell's non-interactive startup happens to set —
+    `agent-worker` under ~/.local/bin is not guaranteed to be found. We build
+    ONE shell-safe string (each token shlex-quoted), prefix it with an
+    explicit unquoted PATH assignment so $HOME/$PATH expand on the remote
+    regardless of shell, and forward any needed env explicitly as an
+    `env NAME=VAL` prefix — the caller's environment does not cross SSH.
+    """
+    assignments = "".join(
+        f"{shlex.quote(k)}={shlex.quote(str(v))} " for k, v in (env or {}).items()
+    )
+    prefix = f"env {assignments}" if env else ""
+    remote = 'PATH="$HOME/.local/bin:$PATH" ' + prefix + " ".join(
+        shlex.quote(a) for a in argv
+    )
+    return ["ssh", *SSH_OPTS, target, "--", remote]
+
+
+def run_worker_cmd(host_target, argv, timeout=180, input_text=None, env=None):
+    """Dispatch an agent-worker command to its host. host_target None → local
+    (byte-identical to today); otherwise wrap for SSH."""
+    if host_target is None:
+        return _run(argv, timeout=timeout, input_text=input_text)
+    return _run(ssh_wrap(host_target, argv, env=env), timeout=timeout,
+                input_text=input_text)
+
+
+def format_status_sections(local_stdout, satellites):
+    """Render /status's aggregated roster across the local host and any
+    configured satellites.
+
+    `satellites` is {machine_name: (returncode, stdout)}. When empty (no
+    machines configured — the common case), the output is the exact
+    pre-existing single-block shape with no "local:" header, so callers with
+    zero machines stay byte-identical to the pre-distributed-bridge output.
+    With one or more satellites, a "local:" header is added alongside a
+    labeled section per machine; a nonzero returncode renders as
+    "(unreachable)" instead of (possibly garbage/partial) stdout, so one
+    unreachable satellite doesn't fail the whole command.
+    """
+    if not satellites:
+        return f"```\n{local_stdout}\n```"
+    sections = [f"local:\n{local_stdout}"]
+    for name, (returncode, stdout) in satellites.items():
+        body = stdout if returncode == 0 else "(unreachable)"
+        sections.append(f"{name}:\n{body}")
+    return "```\n" + "\n\n".join(sections) + "\n```"
+
+
+def remote_inbox_scp_argv(target, local_path, remote_inbox):
+    """argv to scp a locally-saved attachment into a remote worker's inbox.
+
+    `remote_inbox` is reported by agent-worker on the satellite, rather than
+    assembled from the parent's STATE_ROOT. That keeps this correct when the
+    two hosts use different homes or XDG state directories."""
+    dest = f"{target}:{remote_inbox}/"
+    return ["scp", *SSH_OPTS, local_path, dest]
+
+
+def worker_alive(name, host_target=None):
+    r = run_worker_cmd(host_target, ["agent-worker", "status", name], timeout=15)
     return "running: yes" in r.stdout
 
 
-def worker_busy(name):
-    r = _run(["agent-worker", "read", name, "30"], timeout=15)
+def worker_busy(name, host_target=None):
+    r = run_worker_cmd(host_target, ["agent-worker", "read", name, "30"], timeout=15)
     return worker_busy_text(r.stdout)
 
 
@@ -1695,13 +1914,13 @@ def trim_usage_panel(screen):
     return "\n".join(lines[start:end + 1])
 
 
-def worker_screen(name, lines=40, ansi=False):
+def worker_screen(name, lines=40, ansi=False, host_target=None):
     # ansi=True keeps the pane's colour escapes (for the peek image); the
     # default plain capture is what every screen parser downstream expects.
     args = ["agent-worker", "read", name, str(lines)]
     if ansi:
         args.append("--ansi")
-    r = _run(args, timeout=15)
+    r = run_worker_cmd(host_target, args, timeout=15)
     return r.stdout if r.returncode == 0 else r.stderr
 
 
@@ -1723,34 +1942,39 @@ def render_screen_png(text, path):
 
 
 def worker_start(name, directory, channel_id, resume, profile="owner",
-                 harness="claude"):
-    return _run(
+                 harness="claude", host_target=None):
+    return run_worker_cmd(
+        host_target,
         start_args(name, directory, channel_id, resume, profile, harness),
         timeout=180,
     )
 
 
-def worker_send(name, text, typed=False):
+def worker_send(name, text, typed=False, host_target=None):
     args = ["agent-worker", "send", name]
     if typed:
         args.append("--type")
-    return _run(args + [text], timeout=30)
+    return run_worker_cmd(host_target, args + [text], timeout=30)
 
 
-def worker_key(name, *keys):
+def worker_key(name, *keys, host_target=None):
     """Send raw key names (tmux send-keys: Escape, Enter, C-c, `-l TEXT`, …) to
     the worker's pane. Unlike worker_send, it neither verifies a submit nor
     auto-presses Enter — it's for driving TUI overlays like the /usage panel,
     where worker_send's submit check would loop (the box never clears while the
     panel is up) and wrongly trip the wedge-recovery restart."""
-    return _run(["agent-worker", "key", name, *keys], timeout=15)
+    return run_worker_cmd(host_target, ["agent-worker", "key", name, *keys], timeout=15)
 
 
-def worker_stop(name):
-    return _run(["agent-worker", "stop", name], timeout=30)
+def worker_stop(name, host_target=None):
+    return run_worker_cmd(host_target, ["agent-worker", "stop", name], timeout=30)
 
 
-def worker_has_state(name, state_root=None):
+def worker_has_state(name, state_root=None, host_target=None):
+    if host_target is not None:
+        r = run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "has"], timeout=15)
+        return r.returncode == 0
     state_root = state_root or os.path.expanduser("~/.local/state/claude-workers")
     return os.path.isfile(os.path.join(state_root, name, "meta"))
 
@@ -1759,29 +1983,46 @@ def fresh_marker_path(name, state_root=None):
     return os.path.join(state_root or STATE_ROOT, name, "no-resume")
 
 
-def fresh_pending(name, state_root=None):
+def fresh_pending(name, state_root=None, host_target=None):
     """True when /fresh was armed: the worker was shut down and its next
     start must begin a brand-new session instead of --continue-resuming the
     old conversation."""
+    if host_target is not None:
+        r = run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "fresh-pending"],
+            timeout=15,
+        )
+        return r.returncode == 0
     return os.path.isfile(fresh_marker_path(name, state_root))
 
 
-def arm_fresh(name, state_root=None):
+def arm_fresh(name, state_root=None, host_target=None):
     """Mark the worker so its next start skips --continue. The marker is a file
     beside the worker's state (which `agent-worker stop` keeps), so the lazy
     revive on the next message reads it and starts clean."""
+    if host_target is not None:
+        return run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "fresh-arm"],
+            timeout=15,
+        ).returncode == 0
     path = fresh_marker_path(name, state_root)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w").close()
 
 
-def disarm_fresh(name, state_root=None):
+def disarm_fresh(name, state_root=None, host_target=None):
     """Consume the fresh marker — called once the worker has (re)started, so a
     one-shot /fresh doesn't wipe every subsequent revive."""
+    if host_target is not None:
+        return run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "fresh-disarm"],
+            timeout=15,
+        ).returncode == 0
     try:
         os.remove(fresh_marker_path(name, state_root))
     except FileNotFoundError:
         pass
+    return True
 
 
 def should_resume(has_state, fresh):
@@ -1803,6 +2044,46 @@ def remove_worker_state(name, state_root=None):
         return False
     shutil.rmtree(path, ignore_errors=True)
     return True
+
+
+def purge_worker_state(name, host_target=None):
+    """Remove state on the host that owns the worker."""
+    if host_target is None:
+        return remove_worker_state(name)
+    r = run_worker_cmd(
+        host_target, ["agent-worker", "state", name, "purge"], timeout=30)
+    return r.returncode == 0
+
+
+def remote_worker_state_path(name, leaf, host_target):
+    """Ask a satellite for a state-file path; never infer its home locally."""
+    r = run_worker_cmd(
+        host_target, ["agent-worker", "state", name, "path", leaf], timeout=15)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def read_worker_state_file(name, leaf, host_target=None):
+    if host_target is None:
+        try:
+            with open(os.path.join(STATE_ROOT, name, leaf)) as f:
+                return f.read()
+        except OSError:
+            return None
+    r = run_worker_cmd(
+        host_target, ["agent-worker", "state", name, "read", leaf], timeout=15)
+    return r.stdout if r.returncode == 0 else None
+
+
+def remove_worker_state_file(name, leaf, host_target=None):
+    if host_target is None:
+        try:
+            os.remove(os.path.join(STATE_ROOT, name, leaf))
+        except FileNotFoundError:
+            pass
+        return True
+    r = run_worker_cmd(
+        host_target, ["agent-worker", "state", name, "remove", leaf], timeout=15)
+    return r.returncode == 0
 
 
 def prune_old_files(directory, max_age_seconds, now=None):
@@ -1892,6 +2173,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     turn_owner = {}     # worker name -> (channel id, user id) that started it
     codex_totals = {}   # rollout path -> last cumulative token reading
     claude_usage_offsets = {}  # parent path -> child transcript byte offsets
+    claude_usage_snapshots = {}  # parent path -> last relayed cumulative usage
     priced_path = {}    # worker name -> transcript path last priced for it
     limit_watchers = {} # worker name -> provider-limit polling task
     limit_noticed = {}  # worker name -> reset hint already posted
@@ -1934,7 +2216,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await asyncio.to_thread(save_usage_state, usage_state)
         return True
 
-    async def charge_turn(name, channel_id, path, model, codex):
+    async def charge_turn(name, channel_id, path, model, engine, usage_event=None):
         """Price the turn that just ended and bill whoever started it.
 
         Called inside the turn lock and BEFORE the reply paths advance the
@@ -1964,10 +2246,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # A worker we've priced before that has moved to a new file is
             # mid-fleet-life, not mid-cold-start: its new session starts at 0.
             known_worker = name in priced_path
-            fresh_session = known_worker and priced_path[name] != path
+            previous_path = priced_path.get(name)
+            fresh_session = known_worker and previous_path != path
+            if fresh_session and previous_path:
+                codex_totals.pop(previous_path, None)
+                claude_usage_offsets.pop(previous_path, None)
+                claude_usage_snapshots.pop(previous_path, None)
             priced_path[name] = path
-            if codex:
-                totals = await asyncio.to_thread(codex_session_totals, path)
+            if engine == "codex":
+                relayed = usage_event if isinstance(usage_event, dict) else {}
+                totals = relayed.get("totals")
+                if not isinstance(totals, dict):
+                    totals = await asyncio.to_thread(codex_session_totals, path)
                 if totals is None:
                     return
                 baseline = codex_totals.get(path)
@@ -1977,24 +2267,40 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                         return
                     baseline = dict.fromkeys(TOKEN_FIELDS, 0)
                 tokens = subtract_tokens(totals, baseline)
-                share = codex_priority_share(path)
+                try:
+                    share = float(relayed.get("fast_share"))
+                except (TypeError, ValueError):
+                    share = await asyncio.to_thread(codex_priority_share, path)
                 cost = token_cost(tokens, rates_for_model(pricing, model),
                                   share, fast_multiplier(pricing))
             else:
-                unseen = path not in claude_usage_offsets
-                child_offsets = claude_usage_offsets.setdefault(path, {})
-                usage = {}
-                for child_path in claude_session_transcripts(path):
-                    start = child_offsets.get(child_path, 0)
-                    groups, end = await asyncio.to_thread(
-                        claude_usage_window, child_path, start)
-                    child_offsets[child_path] = end
-                    usage[child_path] = groups
-                if unseen and not fresh_session:
-                    return
-                _, seen_model, _ = summarize_claude_usage(usage)
-                model = seen_model or model
-                cost = claude_usage_cost(usage, pricing)
+                relayed_usage = claude_usage_from_event(usage_event)
+                if relayed_usage:
+                    baseline = claude_usage_snapshots.get(path)
+                    claude_usage_snapshots[path] = relayed_usage
+                    if baseline is None:
+                        if not fresh_session:
+                            return
+                        baseline = {}
+                    _, seen_model, _ = summarize_claude_usage(relayed_usage)
+                    model = seen_model or model
+                    cost = claude_usage_cost(
+                        relayed_usage, pricing, previous=baseline)
+                else:
+                    unseen = path not in claude_usage_offsets
+                    child_offsets = claude_usage_offsets.setdefault(path, {})
+                    usage = {}
+                    for child_path in claude_session_transcripts(path):
+                        start = child_offsets.get(child_path, 0)
+                        groups, end = await asyncio.to_thread(
+                            claude_usage_window, child_path, start)
+                        child_offsets[child_path] = end
+                        usage[child_path] = groups
+                    if unseen and not fresh_session:
+                        return
+                    _, seen_model, _ = summarize_claude_usage(usage)
+                    model = seen_model or model
+                    cost = claude_usage_cost(usage, pricing)
             if cost <= 0:
                 return
             channel, user = owner if owner else (channel_id, None)
@@ -2024,7 +2330,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     # --append-system-prompt; the protocol rides in as a user turn instead).
     codex_unprimed = set()
 
-    async def wait_ready(name, timeout=180, harness=None):
+    async def wait_ready(name, timeout=180, harness=None, host_target=None):
         """Poll until the worker pane is idle and input-ready (or timeout).
 
         agent-worker start returns success even when its own readiness check
@@ -2040,9 +2346,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         stable = 0
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not await asyncio.to_thread(worker_alive, name):
+            if not await asyncio.to_thread(worker_alive, name, host_target):
                 return False
-            screen = await asyncio.to_thread(worker_screen, name, 40)
+            screen = await asyncio.to_thread(worker_screen, name, 40, False, host_target)
             if screen_is_ready(screen, harness):
                 stable += 1
                 if stable >= 2:
@@ -2136,10 +2442,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         """Build a worker's live-screen payload as (text, attachments): an
         image (falls back to a code block if rendering is unavailable). Shared
         by the 👀 reaction and the /screen command."""
-        if not await asyncio.to_thread(worker_alive, name):
+        target = resolve_host_target(cfg, repo_by_name(name))
+        if not await asyncio.to_thread(worker_alive, name, target):
             return f"👀 `{name}` isn't running right now.", None
         # Capture with colour for the image; term-shot parses the ANSI escapes.
-        screen = await asyncio.to_thread(worker_screen, name, 40, True)
+        screen = await asyncio.to_thread(worker_screen, name, 40, True, target)
         png = os.path.join(STATE_ROOT, name, "peek.png")
         if await asyncio.to_thread(render_screen_png, screen, png):
             return f"👀 `{name}` — live screen", [png]
@@ -2160,7 +2467,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         The panel only opens on an idle worker — typing /usage mid-turn would
         inject it into the running conversation as steering — so this bails
         when the worker is busy or has half-written input in the box."""
-        if not await asyncio.to_thread(worker_alive, name):
+        target = resolve_host_target(cfg, repo_by_name(name))
+        if not await asyncio.to_thread(worker_alive, name, target):
             return f"📊 `{name}` isn't running right now.", None
         harness = harness_of(name)
         if harness in ("codex", "antigravity"):
@@ -2172,7 +2480,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 f"📊 usage isn't wired up for **{harness}** workers — use "
                 f"`/screen` to peek at `{name}`.", None,
             )
-        screen = await asyncio.to_thread(worker_screen, name, 30)
+        screen = await asyncio.to_thread(worker_screen, name, 30, False, target)
         if not screen_is_ready(screen, harness):
             return f"📊 `{name}` is busy right now — try `/usage` once it's idle.", None
         if not composer_is_empty(screen, harness):
@@ -2182,9 +2490,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             )
         # Drive the overlay with raw keys (worker_send would try to verify a
         # submit that never clears the box while the panel is up).
-        await asyncio.to_thread(worker_key, name, "-l", "/usage")
+        await asyncio.to_thread(worker_key, name, "-l", "/usage", host_target=target)
         await asyncio.sleep(1.2)
-        await asyncio.to_thread(worker_key, name, "Enter")
+        await asyncio.to_thread(worker_key, name, "Enter", host_target=target)
         # Poll until the panel is up ("Esc to cancel") AND its "what's
         # contributing" breakdown has finished its async load (the panel first
         # shows "Scanning local sessions…"/"Refreshing…" placeholders, then
@@ -2192,14 +2500,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         panel = ""
         for _ in range(20):
             await asyncio.sleep(0.4)
-            cap = await asyncio.to_thread(worker_screen, name, 90)
+            cap = await asyncio.to_thread(worker_screen, name, 90, False, target)
             if "Esc to cancel" in cap:
                 panel = cap
                 if "Scanning" not in cap and "Refreshing" not in cap:
                     break
         # Always dismiss, even on a miss, so the worker is never left with the
         # panel open blocking its input box.
-        await asyncio.to_thread(worker_key, name, "Escape")
+        await asyncio.to_thread(worker_key, name, "Escape", host_target=target)
         if not panel:
             return f"📊 couldn't read `{name}`'s usage panel — try again in a moment.", None
         panel = trim_usage_panel(panel)
@@ -2212,15 +2520,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         """Post one provider-quota refusal per worker/reset window."""
         if not channel_id:
             return False
+        target = resolve_host_target(cfg, repo_by_name(name))
         if screen is None:
-            screen = await asyncio.to_thread(worker_screen, name, 80)
+            screen = await asyncio.to_thread(worker_screen, name, 80, False, target)
         hint = provider_usage_limit_notice(screen)
         if not hint:
             return False
         if screen_has_rate_limit_dialog(screen):
             # Preserve the configured model: option 1 silently switches to the
             # suggested cheaper model, while Down selects "Keep current".
-            await asyncio.to_thread(worker_key, name, "Down", "Enter")
+            await asyncio.to_thread(worker_key, name, "Down", "Enter", host_target=target)
         if limit_noticed.get(name) != hint:
             limit_noticed[name] = hint
             await post(
@@ -2236,6 +2545,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         task = asyncio.current_task()
         picked_up = False
         stale_hint = baseline_hint
+        target = resolve_host_target(cfg, repo_by_name(name))
         try:
             # A turn may legitimately run for hours. The normal Stop event
             # cancels this task; this long ceiling only bounds a missing-hook
@@ -2244,9 +2554,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # Screen capture is enough on every pass; do the extra tmux
                 # liveness subprocess only once a minute.
                 if tick % 12 == 0 and not await asyncio.to_thread(
-                        worker_alive, name):
+                        worker_alive, name, target):
                     return
-                screen = await asyncio.to_thread(worker_screen, name, 80)
+                screen = await asyncio.to_thread(worker_screen, name, 80, False, target)
                 hint = provider_usage_limit_notice(screen)
                 if hint:
                     # A previous hard-limit line can remain in scrollback after
@@ -2295,7 +2605,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if harness_for(repo) not in ("claude", "codex"):
                 continue
             name = repo["name"]
-            if await asyncio.to_thread(worker_alive, name):
+            if await asyncio.to_thread(worker_alive, name,
+                                       resolve_host_target(cfg, repo)):
                 await notify_provider_limit(name, channel_for_worker(name))
 
     async def deliver(name, text, message=None, typed=False, tag=None):
@@ -2304,14 +2615,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # course corrections need. A ✅ confirms the message was delivered,
         # whether the worker was idle or mid-turn (a queued steer still sent).
         last_activity[name] = time.time()
-        screen = await asyncio.to_thread(worker_screen, name, 30)
+        repo = repo_by_name(name)
+        target = resolve_host_target(cfg, repo)
+        screen = await asyncio.to_thread(worker_screen, name, 30, False, target)
         # A worker mid-compaction (manual /compact or an auto-compact) is
         # redrawing its input box; a paste — and the message pointing Claude at
         # a just-saved attachment — lands in that transient state and is
         # silently discarded. Wait for a genuinely input-ready prompt first,
         # exactly as the cold-start path does. A normal running turn is not
         # compaction and queues steering fine, so it isn't delayed here.
-        if screen_is_compacting(screen) and not await wait_ready(name) and message:
+        if screen_is_compacting(screen) and not await wait_ready(name, host_target=target) and message:
             # Compaction outlasted the wait — a paste now would be silently
             # discarded. Warn instead of a misleading ✅, and let Ned retry
             # once the worker is idle (his upload is already saved to inbox).
@@ -2321,19 +2634,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             )
             return
         text = tag_inbound(text, typed, tag)
-        r = await asyncio.to_thread(worker_send, name, text, typed)
+        r = await asyncio.to_thread(worker_send, name, text, typed, target)
         if r.returncode != 0:
             # A send that lands exactly on a turn boundary can wedge in the
             # TUI's queued-message state (displayed but never submitted, even
             # with Enter retries). Recover deterministically: restart the
             # worker with --continue and re-send once.
-            repo = next(
-                (x for x in cfg["repos"].values() if x["name"] == name), None
-            )
             channel_id = channel_for_worker(name)
             if repo and channel_id:
                 print(f"[bridge] {name}: send wedged, restarting worker to recover")
-                await asyncio.to_thread(worker_stop, name)
+                await asyncio.to_thread(worker_stop, name, target)
                 # Carry the channel's capability profile AND engine through the
                 # restart — omitting either would silently relaunch a restricted
                 # (utility/greeter) worker as full-trust owner, or a Codex worker
@@ -2345,15 +2655,19 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # belt-and-suspenders.
                 r2 = await asyncio.to_thread(
                     worker_start, name, repo["dir"], channel_id,
-                    should_resume(worker_has_state(name), fresh_pending(name)),
-                    repo.get("profile", "owner"), harness_for(repo),
+                    should_resume(
+                        worker_has_state(name, host_target=target),
+                        fresh_pending(name, host_target=target),
+                    ),
+                    repo.get("profile", "owner"), harness_for(repo), target,
                 )
                 if r2.returncode == 0:
+                    await asyncio.to_thread(disarm_fresh, name, None, target)
                     # The restart resumes and may auto-compact; wait for an
                     # input-ready prompt before re-sending so the recovery
                     # doesn't re-lose the message into a loading TUI.
-                    await wait_ready(name)
-                    r = await asyncio.to_thread(worker_send, name, text, typed)
+                    await wait_ready(name, host_target=target)
+                    r = await asyncio.to_thread(worker_send, name, text, typed, target)
         if r.returncode != 0:
             if message:
                 await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
@@ -2382,11 +2696,37 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         with open(dest, "wb") as f:
             f.write(data)
 
-    async def save_attachments(name, message):
+    async def copy_inbound_attachment(host_target, local_path, worker):
+        """Push a locally-saved attachment out to a remote worker's inbox so
+        the worker (running on `host_target`) can read the same path off its
+        own disk. Ask agent-worker to create and report its host-local inbox;
+        the parent must not assume that its own STATE_ROOT exists there.
+        Returns the remote file path on success, or None."""
+        mkdir = await asyncio.to_thread(
+            run_worker_cmd, host_target,
+            ["agent-worker", "state", worker, "ensure-inbox"], 15,
+        )
+        if mkdir.returncode != 0:
+            return None
+        remote_inbox = mkdir.stdout.strip()
+        if not remote_inbox:
+            return None
+        scp = await asyncio.to_thread(
+            _run, remote_inbox_scp_argv(host_target, local_path, remote_inbox)
+        )
+        if scp.returncode != 0:
+            return None
+        return os.path.join(remote_inbox, os.path.basename(local_path))
+
+    async def save_attachments(name, message, host_target=None):
         """Download a message's Discord attachments into the worker's inbox
         dir and return their local paths, so Claude can Read them off disk.
         A download that fails warns in-channel rather than crashing the handler
-        (which would drop the whole message, reaction and all)."""
+        (which would drop the whole message, reaction and all).
+
+        When `host_target` is not None the worker runs on a remote satellite;
+        after each file lands locally it's also scp'd into the inbox path
+        reported by that satellite. Local workers are unaffected — no scp."""
         if not message.attachments:
             return []
         inbox = os.path.join(STATE_ROOT, name, "inbox")
@@ -2413,6 +2753,24 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     )
                 except discord.HTTPException:
                     pass
+                continue
+            if host_target is not None:
+                remote_path = await copy_inbound_attachment(
+                    host_target, dest, name)
+                if not remote_path:
+                    print(f"[bridge] {name}: failed to copy {dest!r} to "
+                          f"{host_target}")
+                    try:
+                        await message.channel.send(
+                            f"⚠️ couldn't copy `{att.filename}` to the remote "
+                            "worker — it may not be able to read it."
+                        )
+                    except discord.HTTPException:
+                        pass
+                else:
+                    # The prompt is interpreted on the worker host, so name
+                    # the copied file there rather than the parent's temp path.
+                    paths[-1] = remote_path
         return paths
 
     async def reply_snippet(message):
@@ -2431,12 +2789,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     async def handle_repo_message(message, repo):
         name, directory = repo["name"], repo["dir"]
         harness = harness_for(repo)
-        if not await asyncio.to_thread(worker_alive, name):
-            resume = should_resume(worker_has_state(name), fresh_pending(name))
+        target = resolve_host_target(cfg, repo)
+        if not await asyncio.to_thread(worker_alive, name, target):
+            resume = should_resume(
+                worker_has_state(name, host_target=target),
+                fresh_pending(name, host_target=target),
+            )
             await message.add_reaction("🚀" if resume else "🧼")
             r = await asyncio.to_thread(
                 worker_start, name, directory, message.channel.id, resume,
-                repo.get("profile", "owner"), harness,
+                repo.get("profile", "owner"), harness, target,
             )
             if r.returncode != 0:
                 await message.channel.send(
@@ -2444,7 +2806,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 )
                 return
             # Started — consume any armed /fresh so it only skips resume once.
-            await asyncio.to_thread(disarm_fresh, name)
+            await asyncio.to_thread(disarm_fresh, name, None, target)
             # A fresh Codex session has no injected system prompt, so arm the
             # first-message protocol injection (a resumed one already carries it
             # in its restored history).
@@ -2453,7 +2815,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # The resume can auto-compact; wait for a genuinely input-ready
             # prompt before pasting, or this waking message is discarded when
             # the resume/compaction redraw replaces the input box.
-            if not await wait_ready(name):
+            if not await wait_ready(name, host_target=target):
                 await message.channel.send(
                     f"⚠️ `{name}` resumed but isn't input-ready yet (still "
                     "compacting?). Re-send your message in a moment."
@@ -2475,7 +2837,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if message.content.startswith("/"):
             await deliver(name, message.content, message, typed=True)
             return
-        paths = await save_attachments(name, message)
+        paths = await save_attachments(name, message, host_target=target)
         quote = await reply_snippet(message)
         composed = compose_inbound(message.content, paths, quote)
         # A pending /harness handoff rides on the first real message to
@@ -2532,12 +2894,21 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     # likes; worker restarts block, so their callers defer the interaction.
     async def do_status():
         r = await asyncio.to_thread(_run, ["agent-worker", "list"], 15)
-        return f"```\n{r.stdout}\n```", None
+        satellites = {}
+        for m, info in (cfg.get("machines") or {}).items():
+            rr = await asyncio.to_thread(
+                run_worker_cmd, info["ssh"], ["agent-worker", "list"], 15,
+            )
+            satellites[m] = (rr.returncode, rr.stdout)
+        return format_status_sections(r.stdout, satellites), None
 
     async def do_status_one(name):
         # A guest sees only their own channel's worker — never the full roster
         # of every repo on the box.
-        r = await asyncio.to_thread(_run, ["agent-worker", "status", name], 15)
+        target = resolve_host_target(cfg, repo_by_name(name) or {})
+        r = await asyncio.to_thread(
+            run_worker_cmd, target, ["agent-worker", "status", name], 15,
+        )
         return f"```\n{r.stdout}\n```", None
 
     async def do_fresh(name):
@@ -2545,8 +2916,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # brand-new session with no --continue, without resuming first. The
         # marker survives the stop.
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
-        await asyncio.to_thread(arm_fresh, name)
+        target = resolve_host_target(cfg, repo_by_name(name))
+        await asyncio.to_thread(worker_stop, name, target)
+        await asyncio.to_thread(arm_fresh, name, None, target)
         # A fresh context deserves a fresh channel — wipe the old chatter.
         purged, note = await purge_channel(channel_for_worker(name))
         return (
@@ -2556,21 +2928,23 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     async def do_stop(name):
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
+        target = resolve_host_target(cfg, repo_by_name(name))
+        await asyncio.to_thread(worker_stop, name, target)
         return f"🛑 stopped `{name}`", None
 
     async def do_restart(name):
         repo = repo_by_name(name)
         if not repo:
             return f"⚠️ no repo channel mapped for `{name}`", None
+        target = resolve_host_target(cfg, repo)
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
+        await asyncio.to_thread(worker_stop, name, target)
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_for_worker(name), True,
-            repo.get("profile", "owner"), harness_for(repo),
+            repo.get("profile", "owner"), harness_for(repo), target,
         )
         # Explicit resume: cancel any armed fresh so it can't re-fire.
-        await asyncio.to_thread(disarm_fresh, name)
+        await asyncio.to_thread(disarm_fresh, name, None, target)
         return (
             f"🔄 restarted `{name}`" if r.returncode == 0
             else f"⚠️ restart failed: {r.stderr.strip()}", None,
@@ -2585,13 +2959,14 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return f"⚠️ no repo channel mapped for `{name}`", None
         channel_id = channel_for_worker(name)
         harness = harness_for(repo)
+        target = resolve_host_target(cfg, repo)
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
+        await asyncio.to_thread(worker_stop, name, target)
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_id, False,
-            repo.get("profile", "owner"), harness,
+            repo.get("profile", "owner"), harness, target,
         )
-        await asyncio.to_thread(disarm_fresh, name)
+        await asyncio.to_thread(disarm_fresh, name, None, target)
         if r.returncode != 0:
             return f"⚠️ clear failed: {r.stderr.strip()}", None
         # Fresh Codex session: re-arm first-message protocol injection.
@@ -2601,15 +2976,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         purged, note = await purge_channel(channel_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
 
-    async def wait_busy(name, harness, timeout=HANDOFF_PICKUP_SECONDS):
+    async def wait_busy(name, harness, timeout=HANDOFF_PICKUP_SECONDS,
+                        host_target=None):
         """Poll until the worker's pane stops reading as idle — i.e. it has
         picked up the message just delivered. Returns False if it never did
         (answered within one poll, or never saw the paste)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not await asyncio.to_thread(worker_alive, name):
+            if not await asyncio.to_thread(worker_alive, name, host_target):
                 return False
-            screen = await asyncio.to_thread(worker_screen, name, 40)
+            screen = await asyncio.to_thread(worker_screen, name, 40, False, host_target)
             if not screen_is_ready(screen, harness):
                 return True
             await asyncio.sleep(1)
@@ -2619,29 +2995,46 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         """Ask the live worker to write a handoff note for the next engine,
         wait for it to finish, and return a short status suffix. Never
         blocks the switch — always returns, whatever happened."""
+        target = resolve_host_target(cfg, repo_by_name(name))
         try:
-            try:
-                os.remove(handoff_path(name))
-            except FileNotFoundError:
-                pass
+            await asyncio.to_thread(
+                remove_worker_state_file, name, "handoff.md", target)
+            destination = (handoff_path(name) if target is None else
+                           await asyncio.to_thread(
+                               remote_worker_state_path,
+                               name, "handoff.md", target))
+            if not destination:
+                return " ⚠️ couldn't resolve the handoff path — switching without it."
             await deliver(
-                name, HANDOFF_PROMPT.format(path=handoff_path(name)),
+                name, HANDOFF_PROMPT.format(path=destination),
                 tag=HANDOFF_TAG,
             )
             # deliver() returns as soon as the paste lands, so poll for the
             # turn to actually START before waiting for it to end — otherwise
             # the pre-turn idle prompt reads as "finished", and the stop below
             # kills the worker in the middle of writing the note.
-            await wait_busy(name, outgoing_harness)
+            await wait_busy(name, outgoing_harness, host_target=target)
             finished = await wait_ready(
                 name,
                 timeout=HANDOFF_TIMEOUT_SECONDS,
                 harness=outgoing_harness,
+                host_target=target,
             )
             # The file is the real signal either way: a worker that wrote the
             # note and then moved on to something else still handed off, even
             # though it never went idle inside the window.
-            if os.path.isfile(handoff_path(name)):
+            content = await asyncio.to_thread(
+                read_worker_state_file, name, "handoff.md", target)
+            if content is not None:
+                # Handoffs are consumed later from the parent's durable state,
+                # even when the outgoing worker wrote them on a satellite.
+                if target is not None:
+                    local_path = handoff_path(name)
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, "w") as f:
+                        f.write(content)
+                    await asyncio.to_thread(
+                        remove_worker_state_file, name, "handoff.md", target)
                 return " 📝 handoff captured for the next engine."
             if not finished:
                 return " ⚠️ handoff didn't finish in time — switching without it."
@@ -2691,11 +3084,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         # engine; a stale codex-prime flag from the old engine is cleared.
         cancel_limit_watcher(name, clear_notice=True)
         handoff_note = ""
+        target = resolve_host_target(cfg, repo)
         try:
-            if await asyncio.to_thread(worker_alive, name):
+            if await asyncio.to_thread(worker_alive, name, target):
                 if handoff:
                     handoff_note = await capture_handoff(name, outgoing_harness)
-                await asyncio.to_thread(worker_stop, name)
+                await asyncio.to_thread(worker_stop, name, target)
             elif handoff:
                 handoff_note = " ℹ️ no running session to capture a handoff from."
         finally:
@@ -2749,14 +3143,20 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         )
         if not item:
             return f"⚠️ no repo channel mapped for `{name}`", None
-        cid, _ = item
+        cid, repo = item
         cancel_limit_watcher(name, clear_notice=True)
-        await asyncio.to_thread(worker_stop, name)
-        wiped = await asyncio.to_thread(remove_worker_state, name)
+        target = resolve_host_target(cfg, repo)
+        await asyncio.to_thread(worker_stop, name, target)
+        wiped = await asyncio.to_thread(purge_worker_state, name, target)
         del cfg["repos"][cid]
         save_config(cfg, config_path)
         last_activity.pop(name, None)
         notified.discard(name)
+        old_path = priced_path.pop(name, None)
+        if old_path:
+            codex_totals.pop(old_path, None)
+            claude_usage_offsets.pop(old_path, None)
+            claude_usage_snapshots.pop(old_path, None)
         print(f"[bridge] close: retired worker {name} (channel {cid})")
         summary = (
             f"🗑️ Closed `{name}` — worker stopped, "
@@ -3235,13 +3635,21 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     @tree.command(name="addrepo", description="Create a Discord channel and map a repo to a worker")
     @describe(name="Worker/channel name", path="Absolute path to the repo",
               category="Category to file it under — an existing one, or a new "
-                       "name to create it (default: the inbox category)")
-    async def slash_addrepo(interaction, name: str, path: str, category: str = None):
+                       "name to create it (default: the inbox category)",
+              host="Machine to run this repo's worker on (default: local; "
+                   "must be a name in config 'machines')")
+    async def slash_addrepo(interaction, name: str, path: str, category: str = None, host: str = None):
         if interaction.user.id not in cfg["allowed_users"]:
             await interaction.response.send_message("⛔ not authorized", ephemeral=True)
             return
         directory = os.path.expanduser(path)
-        if not os.path.isdir(directory):
+        if host:
+            try:
+                resolve_host_target(cfg, {"host": host})
+            except KeyError as e:
+                await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+                return
+        if not await asyncio.to_thread(dir_exists_for_host, cfg, host, directory):
             await interaction.response.send_message(
                 f"⚠️ no such directory: {directory}", ephemeral=True
             )
@@ -3249,7 +3657,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await interaction.response.defer(thinking=True)
         cat, created = await resolve_category(interaction.guild, category)
         channel = await interaction.guild.create_text_channel(name, category=cat)
-        cfg["repos"][str(channel.id)] = {"name": name, "dir": directory}
+        cfg["repos"][str(channel.id)] = build_repo_entry(
+            name=name, directory=directory, channel_id=channel.id, host=host
+        )
         save_config(cfg, config_path)
         where = f" in **{cat.name}**{' (new category)' if created else ''}" if cat else ""
         await interaction.followup.send(
@@ -3397,7 +3807,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not repo or not channel_allows(cfg, after.channel.id, after.author.id):
             return
         name = repo["name"]
-        if not await asyncio.to_thread(worker_alive, name):
+        if not await asyncio.to_thread(worker_alive, name,
+                                       resolve_host_target(cfg, repo)):
             return
         # An edit steers a live worker exactly like a new message, so it is
         # charged the same way — otherwise a capped user keeps driving by
@@ -3434,7 +3845,118 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await peek_screen(payload.channel_id, repo["name"])
 
     # ---- localhost event listener (Stop hook + relays post here) ----------
+    async def dispatch_worker_send(event, attachments):
+        """Post a claude.worker.send event's content + attachments to Discord.
+
+        Shared by the JSON and multipart paths so both reach the channel the
+        same way; the only difference is where `attachments` came from (local
+        paths in the JSON event vs. temp files written from uploaded bytes).
+        """
+        worker = event.get("worker", "")
+        if worker:
+            notified.add(worker)
+        channel_id = worker_notification_channel(cfg, worker, event.get("chat", ""))
+        content = event.get("content") or ""
+        if channel_id and (content or attachments):
+            if worker:
+                content = await tag_reply(worker, content)
+            await post(channel_id, content, attachments)
+
+    async def handle_multipart_event(request):
+        """A remote worker whose files the bridge can't read off disk uploads
+        the bytes here as multipart/form-data: field `payload` is the exact
+        signed JSON metadata (verified over its raw bytes, identically to the
+        JSON path), and each `file` part is an attachment. We stage the uploads
+        to temp files and dispatch through the same Discord-post code, then
+        clean the temp files up."""
+        payload_bytes = None
+        tmp_paths = []
+        try:
+            reader = await request.multipart()
+            async for part in reader:
+                if part.name == "payload":
+                    # Must arrive (and be verified) before we touch disk. A
+                    # streaming reader yields parts in order and cannot look
+                    # ahead, so a duplicate/late payload after files is treated
+                    # as the first-seen; the file-branch below already rejects
+                    # any `file` part that precedes this.
+                    #
+                    # Read in bounded chunks rather than `part.read()` in one
+                    # shot: this happens BEFORE the HMAC check below, so an
+                    # unauthenticated caller must not be able to force a large
+                    # in-memory buffer just because MAX_REQUEST_BYTES (sized
+                    # for a 25 MiB attachment) is generous. The signed JSON
+                    # metadata is always tiny, so MAX_PAYLOAD_BYTES is a hard
+                    # cap independent of the overall request size.
+                    buf = []
+                    written = 0
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        if not upload_size_ok(written, len(chunk), cap=MAX_PAYLOAD_BYTES):
+                            return web.json_response(
+                                {"error": "payload too large"}, status=413
+                            )
+                        buf.append(chunk)
+                        written += len(chunk)
+                    payload_bytes = b"".join(buf)
+                    if not verify_signature(
+                        payload_bytes,
+                        request.headers.get("X-Webhook-Signature", ""),
+                        secret,
+                    ):
+                        return web.json_response(
+                            {"error": "bad signature"}, status=401
+                        )
+                    continue
+                # A `file` part. Refuse to write anything to disk until the
+                # payload has arrived and its signature verified — an
+                # unauthenticated caller must never reach tempfile.mkstemp.
+                if payload_bytes is None:
+                    return web.json_response(
+                        {"error": "file part before payload"}, status=400
+                    )
+                if len(tmp_paths) >= MAX_UPLOAD_PARTS:
+                    return web.json_response(
+                        {"error": "too many parts"}, status=413
+                    )
+                fd, tmp = tempfile.mkstemp(
+                    prefix="bridge-upload-",
+                    suffix="-" + os.path.basename(part.filename or "attachment"),
+                )
+                tmp_paths.append(tmp)
+                written = 0
+                with os.fdopen(fd, "wb") as out:
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        if not upload_size_ok(written, len(chunk)):
+                            return web.json_response(
+                                {"error": "upload too large"}, status=413
+                            )
+                        out.write(chunk)
+                        written += len(chunk)
+            if payload_bytes is None:
+                return web.json_response({"error": "missing payload"}, status=400)
+            try:
+                event = json.loads(payload_bytes)
+            except ValueError:
+                return web.json_response({"error": "bad json"}, status=400)
+            if event.get("event_type", "") == "claude.worker.send":
+                await dispatch_worker_send(event, tmp_paths)
+            return web.json_response({"status": "ok"})
+        finally:
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
     async def handle_event(request):
+        if (request.content_type or "").startswith("multipart/form-data"):
+            return await handle_multipart_event(request)
         body = await request.read()
         if not verify_signature(
             body, request.headers.get("X-Webhook-Signature", ""), secret
@@ -3473,29 +3995,36 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # turn's text.
                 worker_spoke = name in notified
                 notified.discard(name)
-                # Codex's Stop hook hands us the final assistant message inline
-                # (the relay always sets a "reply" key, empty string included);
-                # Claude's relay never does, so its absence selects the
-                # transcript-parsing path below.
-                codex_reply = event.get("reply")
+                # A relay can hand us the final assistant message inline, computed
+                # where the transcript lives (essential for remote workers whose
+                # transcript the bridge can't read across the network): Codex always
+                # sets a "reply" key (empty string included) and the Claude
+                # done-relay now sets it too whenever its extraction was non-empty.
+                # Its presence selects the inline-post path; its absence (None)
+                # selects the transcript-parsing fallback below — byte-identical to
+                # before this change.
+                inline_reply = event.get("reply")
+                engine = event.get("engine") or harness_for(
+                    repo_by_name(name) or {})
                 # Price the turn before any branch below advances the offset.
                 await charge_turn(name, channel_id, path,
-                                  event.get("model"), codex_reply is not None)
+                                  event.get("model"), engine,
+                                  event.get("usage"))
                 if channel_id and limit_hit:
-                    if codex_reply is None:
+                    if inline_reply is None:
                         _, off = extract_new_reply(path, offsets.get(path, 0))
                         offsets[path] = off
                     print(f"[bridge] {name}: provider usage limit notified — "
                           "fallback silent")
                 elif channel_id and worker_spoke:
-                    if codex_reply is None:
+                    if inline_reply is None:
                         _, off = extract_new_reply(path, offsets.get(path, 0))
                         offsets[path] = off
                     print(f"[bridge] {name}: turn ended, worker already notified — fallback silent")
-                elif channel_id and codex_reply is not None:
-                    # Codex: no transcript parse — the reply rode in on the event.
-                    reply = codex_reply.strip() or "(no new reply text captured — use /screen)"
-                    print(f"[bridge] {name}: codex turn ended, posting "
+                elif channel_id and inline_reply is not None:
+                    # Inline reply rode in on the event — no transcript parse.
+                    reply = inline_reply.strip() or "(no new reply text captured — use /screen)"
+                    print(f"[bridge] {name}: turn ended (inline reply), posting "
                           f"{len(reply)} chars to {channel_id}")
                     await post(channel_id, await tag_reply(name, reply))
                 elif channel_id:
@@ -3530,7 +4059,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             repo_name = (event.get("name") or "").strip()
             repo_path = os.path.expanduser(event.get("path") or "")
             requested_cat = (event.get("category") or "").strip()
-            if not repo_name or not os.path.isdir(repo_path):
+            host = (event.get("host") or "").strip() or None
+            if host:
+                try:
+                    resolve_host_target(cfg, {"host": host})
+                except KeyError as e:
+                    return web.json_response({"error": str(e)}, status=400)
+            if not repo_name or not await asyncio.to_thread(
+                dir_exists_for_host, cfg, host, repo_path
+            ):
                 return web.json_response(
                     {"error": f"invalid name or directory: {repo_name!r} {repo_path!r}"},
                     status=400,
@@ -3542,7 +4079,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if cat is None:
                 return web.json_response({"error": "category not found"}, status=400)
             channel = await guild.create_text_channel(repo_name, category=cat)
-            cfg["repos"][str(channel.id)] = {"name": repo_name, "dir": repo_path}
+            cfg["repos"][str(channel.id)] = build_repo_entry(
+                name=repo_name, directory=repo_path, channel_id=channel.id, host=host
+            )
             save_config(cfg, config_path)
             print(f"[bridge] addrepo: #{channel.name} ({channel.id}) -> {repo_path} "
                   f"[{cat.name}{' new' if created else ''}]")
@@ -3654,18 +4193,22 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                     {"error": f"no repo channel mapped for worker {name!r}"},
                     status=400,
                 )
-            if await asyncio.to_thread(worker_alive, name):
+            target = resolve_host_target(cfg, repo)
+            if await asyncio.to_thread(worker_alive, name, target):
                 last_activity[name] = time.time()
                 return web.json_response({"status": "ok", "note": "already running"})
-            resume = should_resume(worker_has_state(name), fresh_pending(name))
+            resume = should_resume(
+                worker_has_state(name, host_target=target),
+                fresh_pending(name, host_target=target),
+            )
             harness = harness_for(repo)
             r = await asyncio.to_thread(
                 worker_start, name, repo["dir"], channel_id, resume,
-                repo.get("profile", "owner"), harness,
+                repo.get("profile", "owner"), harness, target,
             )
             if r.returncode != 0:
                 return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)
-            await asyncio.to_thread(disarm_fresh, name)
+            await asyncio.to_thread(disarm_fresh, name, None, target)
             if harness in ("codex", "antigravity") and not resume:
                 codex_unprimed.add(name)
             last_activity[name] = time.time()
@@ -3738,21 +4281,30 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             # codex_totals is keyed by rollout path and leaks the same way —
             # a Codex worker that gets /clear'd strands its old session's
             # cumulative reading here forever.
-            for path in [p for p in codex_totals if p and not os.path.exists(p)]:
+            active_usage_paths = set(priced_path.values())
+            for path in [p for p in codex_totals
+                         if p and p not in active_usage_paths
+                         and not os.path.exists(p)]:
                 codex_totals.pop(path, None)
             for path in [p for p in claude_usage_offsets
-                         if p and not os.path.exists(p)]:
+                         if p and p not in active_usage_paths
+                         and not os.path.exists(p)]:
                 claude_usage_offsets.pop(path, None)
+            for path in [p for p in claude_usage_snapshots
+                         if p and p not in active_usage_paths
+                         and not os.path.exists(p)]:
+                claude_usage_snapshots.pop(path, None)
             idle_s = cfg["idle_minutes"] * 60
             for repo in list(cfg["repos"].values()):
                 name = repo["name"]
                 last = last_activity.get(name)
                 if last is None or time.time() - last < idle_s:
                     continue
-                if await asyncio.to_thread(worker_alive, name) and not (
-                    await asyncio.to_thread(worker_busy, name)
+                target = resolve_host_target(cfg, repo)
+                if await asyncio.to_thread(worker_alive, name, target) and not (
+                    await asyncio.to_thread(worker_busy, name, target)
                 ):
-                    await asyncio.to_thread(worker_stop, name)
+                    await asyncio.to_thread(worker_stop, name, target)
                     last_activity.pop(name, None)
                     channel_id = channel_for_worker(name)
                     if channel_id:
@@ -3763,13 +4315,13 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                         )
 
     async def main():
-        app = web.Application()
+        app = web.Application(client_max_size=MAX_REQUEST_BYTES)
         app.router.add_post("/event", handle_event)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "127.0.0.1", int(cfg["listen_port"]))
+        site = web.TCPSite(runner, cfg["listen_host"], int(cfg["listen_port"]))
         await site.start()
-        print(f"[bridge] event listener on 127.0.0.1:{cfg['listen_port']}")
+        print(f"[bridge] event listener on {cfg['listen_host']}:{cfg['listen_port']}")
         asyncio.create_task(reaper())
         await client.start(token)
 

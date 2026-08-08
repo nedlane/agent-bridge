@@ -3,11 +3,14 @@
 # tools-based interface workers use instead of reading screens or config
 # internals. Verbs are signed events to the bridge's localhost listener.
 #
-#   bridge-ctl addrepo <name> <path> [category]
+#   bridge-ctl addrepo <name> <path> [category] [--host <machine>]
 #                                      # create #<name> and map it to <path>.
 #                                      # [category] files it under an existing
 #                                      # category or creates a new one; omit to
-#                                      # use the default inbox category
+#                                      # use the default inbox category.
+#                                      # --host runs that repo's worker on
+#                                      # <machine> (must be a name in config
+#                                      # 'machines'); omit for local
 #   bridge-ctl start <name>            # start that repo's worker via the
 #                                      # bridge (protocol injected, resumes)
 #   bridge-ctl peek <name>             # post that worker's live screen into
@@ -62,19 +65,57 @@ print(hmac.new(os.environ["SECRET"].encode(), sys.stdin.buffer.read(),
 cmd="${1:-}"
 case "$cmd" in
   addrepo)
-    name="${2:-}"
-    path="${3:-}"
-    category="${4:-}"
+    shift
+    name=""
+    path=""
+    category=""
+    host=""
+    positional=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --host)
+          host="${2:-}"
+          [[ -n "$host" ]] || die "--host requires a machine name"
+          shift 2
+          ;;
+        --host=*)
+          host="${1#--host=}"
+          shift
+          ;;
+        *)
+          case "$positional" in
+            0) name="$1" ;;
+            1) path="$1" ;;
+            2) category="$1" ;;
+            *) die "usage: bridge-ctl addrepo <name> <path> [category] [--host <machine>]" ;;
+          esac
+          positional=$((positional + 1))
+          shift
+          ;;
+      esac
+    done
     [[ -n "$name" && -n "$path" ]] \
-      || die "usage: bridge-ctl addrepo <name> <path> [category]"
-    path="$(cd "${path/#\~/$HOME}" 2>/dev/null && pwd)" || die "no such directory: ${3}"
-    body="$(NAME="$name" REPO="$path" CATEGORY="$category" python3 -c '
+      || die "usage: bridge-ctl addrepo <name> <path> [category] [--host <machine>]"
+    orig_path="$path"
+    if [[ -n "$host" && "$host" != "local" ]]; then
+      # The path lives on the satellite, not here — we can't canonicalize
+      # (~, relative) against this machine's filesystem, so require an
+      # absolute path and pass it through unchanged; the bridge validates
+      # existence on the target host.
+      [[ "$path" == /* ]] \
+        || die "with --host, path must be absolute on the target machine: ${orig_path}"
+    else
+      path="$(cd "${path/#\~/$HOME}" 2>/dev/null && pwd)" || die "no such directory: ${orig_path}"
+    fi
+    body="$(NAME="$name" REPO="$path" CATEGORY="$category" HOST="$host" python3 -c '
 import json, os
 req = {"event_type": "claude.bridge.addrepo",
        "name": os.environ["NAME"],
        "path": os.environ["REPO"]}
 if os.environ.get("CATEGORY"):
     req["category"] = os.environ["CATEGORY"]
+if os.environ.get("HOST"):
+    req["host"] = os.environ["HOST"]
 print(json.dumps(req))')" || die "could not build request"
     post_event "$body"
     ;;
@@ -191,7 +232,8 @@ if not repos:
     print("(no repo channels mapped)")
 for cid, repo in repos.items():
     name, rdir = repo["name"], repo["dir"]
-    print(f"{name:<20} discord:{cid}  {rdir}")' "$CONFIG"
+    host = repo.get("host") or "local"
+    print(f"{name:<20} {host:<10} discord:{cid}  {rdir}")' "$CONFIG"
     ;;
   categories)
     # Categories are live Discord state (not in config), so ask the bridge.

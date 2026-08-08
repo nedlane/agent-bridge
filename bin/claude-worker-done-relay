@@ -31,16 +31,40 @@ chat="$(sed -n 's/^chat=//p' "$STATE_ROOT/$worker/meta" 2>/dev/null | head -1)"
 [[ -n "$chat" ]] || exit 0
 
 dir="$(sed -n 's/^dir=//p' "$STATE_ROOT/$worker/meta" 2>/dev/null | head -1)"
+harness="$(sed -n 's/^harness=//p' "$STATE_ROOT/$worker/meta" 2>/dev/null | head -1)"
+[[ -n "$harness" ]] || harness="claude"
 
 hook_json="$(cat 2>/dev/null || true)"
 url="$(sed -n 's/^BRIDGE_WEBHOOK_URL=//p' "$CFG" | head -1)"
 secret="$(sed -n 's/^BRIDGE_WEBHOOK_SECRET=//p' "$CFG" | head -1)"
 [[ -n "$url" && -n "$secret" ]] || exit 0
 
+# Extract the final reply HERE, where the transcript lives — a remote worker's
+# transcript is not readable by the bridge across the network. agent-reply-extract
+# tracks its own byte offset (reply-relay.off, independent of the bridge's own
+# in-memory offset tracking) so each turn only ever yields text written since the
+# previous turn. transcript_path comes from the hook JSON, so read it first.
+transcript_path="$(HOOK_JSON="$hook_json" python3 -c '
+import json, os
+try: print(json.loads(os.environ.get("HOOK_JSON") or "{}").get("transcript_path", "") or "")
+except ValueError: pass' 2>/dev/null)"
+reply=""
+usage_json=""
+if [[ -n "$transcript_path" ]]; then
+  reply="$("$(dirname "$0")/agent-reply-extract" "$transcript_path" \
+            "$STATE_ROOT/$worker/reply-relay.off" 2>/dev/null || true)"
+  usage_json="$("$(dirname "$0")/agent-session-usage" "$harness" \
+                 "$transcript_path" 2>/dev/null || true)"
+fi
+
 # Build the event from the hook input. stop_hook_active marks a continuation
-# triggered by a previous Stop hook — relaying those would loop. The
-# transcript path lets the bridge extract the exact final reply text.
-body="$(HOOK_JSON="$hook_json" WORKER="$worker" DIR="$dir" CHAT="$chat" python3 -c '
+# triggered by a previous Stop hook — relaying those would loop. The reply is
+# computed above and sent INLINE; the transcript path rides along as a fallback
+# handle for the bridge. Only a non-empty reply adds the "reply" key, so an empty
+# extraction leaves the key absent and the bridge runs its unchanged transcript
+# fallback (byte-identical to before this change). REPLY is passed as an env var
+# and JSON-escaped by json.dumps — never string-concatenated into the body.
+body="$(HOOK_JSON="$hook_json" WORKER="$worker" DIR="$dir" CHAT="$chat" REPLY="$reply" HARNESS="$harness" USAGE_JSON="$usage_json" python3 -c '
 import json, os, sys
 try:
     hook = json.loads(os.environ.get("HOOK_JSON") or "{}")
@@ -48,14 +72,25 @@ except ValueError:
     hook = {}
 if hook.get("stop_hook_active"):
     sys.exit(0)
-print(json.dumps({
+payload = {
     "event_type": "claude.worker.turn_ended",
     "worker": os.environ["WORKER"],
     "dir": os.environ["DIR"],
     "chat": os.environ["CHAT"],
     "session_id": hook.get("session_id", ""),
     "transcript_path": hook.get("transcript_path", ""),
-}))' 2>/dev/null)"
+    "engine": os.environ.get("HARNESS", "claude"),
+}
+reply = os.environ.get("REPLY", "")
+if reply:
+    payload["reply"] = reply
+try:
+    usage = json.loads(os.environ.get("USAGE_JSON") or "")
+except ValueError:
+    usage = None
+if isinstance(usage, dict):
+    payload["usage"] = usage
+print(json.dumps(payload))' 2>/dev/null)"
 [[ -n "$body" ]] || exit 0
 
 sig="$(printf '%s' "$body" | SECRET="$secret" python3 -c '

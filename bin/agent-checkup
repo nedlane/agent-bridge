@@ -102,6 +102,30 @@ else
   warn "no bridge webhook file ($bridge_webhook_file) — worker replies cannot reach Discord (see docs/agent-control-plane.md)"
 fi
 
+# --- satellite machines (if configured) -----------------------------------------------
+if [[ -r "$bridge_cfg" ]]; then
+  # Derive the expected parent webhook URL from the bridge config itself,
+  # instead of hardcoding the parent's IP/port here.
+  parent_url=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("http://" + (d.get("listen_host") or "127.0.0.1") + ":" + str(d.get("listen_port") or 8765) + "/event")' "$bridge_cfg" 2>/dev/null)
+  parent_url="${parent_url:-http://127.0.0.1:8765/event}"
+
+  # Extract machines from config and probe each one
+  machines_output=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(n + "\t" + (m.get("ssh") or "")) for n,m in (d.get("machines") or {}).items()]' "$bridge_cfg" 2>/dev/null)
+  if [[ -n "$machines_output" ]]; then
+    while IFS=$'\t' read -r machine_name machine_target; do
+      if [[ -z "$machine_target" ]]; then
+        continue
+      fi
+      if ssh -n -o ConnectTimeout=8 -o BatchMode=yes "$machine_target" \
+        "command -v agent-worker >/dev/null 2>&1 && grep -qF 'BRIDGE_WEBHOOK_URL=$parent_url' \"\$HOME/.config/claude-workers/bridge-webhook\" 2>/dev/null"; then
+        pass "satellite $machine_name ($machine_target): agent-worker present and relays point at the parent"
+      else
+        warn "satellite $machine_name ($machine_target): unreachable, or agent-worker missing, or bridge-webhook not pointed at the parent"
+      fi
+    done <<< "$machines_output"
+  fi
+fi
+
 # --- manual checks ------------------------------------------------------------------
 cat <<'MANUAL'
 

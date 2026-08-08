@@ -12,6 +12,7 @@ import hmac
 import importlib.util
 import json
 import os
+import shlex
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -64,6 +65,102 @@ class VerifySignatureTests(unittest.TestCase):
         self.assertFalse(cb.verify_signature(body, self._sig(body, ""), ""))
 
 
+class MultipartEventAuthTests(unittest.TestCase):
+    """Pin the HMAC contract the multipart /event branch relies on: it verifies
+    over the raw bytes of the `payload` field exactly as the JSON path verifies
+    over the raw request body. If the multipart branch ever hashed anything but
+    those bytes, this would break."""
+
+    def test_signed_metadata_verifies(self):
+        secret = "s"
+        body = b'{"event_type":"claude.worker.send","chat":"discord:1","content":"x"}'
+        sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        self.assertTrue(cb.verify_signature(body, sig, secret))
+
+    def test_tampered_payload_rejected(self):
+        secret = "s"
+        body = b'{"event_type":"claude.worker.send","content":"x"}'
+        sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        # A byte flipped after signing (e.g. content swapped in flight) fails.
+        self.assertFalse(
+            cb.verify_signature(body.replace(b'"x"', b'"y"'), sig, secret)
+        )
+
+
+class UploadSizeOkTests(unittest.TestCase):
+    """Pin the per-part byte cap the multipart /event branch uses to bound
+    disk writes (defense in depth once listen_host leaves loopback)."""
+
+    def test_under_cap_ok(self):
+        self.assertTrue(cb.upload_size_ok(0, 100, cap=1000))
+
+    def test_exactly_at_cap_ok(self):
+        # Writing the chunk that lands exactly on the cap is allowed.
+        self.assertTrue(cb.upload_size_ok(900, 100, cap=1000))
+
+    def test_over_cap_rejected(self):
+        self.assertFalse(cb.upload_size_ok(950, 100, cap=1000))
+
+    def test_accumulates_across_chunks(self):
+        # A part staying under the cap chunk-by-chunk still trips once the
+        # running total would exceed it.
+        self.assertTrue(cb.upload_size_ok(500, 400, cap=1000))
+        self.assertFalse(cb.upload_size_ok(900, 200, cap=1000))
+
+    def test_default_cap_is_module_constant(self):
+        self.assertTrue(cb.upload_size_ok(0, cb.MAX_UPLOAD_BYTES))
+        self.assertFalse(cb.upload_size_ok(0, cb.MAX_UPLOAD_BYTES + 1))
+
+    def test_payload_cap_via_explicit_cap_arg(self):
+        # handle_multipart_event reuses this same pure helper (with
+        # cap=MAX_PAYLOAD_BYTES) to bound the pre-auth `payload` part read.
+        self.assertTrue(cb.upload_size_ok(0, cb.MAX_PAYLOAD_BYTES, cap=cb.MAX_PAYLOAD_BYTES))
+        self.assertFalse(
+            cb.upload_size_ok(0, cb.MAX_PAYLOAD_BYTES + 1, cap=cb.MAX_PAYLOAD_BYTES)
+        )
+
+
+class RequestSizeConstantsTests(unittest.TestCase):
+    """Pin the whole-request/pre-auth-read bounds so a future edit can't
+    silently reintroduce the aiohttp default-1-MiB coupling bug or widen the
+    pre-auth payload read without deliberately touching these constants."""
+
+    def test_max_request_bytes_has_headroom_over_one_upload(self):
+        self.assertGreater(cb.MAX_REQUEST_BYTES, cb.MAX_UPLOAD_BYTES)
+
+    def test_max_payload_bytes_much_smaller_than_max_request_bytes(self):
+        self.assertLess(cb.MAX_PAYLOAD_BYTES, cb.MAX_REQUEST_BYTES)
+
+    def test_max_upload_bytes_smaller_than_max_request_bytes(self):
+        self.assertLess(cb.MAX_UPLOAD_BYTES, cb.MAX_REQUEST_BYTES)
+
+
+class BridgeUrlIsLocalTests(unittest.TestCase):
+    """The Python helper mirrors the shell check in discord-notify that decides
+    JSON-paths vs. multipart-upload transport."""
+
+    def test_loopback_hosts_are_local(self):
+        for url in (
+            "http://127.0.0.1:8787/event",
+            "http://localhost:8787/event",
+            "http://[::1]:8787/event",
+            "http://LOCALHOST/event",
+        ):
+            self.assertTrue(cb.bridge_url_is_local(url), url)
+
+    def test_remote_hosts_are_not_local(self):
+        for url in (
+            "http://100.105.249.62:8787/event",
+            "http://192.168.1.10/event",
+            "https://bridge.example.com/event",
+        ):
+            self.assertFalse(cb.bridge_url_is_local(url), url)
+
+    def test_blank_url_is_not_local(self):
+        self.assertFalse(cb.bridge_url_is_local(""))
+        self.assertFalse(cb.bridge_url_is_local(None))
+
+
 class ChannelAllowsTests(unittest.TestCase):
     def test_welcome_channel_open_to_anyone(self):
         cfg = {"welcome_channel": 555, "allowed_users": [], "repos": {}}
@@ -95,6 +192,69 @@ class ChannelAllowsTests(unittest.TestCase):
         self.assertFalse(cb.channel_allows(cfg, 100, 8))   # viewer cannot drive
         self.assertFalse(cb.channel_allows(cfg, 100, 999))  # unknown
         self.assertFalse(cb.channel_allows(cfg, 300, 8))    # no such channel
+
+
+class ResolveHostTargetTests(unittest.TestCase):
+    def test_absent_host_is_local(self):
+        self.assertIsNone(cb.resolve_host_target({}, {"name": "a"}))
+
+    def test_explicit_local_is_local(self):
+        self.assertIsNone(cb.resolve_host_target({}, {"host": "local"}))
+
+    def test_remote_host_resolves_ssh_target(self):
+        cfg = {"machines": {"mac": {"ssh": "me@hc-002"}}}
+        self.assertEqual(cb.resolve_host_target(cfg, {"host": "mac"}), "me@hc-002")
+
+    def test_unknown_machine_raises(self):
+        with self.assertRaises(KeyError):
+            cb.resolve_host_target({"machines": {}}, {"host": "mac"})
+
+
+class DirExistsForHostTests(unittest.TestCase):
+    def test_local_existing_dir_is_true(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(cb.dir_exists_for_host({}, None, d))
+
+    def test_local_bogus_dir_is_false(self):
+        self.assertFalse(
+            cb.dir_exists_for_host({}, None, "/no/such/dir/ever")
+        )
+
+    def test_explicit_local_host_uses_isdir(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(cb.dir_exists_for_host({}, "local", d))
+
+    def test_remote_host_runs_ssh_test_dash_d(self):
+        cfg = {"machines": {"mac": {"ssh": "me@hc-002"}}}
+        seen = {}
+
+        def fake_run(args, timeout=180, input_text=None):
+            seen["args"] = args
+            return __import__("subprocess").CompletedProcess(args, 0, "", "")
+
+        orig = cb._run
+        cb._run = fake_run
+        try:
+            result = cb.dir_exists_for_host(cfg, "mac", "/srv/repo")
+        finally:
+            cb._run = orig
+        self.assertEqual(
+            seen["args"],
+            ["ssh", *cb.SSH_OPTS, "me@hc-002", "test", "-d", "/srv/repo"],
+        )
+        self.assertTrue(result)
+
+    def test_remote_host_nonzero_returncode_is_false(self):
+        cfg = {"machines": {"mac": {"ssh": "me@hc-002"}}}
+        orig = cb._run
+        cb._run = lambda args, timeout=180, input_text=None: __import__(
+            "subprocess"
+        ).CompletedProcess(args, 1, "", "")
+        try:
+            result = cb.dir_exists_for_host(cfg, "mac", "/srv/repo")
+        finally:
+            cb._run = orig
+        self.assertFalse(result)
 
 
 class ProfileArgsTests(unittest.TestCase):
@@ -498,6 +658,25 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "does-not-exist.json")
             self.assertEqual(cb.load_config(path), cb.default_config())
+
+
+class ListenHostDefaultTests(unittest.TestCase):
+    def test_defaults_to_loopback(self):
+        self.assertEqual(cb.default_config()["listen_host"], "127.0.0.1")
+
+    def test_load_config_respects_explicit_value(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "config.json")
+            with open(path, "w") as f:
+                json.dump({"listen_host": "100.105.249.62"}, f)
+            cfg = cb.load_config(path)
+            self.assertEqual(cfg["listen_host"], "100.105.249.62")
+
+    def test_load_config_missing_file_defaults_to_loopback(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "does-not-exist.json")
+            cfg = cb.load_config(path)
+            self.assertEqual(cfg["listen_host"], "127.0.0.1")
 
 
 class SenderIdentityTests(unittest.TestCase):
@@ -1399,6 +1578,47 @@ class CodexSessionTotalsTests(unittest.TestCase):
         self.assertEqual(cb.subtract_tokens({"output": 5}, None)["output"], 5)
 
 
+class RelayedSessionUsageTests(unittest.TestCase):
+    def test_claude_snapshot_round_trips_json_and_preserves_groups(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "session.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({
+                    "type": "assistant",
+                    "message": {
+                        "model": "claude-opus-5",
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 7,
+                            "cache_read_input_tokens": 11,
+                            "cache_creation_input_tokens": 3,
+                            "speed": "fast",
+                        },
+                    },
+                }) + "\n")
+            event = cb.session_usage_event("claude", path)
+            restored = cb.claude_usage_from_event(json.loads(json.dumps(event)))
+            group = restored[path][("claude-opus-5", True)]
+            self.assertEqual(group, {
+                "input": 2, "output": 7,
+                "cache_read": 11, "cache_write": 3,
+            })
+
+    def test_codex_snapshot_carries_cumulative_totals(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "rollout.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "token_count", "info": {"total_token_usage": {
+                        "input_tokens": 10, "cached_input_tokens": 4,
+                        "output_tokens": 3,
+                    }}}}) + "\n")
+            event = cb.session_usage_event("codex", path)
+            self.assertEqual(event["engine"], "codex")
+            self.assertEqual(event["totals"]["input"], 6)
+            self.assertEqual(event["totals"]["cache_read"], 4)
+
+
 class LedgerSurvivesWorkerLifecycleTests(unittest.TestCase):
     """A worker restart must never reset someone's usage.
 
@@ -1689,6 +1909,225 @@ class UsageSummaryTests(unittest.TestCase):
         cfg = {"usage_limits": {"channels": {"10": {"blocked": True}}}}
         self.assertIn("blocked",
                       " ".join(cb.usage_summary(cfg, {}, 10, 7, 100)))
+
+
+class SshWrapTests(unittest.TestCase):
+    def test_wraps_with_ssh_and_quotes(self):
+        out = cb.ssh_wrap("me@hc-002", ["agent-worker", "read", "app", "40"])
+        self.assertEqual(out[0], "ssh")
+        n = len(cb.SSH_OPTS)
+        self.assertEqual(out[1:1 + n], cb.SSH_OPTS)
+        self.assertEqual(out[1 + n], "me@hc-002")
+        self.assertEqual(out[2 + n], "--")
+        # remainder is one shell-quoted string safe to hand to the remote shell
+        remote = out[3 + n]
+        self.assertIn("agent-worker read app 40", remote)
+
+    def test_includes_connect_timeout_and_batch_mode(self):
+        out = cb.ssh_wrap("me@hc-002", ["agent-worker", "read", "app", "40"])
+        self.assertEqual(
+            out, ["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+                  "me@hc-002", "--", out[-1]]
+        )
+        self.assertIn("-o ConnectTimeout=8 -o BatchMode=yes", " ".join(out))
+
+    def test_remote_command_sets_path_first(self):
+        out = cb.ssh_wrap("h", ["agent-worker", "status", "app"])
+        remote = out[-1]
+        self.assertTrue(remote.startswith('PATH="$HOME/.local/bin:$PATH" '))
+        self.assertIn("agent-worker status app", remote)
+
+    def test_forwards_env_prefix(self):
+        out = cb.ssh_wrap("h", ["agent-worker", "send", "a", "hi there"],
+                          env={"CLAUDE_WORKER": "a"})
+        remote = out[-1]
+        self.assertTrue(
+            remote.startswith('PATH="$HOME/.local/bin:$PATH" env CLAUDE_WORKER=a ')
+        )
+        # embedded spaces/quotes in the message are preserved through quoting
+        self.assertIn(shlex.quote("hi there"), remote)
+
+
+class FormatStatusSectionsTests(unittest.TestCase):
+    """format_status_sections is the pure formatter behind /status's
+    aggregation across the local host and any configured satellites.
+
+    do_status itself is a closure inside run_bridge and isn't directly
+    unit-testable, but the constraint that matters — byte-identical output
+    for the common local-only case (no machines configured) — lives entirely
+    in this formatting logic, so it's factored out and tested here.
+    """
+
+    def test_no_machines_is_byte_identical_to_bare_block(self):
+        # With zero machines configured, output must match the pre-existing
+        # single-block shape exactly: no "local:" header, nothing extra.
+        out = cb.format_status_sections("roster here", {})
+        self.assertEqual(out, "```\nroster here\n```")
+
+    def test_with_machines_adds_labeled_local_and_satellite_sections(self):
+        out = cb.format_status_sections(
+            "local roster", {"mac": (0, "mac roster"), "pi": (0, "pi roster")}
+        )
+        self.assertEqual(
+            out,
+            "```\nlocal:\nlocal roster\n\nmac:\nmac roster\n\npi:\npi roster\n```",
+        )
+
+    def test_unreachable_satellite_shown_without_failing_whole_command(self):
+        out = cb.format_status_sections(
+            "local roster", {"mac": (1, "connection refused")}
+        )
+        self.assertEqual(
+            out, "```\nlocal:\nlocal roster\n\nmac:\n(unreachable)\n```"
+        )
+
+
+class RunWorkerCmdTests(unittest.TestCase):
+    def setUp(self):
+        self.seen = {}
+        self._orig = cb._run
+        cb._run = lambda args, timeout=180, input_text=None: self.seen.setdefault("args", args) or \
+            __import__("subprocess").CompletedProcess(args, 0, "", "")
+
+    def tearDown(self):
+        cb._run = self._orig
+
+    def test_local_passes_argv_unchanged(self):
+        cb.run_worker_cmd(None, ["agent-worker", "stop", "a"])
+        self.assertEqual(self.seen["args"], ["agent-worker", "stop", "a"])
+
+    def test_remote_wraps_with_ssh(self):
+        cb.run_worker_cmd("me@h", ["agent-worker", "stop", "a"])
+        args = self.seen["args"]
+        self.assertEqual(args[0], "ssh")
+        n = len(cb.SSH_OPTS)
+        self.assertEqual(args[1:1 + n], cb.SSH_OPTS)
+        self.assertEqual(args[1 + n:3 + n], ["me@h", "--"])
+
+
+class WorkerPollHostAwareTests(unittest.TestCase):
+    """worker_alive/worker_busy default to local (byte-identical to before) and
+    route through run_worker_cmd → ssh_wrap when given a host_target."""
+
+    def setUp(self):
+        self.calls = []
+        self._orig = cb._run
+        # Capture EVERY argv reaching _run and hand back a stub result whose
+        # stdout satisfies both pollers ("running: yes" for alive; the read
+        # capture is passed to worker_busy_text, which is fine empty).
+        cb._run = lambda args, timeout=180, input_text=None: (
+            self.calls.append(args)
+            or __import__("subprocess").CompletedProcess(args, 0, "running: yes", "")
+        )
+
+    def tearDown(self):
+        cb._run = self._orig
+
+    def test_worker_alive_local_argv_unchanged(self):
+        cb.worker_alive("app")
+        self.assertEqual(self.calls[-1], ["agent-worker", "status", "app"])
+
+    def test_worker_alive_remote_ssh_wrapped(self):
+        cb.worker_alive("app", host_target="me@hc-002")
+        args = self.calls[-1]
+        n = len(cb.SSH_OPTS)
+        self.assertEqual(args[0], "ssh")
+        self.assertEqual(args[1:1 + n], cb.SSH_OPTS)
+        self.assertEqual(args[1 + n:3 + n], ["me@hc-002", "--"])
+        self.assertIn("agent-worker status app", args[3 + n])
+
+    def test_worker_busy_local_argv_unchanged(self):
+        cb.worker_busy("app")
+        self.assertEqual(self.calls[-1], ["agent-worker", "read", "app", "30"])
+
+    def test_worker_busy_remote_ssh_wrapped(self):
+        cb.worker_busy("app", host_target="me@hc-002")
+        args = self.calls[-1]
+        n = len(cb.SSH_OPTS)
+        self.assertEqual(args[0], "ssh")
+        self.assertEqual(args[1:1 + n], cb.SSH_OPTS)
+        self.assertEqual(args[1 + n:3 + n], ["me@hc-002", "--"])
+        self.assertIn("agent-worker read app 30", args[3 + n])
+
+
+class InboundAttachmentTests(unittest.TestCase):
+    def test_scp_argv_targets_remote_inbox(self):
+        argv = cb.remote_inbox_scp_argv(
+            "me@h", "/tmp/a.png",
+            "/Users/u/Library/State/claude-workers/app/inbox")
+        self.assertEqual(argv[0], "scp")
+        self.assertEqual(argv[1:1 + len(cb.SSH_OPTS)], cb.SSH_OPTS)
+        self.assertIn("/tmp/a.png", argv)
+        self.assertIn(
+            "me@h:/Users/u/Library/State/claude-workers/app/inbox/", argv)
+
+
+class RemoteWorkerStateTests(unittest.TestCase):
+    def setUp(self):
+        self.orig = cb._run
+        self.calls = []
+
+        def fake(args, timeout=180, input_text=None):
+            self.calls.append(args)
+            remote = args[-1] if args and args[0] == "ssh" else ""
+            if " state app path handoff.md" in remote:
+                stdout = "/Users/u/state/claude-workers/app/handoff.md\n"
+            elif " state app read handoff.md" in remote:
+                stdout = "handoff body"
+            else:
+                stdout = ""
+            return __import__("subprocess").CompletedProcess(args, 0, stdout, "")
+
+        cb._run = fake
+
+    def tearDown(self):
+        cb._run = self.orig
+
+    def test_state_and_fresh_checks_dispatch_to_satellite(self):
+        self.assertTrue(cb.worker_has_state("app", host_target="me@mac"))
+        self.assertTrue(cb.fresh_pending("app", host_target="me@mac"))
+        remote = "\n".join(call[-1] for call in self.calls)
+        self.assertIn("agent-worker state app has", remote)
+        self.assertIn("agent-worker state app fresh-pending", remote)
+
+    def test_remote_path_is_reported_by_satellite(self):
+        self.assertEqual(
+            cb.remote_worker_state_path("app", "handoff.md", "me@mac"),
+            "/Users/u/state/claude-workers/app/handoff.md",
+        )
+
+    def test_purge_and_read_dispatch_to_satellite(self):
+        self.assertEqual(
+            cb.read_worker_state_file("app", "handoff.md", "me@mac"),
+            "handoff body",
+        )
+        self.assertTrue(cb.purge_worker_state("app", "me@mac"))
+        remote = "\n".join(call[-1] for call in self.calls)
+        self.assertIn("agent-worker state app read handoff.md", remote)
+        self.assertIn("agent-worker state app purge", remote)
+
+
+class BuildRepoEntryTests(unittest.TestCase):
+    def test_repo_entry_records_host(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1, host="mac")
+        self.assertEqual(entry["host"], "mac")
+
+    def test_default_host_absent_or_local(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1)
+        self.assertIn(entry.get("host", "local"), (None, "local"))
+
+    def test_local_host_omitted(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1, host="local")
+        self.assertNotIn("host", entry)
+
+    def test_none_host_omitted(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1, host=None)
+        self.assertNotIn("host", entry)
+
+    def test_basic_fields(self):
+        entry = cb.build_repo_entry(name="app", directory="/p", channel_id=1)
+        self.assertEqual(entry["name"], "app")
+        self.assertEqual(entry["dir"], "/p")
 
 
 if __name__ == "__main__":

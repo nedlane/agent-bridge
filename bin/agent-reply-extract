@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Print the new assistant reply in a Claude transcript since a stored byte
+offset, then advance the offset. Used by claude-worker-done-relay so reply
+extraction runs where the transcript lives (works for remote workers, whose
+transcript the bridge cannot read across the network).
+
+Usage: agent-reply-extract <transcript_path> <offset_file>
+
+Reads a transcript-aware byte offset from <offset_file> (0 if missing/invalid),
+calls the bridge's extract_new_reply(transcript, offset) -> (reply, new_offset),
+writes the transcript identity plus new_offset back, and prints reply to stdout
+(nothing if empty). An offset from another transcript, or one beyond a truncated
+file's EOF, resets to zero. Only complete transcript lines are consumed, so a
+mid-write trailing line is left for the next run (race-safe, same guarantee as
+the bridge).
+"""
+import importlib.util
+import json
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+
+
+def _bridge():
+    # bin/agent-bridge has no .py extension, so load it with an explicit
+    # SourceFileLoader — identical to how tests/test_claude_bridge.py does it.
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-bridge")
+    loader = SourceFileLoader("claude_bridge", path)
+    spec = importlib.util.spec_from_loader("claude_bridge", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _read_offset(off_file, transcript):
+    try:
+        with open(off_file) as f:
+            saved = json.load(f)
+        if saved.get("transcript") != os.path.realpath(transcript):
+            return 0
+        offset = int(saved.get("offset") or 0)
+        if offset < 0 or offset > os.path.getsize(transcript):
+            return 0
+        return offset
+    except (OSError, TypeError, ValueError, AttributeError):
+        # Legacy files contained only an integer. Their transcript identity is
+        # unknowable, so reset once during the format upgrade rather than risk
+        # carrying an old session's beyond-EOF offset forever.
+        return 0
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.stderr.write("usage: agent-reply-extract <transcript_path> <offset_file>\n")
+        return 2
+    transcript, off_file = sys.argv[1], sys.argv[2]
+    start = _read_offset(off_file, transcript)
+    cb = _bridge()
+    reply, new_offset = cb.extract_new_reply(transcript, start)
+    with open(off_file, "w") as f:
+        json.dump({
+            "transcript": os.path.realpath(transcript),
+            "offset": new_offset,
+        }, f)
+    if reply:
+        sys.stdout.write(reply)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
