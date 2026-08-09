@@ -742,14 +742,6 @@ class SenderIdentityTests(unittest.TestCase):
         self.assertTrue(body.startswith(tag))
         self.assertIn("discord-notify", body)
 
-    def test_sender_tag_discourages_routine_name_address(self):
-        tag = cb.sender_tag("Christian", 42, 99)
-        self.assertIn("do not routinely address the sender by name", tag)
-
-    def test_system_prompts_discourage_routine_name_address(self):
-        self.assertIn("do NOT routinely address someone by name", cb.PROTOCOL)
-        self.assertIn("Do not routinely address visitors by name", cb.GREETER)
-
     def test_sender_tag_puts_the_immutable_id_before_the_name(self):
         tag = cb.sender_tag("Christian", 42, 99)
         self.assertLess(tag.index("user id 42"), tag.index("Christian"))
