@@ -27,6 +27,39 @@ worker_mod = load_worker()
 
 
 class PureHelperTests(unittest.TestCase):
+    def test_command_summary_hides_shell_wrapper(self):
+        activity = worker_mod.summarize_item({
+            "type": "commandExecution",
+            "command": "/usr/bin/zsh -lc \"rg -n 'TODO|FIXME' src tests\"",
+            "exitCode": 0,
+        }, completed=True)
+        self.assertIn("`rg -n 'TODO|FIXME' src tests`", activity)
+        self.assertNotIn("zsh -lc", activity)
+
+    def test_command_activity_labels_common_intent(self):
+        self.assertEqual(
+            worker_mod.command_activity_label("python3 -m pytest -q"),
+            "Running tests",
+        )
+        self.assertEqual(
+            worker_mod.command_activity_label("rg -n TODO src", completed=True),
+            "Search completed",
+        )
+
+    def test_activity_item_is_structured_and_reuses_item_id(self):
+        item = {
+            "id": "item-1", "type": "commandExecution",
+            "command": "/usr/bin/zsh -lc \"rg -n TODO src\"",
+            "exitCode": 0, "durationMs": 250,
+        }
+        started = worker_mod.activity_item(item)
+        completed = worker_mod.activity_item(item, completed=True)
+        self.assertEqual(started["id"], completed["id"])
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(started["detail"], "rg -n TODO src")
+        self.assertEqual(completed["meta"], "exit 0 · 0.2s")
+
     def test_redact_command_hides_common_credentials(self):
         command = (
             "curl --client-secret hunter2 -H 'Authorization: Bearer bearer-value' "

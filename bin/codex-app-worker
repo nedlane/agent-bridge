@@ -22,6 +22,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import signal
 import sys
 import time
@@ -125,9 +126,22 @@ def redact_command(command: str, limit: int = 220) -> str:
     useful context, but common inline credential forms are redacted first.
     """
     value = " ".join((command or "").split())
+    # Redact before parsing/unwrapping: a secret may contain shell syntax that
+    # changes how shlex tokenizes the display string.
     value = _AUTH_HEADER.sub(r"\1[redacted]", value)
     value = _SECRET_ASSIGNMENT.sub(r"\1[redacted]", value)
     value = _SECRET_FLAG.sub(r"\1[redacted]", value)
+    # app-server commonly reports commands through its shell wrapper. Showing
+    # `/usr/bin/zsh -lc "..."` on every row is implementation noise, not
+    # useful activity. Unwrap only the exact argv shape; malformed quoting
+    # simply falls back to the original safe display.
+    with contextlib.suppress(ValueError):
+        argv = shlex.split(value)
+        if (len(argv) == 3 and argv[1] == "-lc"
+                and os.path.basename(argv[0]) in {
+                    "sh", "bash", "zsh", "dash", "fish",
+                }):
+            value = " ".join(argv[2].split())
     if len(value) > limit:
         value = value[: limit - 1] + "…"
     return value
@@ -186,6 +200,75 @@ def summarize_item(item: dict[str, Any], completed: bool = False) -> str | None:
         return "Reviewing changes"
     if kind == "exitedReviewMode":
         return "Review complete"
+    return None
+
+
+def command_activity_label(command: str, completed: bool = False) -> str:
+    """Translate common shell operations into intent, like coding UIs do."""
+    lower = command.lower().strip()
+    done = completed
+    if re.search(r"(^|[;&| /])(pytest|unittest|vitest|jest)( |$)", lower) \
+            or re.search(r"(^|[;&| ])(cargo|go) test( |$)", lower):
+        return "Tests completed" if done else "Running tests"
+    if re.search(r"(^|[;&| /])(ruff|eslint|shellcheck|mypy|pyright|tsc)( |$)", lower):
+        return "Checks completed" if done else "Running checks"
+    if re.search(r"(^|[;&| ]+)(rg|grep)( |$)", lower):
+        return "Search completed" if done else "Searching the codebase"
+    if re.search(r"(^|[;&| ]+)(sed|nl|head|tail)( |$)", lower):
+        return "Source inspected" if done else "Reading source"
+    if re.search(r"(^|[;&| ]+)(ls|find|tree)( |$)", lower) or "rg --files" in lower:
+        return "Files inventoried" if done else "Exploring files"
+    if re.search(r"(^|[;&| ]+)git (status|diff|log|show)( |$)", lower):
+        return "Changes inspected" if done else "Inspecting changes"
+    return "Command completed" if done else "Running command"
+
+
+def activity_item(item: dict[str, Any], completed: bool = False) -> dict[str, Any] | None:
+    """Structured, presentation-neutral activity for Discord and future UIs."""
+    kind = item.get("type")
+    status = "completed" if completed else "running"
+    activity: dict[str, Any] = {
+        "id": str(item.get("id") or ""), "kind": kind or "activity",
+        "status": status,
+    }
+    if kind == "commandExecution":
+        command = redact_command(item.get("command") or "", 360)
+        activity.update({
+            "kind": "command", "label": command_activity_label(command, completed),
+            "detail": command,
+        })
+        if completed:
+            meta = []
+            if item.get("exitCode") is not None:
+                meta.append(f"exit {item['exitCode']}")
+            if isinstance(item.get("durationMs"), (int, float)):
+                meta.append(f"{item['durationMs'] / 1000:.1f}s")
+            activity["meta"] = " · ".join(meta)
+        return activity
+    if kind == "fileChange":
+        paths = [str(c.get("path")) for c in item.get("changes") or [] if c.get("path")]
+        activity.update({
+            "kind": "file", "label": "Files updated" if completed else "Editing files",
+            "paths": paths[:5], "meta": f"{len(paths)} file{'s' if len(paths) != 1 else ''}",
+        })
+        return activity
+    if kind in ("mcpToolCall", "dynamicToolCall"):
+        tool = ".".join(str(x) for x in (item.get("server"), item.get("tool")) if x)
+        activity.update({
+            "kind": "tool", "label": "Tool completed" if completed else "Using tool",
+            "detail": tool or "tool",
+        })
+        return activity
+    if kind == "webSearch":
+        activity.update({
+            "kind": "search", "label": "Web search completed" if completed else "Searching the web",
+            "detail": " ".join(str(item.get("query") or "").split())[:300],
+        })
+        return activity
+    legacy = summarize_item(item, completed)
+    if legacy:
+        activity.update({"label": legacy})
+        return activity
     return None
 
 
@@ -374,7 +457,9 @@ class CodexAppWorker:
         self.state.setdefault("plan", [])
         self.state.setdefault("diff", {"files": 0, "additions": 0, "deletions": 0})
         self.state.setdefault("service_tier", None)
-        self.activities: deque[str] = deque(self.state.get("activities") or [], maxlen=ACTIVITY_LIMIT)
+        self.activities: deque[Any] = deque(
+            self.state.get("activities") or [], maxlen=ACTIVITY_LIMIT
+        )
         self.client: AppServerClient | None = None
         self.control_server: asyncio.AbstractServer | None = None
         self.stop_event = asyncio.Event()
@@ -398,12 +483,33 @@ class CodexAppWorker:
     def terminal(self, text: str = "", end: str = "\n") -> None:
         print(text, end=end, flush=True)
 
-    def add_activity(self, text: str | None) -> None:
-        if text:
-            self.activities.append(text)
-            self.terminal(f"• {text}")
+    def add_activity(self, activity: Any) -> None:
+        if activity:
+            self.activities.append(activity)
+            if isinstance(activity, dict):
+                text = activity.get("label") or activity.get("kind") or "Activity"
+                detail = activity.get("detail")
+                self.terminal(f"• {text}{(': ' + str(detail)) if detail else ''}")
+            else:
+                self.terminal(f"• {activity}")
             self.save()
             self.schedule_progress()
+
+    def complete_activity(self, item: dict[str, Any]) -> None:
+        """Replace an in-flight row with its completion instead of duplicating it."""
+        item_id = str(item.get("id") or "")
+        if item_id:
+            self.activities = deque(
+                (row for row in self.activities
+                 if not isinstance(row, dict) or row.get("id") != item_id),
+                maxlen=ACTIVITY_LIMIT,
+            )
+        else:
+            started = activity_item(item, completed=False)
+            if started:
+                with contextlib.suppress(ValueError):
+                    self.activities.remove(started)
+        self.add_activity(activity_item(item, completed=True))
 
     async def start(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -684,7 +790,11 @@ class CodexAppWorker:
                     "expectedTurnId": active_turn,
                     "input": payload,
                 })
-                self.add_activity("Received steering input")
+                self.add_activity({
+                    "kind": "steering", "status": "completed",
+                    "label": "Steering applied",
+                    "detail": "The active turn was updated with a new instruction.",
+                })
                 return {"ok": True, "mode": "steer", "turn_id": result.get("turnId")}
             params: dict[str, Any] = {
                 "threadId": self.state["thread_id"],
@@ -751,7 +861,7 @@ class CodexAppWorker:
             self.state["active_flags"] = status.get("activeFlags") or []
             self.save()
         elif method == "item/started":
-            self.add_activity(summarize_item(params.get("item") or {}, completed=False))
+            self.add_activity(activity_item(params.get("item") or {}, completed=False))
         elif method == "item/completed":
             item = params.get("item") or {}
             if item.get("type") == "agentMessage" and item.get("text"):
@@ -768,7 +878,7 @@ class CodexAppWorker:
                 summaries = item.get("summary") or []
                 if summaries:
                     self.reasoning_summary = "\n".join(str(x) for x in summaries)[-800:]
-            self.add_activity(summarize_item(item, completed=True))
+            self.complete_activity(item)
         elif method == "item/commandExecution/outputDelta":
             delta = params.get("delta") or ""
             if delta:
@@ -883,6 +993,7 @@ class CodexAppWorker:
             "effort": self.state.get("effort"),
             "fast": self.state.get("service_tier") == "priority",
             "elapsed_seconds": elapsed,
+            "updated_at": now_iso(),
             "activities": list(self.activities),
             "plan": self.state.get("plan") or [],
             "diff": self.state.get("diff") or {},

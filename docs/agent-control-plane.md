@@ -40,8 +40,10 @@ final reply plus a live stream of UI-safe reasoning summaries, plan updates,
 command/tool/file activity, diff stats, token usage, typed failures, goals, and
 rate limits. `codex-app-worker` signs those events to the same bridge listener.
 The bridge edits one Discord progress card in place for the turn, then posts
-the final answer separately. It never puts raw reasoning or raw command output
-in the progress card.
+the final answer as a separate, durable channel message. Steering updates the
+active turn and its existing card; a later independent turn gets a new card.
+The activity feed uses structured intent labels and fenced commands. It never
+puts raw reasoning or raw command output in the progress card.
 
 On a satellite worker, reply extraction and usage collection happen beside the
 transcript. A legacy done relay or the app-server worker includes the reply plus

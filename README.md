@@ -137,9 +137,15 @@ commands, command output, file activity, and final responses.
 
 During each Codex turn Discord gets one live activity card that is edited in
 place every few seconds. It shows Codex's UI-safe reasoning summary, plan state,
-recent commands/tools/files, diff counts, elapsed time, and tokens; raw reasoning
-and raw command output are never put in that card. The final response remains a
-separate message. Existing running Codex TUI workers are not replaced when the
+intent-labelled commands/tools/files, diff counts, elapsed time, and tokens;
+raw reasoning and raw command output are never put in that card. Commands use
+fenced code blocks so their contents cannot be interpreted as Discord markdown.
+An ordinary message sent while that turn is active steers it immediately
+(`↪` acknowledgement); it does not create a second card or silently become a
+deferred follow-up. The next idle-state prompt starts a new turn and card
+(`✅` acknowledgement). Each final response is posted as a normal, permanent
+channel message, so only the changing reasoning/activity layer is transient.
+Existing running Codex TUI workers are not replaced when the
 bridge restarts—they keep their recorded `backend=tui` until explicitly
 restarted. Set `codex_backend` or a repo's `backend` to `tui` for rollback.
 

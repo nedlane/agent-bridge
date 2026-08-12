@@ -1184,6 +1184,55 @@ class CodexAppServerBridgeTests(unittest.TestCase):
             self.assertIn(expected, rendered)
         self.assertLessEqual(len(rendered), cb.DISCORD_LIMIT)
 
+    def test_progress_embed_has_rich_live_sections(self):
+        embed = cb.worker_progress_embed({
+            "worker": "bridge", "status": "active",
+            "model": "gpt-5.6-sol", "effort": "high", "fast": True,
+            "elapsed_seconds": 83,
+            "updated_at": "2026-08-13T05:00:00+10:00",
+            "reasoning_summary": "Tracing the request through the control plane",
+            "plan": [
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Implement", "status": "inProgress"},
+            ],
+            "activities": ["Running: `pytest -q`", "Updated `app.py`"],
+            "diff": {"files": 2, "additions": 10, "deletions": 3},
+            "token_usage": {"total": {
+                "inputTokens": 1000, "cachedInputTokens": 800,
+                "outputTokens": 40, "reasoningOutputTokens": 10,
+            }},
+        })
+        self.assertEqual(embed["color"], 0x5865F2)
+        self.assertIn("bridge is working", embed["title"])
+        self.assertIn("Tracing the request", embed["description"])
+        fields = {field["name"]: field["value"] for field in embed["fields"]}
+        plan_field = next(value for name, value in fields.items()
+                          if name.startswith("Plan"))
+        self.assertIn("🔵 Implement", plan_field)
+        self.assertIn("pytest -q", fields["Live activity"])
+        self.assertIn("+10", fields["Changes"])
+        self.assertIn("50", fields["Tokens"])
+        self.assertIn("Fast", embed["footer"]["text"])
+        self.assertEqual(embed["timestamp"], "2026-08-13T05:00:00+10:00")
+
+    def test_structured_activity_uses_real_code_fence_without_markdown_leak(self):
+        rendered = cb._activity_feed([{
+            "kind": "command", "status": "running",
+            "label": "Searching the codebase",
+            "detail": "rg -n 'TODO|FIXME' src tests",
+        }])
+        self.assertIn("▶ **Searching the codebase**", rendered)
+        self.assertIn("```sh\nrg -n 'TODO|FIXME' src tests\n```", rendered)
+        self.assertNotIn("`rg -n", rendered)
+
+    def test_activity_code_fence_cannot_be_closed_by_command(self):
+        rendered = cb._activity_block({
+            "kind": "command", "status": "completed",
+            "label": "Command completed", "detail": "printf '```oops'",
+        })
+        self.assertIn("``\u200b`oops", rendered)
+        self.assertEqual(rendered.count("```"), 2)
+
     def test_structured_usage_includes_plan_window(self):
         rendered = cb.format_app_server_usage("bridge", {
             "token_usage": {"total": {

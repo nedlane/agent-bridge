@@ -1520,6 +1520,73 @@ def _progress_text(value, limit):
     return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
+def _discord_code(value, limit=360):
+    """Text safe inside a Discord fenced code block."""
+    value = str(value or "").replace("```", "``\u200b`").strip()
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+
+def _discord_inline_code(value, limit=100):
+    """Text safe inside Discord inline code."""
+    value = " ".join(str(value or "").split()).replace("`", "ˋ")
+    value = value if len(value) <= limit else value[:limit - 1] + "…"
+    return f"`{value}`"
+
+
+def _legacy_activity(value):
+    """Convert pre-structured worker activity into the new display shape."""
+    text = str(value or "")
+    command = re.match(r"Running:\s*`(.*)`$", text)
+    if command:
+        return {
+            "kind": "command", "status": "running", "label": "Running command",
+            "detail": command.group(1),
+        }
+    command = re.match(r"Command finished \(([^)]*)\):\s*`(.*)`$", text)
+    if command:
+        return {
+            "kind": "command", "status": "completed", "label": "Command completed",
+            "meta": command.group(1).replace(", ", " · "),
+            "detail": command.group(2),
+        }
+    return {"kind": "activity", "status": "completed", "label": text}
+
+
+def _activity_block(raw):
+    """One legible activity entry, keeping commands wholly inside code fences."""
+    activity = raw if isinstance(raw, dict) else _legacy_activity(raw)
+    status = str(activity.get("status") or "completed")
+    kind = str(activity.get("kind") or "activity")
+    icon = "▶" if status == "running" else ("✕" if status == "failed" else "✓")
+    label = _progress_text(activity.get("label") or kind.replace("_", " ").title(), 100)
+    meta = _progress_text(activity.get("meta"), 80)
+    heading = f"{icon} **{label}**" + (f"  ·  {meta}" if meta else "")
+    if kind == "command" and activity.get("detail"):
+        return f"{heading}\n```sh\n{_discord_code(activity['detail'])}\n```"
+    paths = activity.get("paths") or []
+    if isinstance(paths, list) and paths:
+        shown = "  ".join(_discord_inline_code(path) for path in paths[:4])
+        return f"{heading}\n{shown}"
+    detail = _progress_text(activity.get("detail"), 300)
+    return f"{heading}" + (f"\n{detail}" if detail else "")
+
+
+def _activity_feed(activities, limit=1024):
+    """Newest useful activity that fits one Discord embed field."""
+    blocks = []
+    size = 0
+    for raw in reversed(list(activities or [])[-8:]):
+        block = _activity_block(raw)
+        added = len(block) + (2 if blocks else 0)
+        if size + added > limit:
+            continue
+        blocks.insert(0, block)
+        size += added
+        if len(blocks) >= 4:
+            break
+    return "\n\n".join(blocks) or "Waiting for the first tool call…"
+
+
 def format_worker_progress(event):
     """Render a compact, coding-UI-style Discord live activity card."""
     status = str(event.get("status") or "active")
@@ -1580,6 +1647,111 @@ def format_worker_progress(event):
         lines += ["", "-# " + "  |  ".join(footer)]
     rendered = "\n".join(lines)
     return rendered[:DISCORD_LIMIT - 1] + ("…" if len(rendered) >= DISCORD_LIMIT else "")
+
+
+def worker_progress_embed(event):
+    """Build a rich Discord progress embed as an API-shaped dictionary."""
+    status = str(event.get("status") or "active")
+    active = status in ("active", "inProgress", "starting")
+    completed = status == "completed"
+    elapsed = max(0, int(event.get("elapsed_seconds") or 0))
+    elapsed_text = (
+        f"{elapsed // 60}m {elapsed % 60:02d}s" if elapsed >= 60 else f"{elapsed}s"
+    )
+    worker = _progress_text(event.get("worker") or "worker", 80)
+    summary = _progress_text(event.get("reasoning_summary"), 900)
+    title = (
+        f"● {worker} is working" if active else
+        f"✓ {worker} finished" if completed else
+        f"■ {worker} {status}"
+    )
+    embed = {
+        "title": title,
+        "description": summary or (
+            "Connecting to Codex and preparing the turn…" if active
+            else "The turn has ended."
+        ),
+        "color": 0x5865F2 if active else (0x23A55A if completed else 0xED4245),
+        "fields": [],
+    }
+
+    plan = event.get("plan") or []
+    if isinstance(plan, list) and plan:
+        plan_lines = []
+        for item in plan[:7]:
+            if not isinstance(item, dict):
+                continue
+            item_status = str(item.get("status") or "pending").lower()
+            marker = "✅" if item_status in ("completed", "complete") else (
+                "🔵" if item_status in ("inprogress", "in_progress", "active")
+                else "⬜"
+            )
+            plan_lines.append(
+                f"{marker} {_progress_text(item.get('step') or item.get('text'), 170)}"
+            )
+        if plan_lines:
+            done = sum(
+                1 for item in plan[:7] if isinstance(item, dict)
+                and str(item.get("status") or "").lower() in ("completed", "complete")
+            )
+            embed["fields"].append({
+                "name": f"Plan  ·  {done}/{len(plan_lines)} complete",
+                "value": "\n".join(plan_lines)[:1024],
+                "inline": False,
+            })
+
+    activities = event.get("activities") or []
+    if isinstance(activities, list) and activities:
+        embed["fields"].append({
+            "name": "Live activity" if active else "Activity",
+            "value": _activity_feed(activities), "inline": False,
+        })
+
+    stats = event.get("diff") or {}
+    token_usage = event.get("token_usage") or {}
+    usage = token_usage.get("total") or {}
+    if any(int(stats.get(key) or 0) for key in ("files", "additions", "deletions")):
+        embed["fields"].append({
+            "name": "Changes",
+            "value": (
+                f"**{int(stats.get('files') or 0)}** files\n"
+                f"`+{int(stats.get('additions') or 0)}`  "
+                f"`−{int(stats.get('deletions') or 0)}`"
+            ),
+            "inline": True,
+        })
+    if isinstance(usage, dict) and usage:
+        raw_input = int(usage.get("inputTokens") or 0)
+        cached = int(usage.get("cachedInputTokens") or 0)
+        output = int(usage.get("outputTokens") or 0) + int(
+            usage.get("reasoningOutputTokens") or 0
+        )
+        context_window = int(token_usage.get("modelContextWindow") or 0)
+        total_tokens = int(usage.get("totalTokens") or 0)
+        context = (
+            f"\n{min(100, round(total_tokens * 100 / context_window))}% context"
+            if context_window and total_tokens else ""
+        )
+        embed["fields"].append({
+            "name": "Tokens",
+            "value": (
+                f"**{format_tokens(max(0, raw_input - cached))}** in  ·  "
+                f"**{format_tokens(output)}** out\n{format_tokens(cached)} cached{context}"
+            ),
+            "inline": True,
+        })
+
+    model = _progress_text(event.get("model") or "Codex", 50)
+    effort = _progress_text(event.get("effort"), 15)
+    mode = "Fast" if event.get("fast") else "Standard"
+    model_label = f"{model}{(' · ' + effort) if effort else ''} · {mode}"
+    state_label = "live" if active else ("completed" if completed else status)
+    embed["footer"] = {
+        "text": f"{model_label}  •  {elapsed_text}  •  {state_label}"
+    }
+    if event.get("updated_at"):
+        embed["timestamp"] = str(event["updated_at"])
+    return embed
 
 
 def format_app_server_usage(name, state):
@@ -2508,7 +2680,7 @@ def consume_handoff(name, state_root=None, now=None):
 # --------------------------------------------------------------------------
 
 
-def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
+def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtime
     import logging
 
     import aiohttp
@@ -2755,6 +2927,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     async def post(channel_id, text, attachments=None):
         channel = client.get_channel(channel_id)
+        if channel is None and event_only:
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except discord.HTTPException:
+                channel = None
         if channel is None:
             print(f"[bridge] unknown channel {channel_id}, dropping message")
             return
@@ -3085,14 +3262,15 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 await notify_provider_limit(name, channel_for_worker(name))
 
     async def deliver(name, text, message=None, typed=False, tag=None):
-        # Messages go straight in even mid-turn — Claude Code (and Codex) queue
-        # typed-while-running input as steering, which is what check-ins and
-        # course corrections need. A ✅ confirms the message was delivered,
-        # whether the worker was idle or mid-turn (a queued steer still sent).
+        # Messages go straight in even mid-turn: app-server applies them to the
+        # active turn with turn/steer. This is steering, not a deferred
+        # follow-up queue. A ↪ reaction distinguishes that from ✅ on a new
+        # turn so Discord communicates the same state as a coding-focused UI.
         last_activity[name] = time.time()
         repo = repo_by_name(name)
         target = resolve_host_target(cfg, repo)
         app_state = await asyncio.to_thread(worker_inspect, name, target)
+        was_active = bool(app_state and app_state.get("active_turn_id"))
         screen = "" if app_state else await asyncio.to_thread(
             worker_screen, name, 30, False, target)
         # A worker mid-compaction (manual /compact or an auto-compact) is
@@ -3161,7 +3339,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not app_state:
             arm_limit_watcher(name, screen)
         if message:
-            await message.add_reaction("✅")
+            await message.add_reaction("↪" if was_active else "✅")
         return True
 
     async def fetch_attachment(att, dest):
@@ -4339,7 +4517,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         channel_id = worker_notification_channel(cfg, name, event.get("chat", ""))
         if not name or not channel_id:
             return
+        # A separately launched event-only bridge is deliberately outbound
+        # only. Reject events for workers outside its explicit config mapping;
+        # an HMAC-valid production event must not leak into a preview channel.
+        if event_only and channel_for_worker(name) != channel_id:
+            print(f"[bridge] unmapped event-only worker {name!r}, dropping update")
+            return
         channel = client.get_channel(channel_id)
+        if channel is None and event_only:
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except discord.HTTPException:
+                channel = None
         if channel is None:
             print(f"[bridge] unknown progress channel {channel_id}, dropping update")
             return
@@ -4349,21 +4538,22 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         status = str(event.get("status") or "active")
         terminal = status in ("completed", "interrupted", "failed", "cancelled")
         current = progress_cards.get(key)
-        content = format_worker_progress(event)
+        embed = discord.Embed.from_dict(worker_progress_embed(event))
         try:
             if current and current[0] == turn_id:
                 await current[1].edit(
-                    content=content, allowed_mentions=discord.AllowedMentions.none()
+                    content=None, embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none()
                 )
                 message = current[1]
             elif terminal:
                 # A terminal update can race bridge startup and have no live card.
                 message = await channel.send(
-                    content, allowed_mentions=discord.AllowedMentions.none()
+                    embed=embed, allowed_mentions=discord.AllowedMentions.none()
                 )
             else:
                 message = await channel.send(
-                    content, allowed_mentions=discord.AllowedMentions.none()
+                    embed=embed, allowed_mentions=discord.AllowedMentions.none()
                 )
             if terminal:
                 progress_cards.pop(key, None)
@@ -4947,9 +5137,19 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await runner.setup()
         site = web.TCPSite(runner, cfg["listen_host"], int(cfg["listen_port"]))
         await site.start()
-        print(f"[bridge] event listener on {cfg['listen_host']}:{cfg['listen_port']}")
-        asyncio.create_task(reaper())
-        await client.start(token)
+        mode = "event-only preview" if event_only else "gateway"
+        print(f"[bridge] event listener on {cfg['listen_host']}:{cfg['listen_port']} ({mode})")
+        if event_only:
+            # Authenticated REST without a second Gateway session: safe beside
+            # production because it cannot consume inbound Discord messages.
+            await client.login(token)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await client.close()
+        else:
+            asyncio.create_task(reaper())
+            await client.start(token)
 
     asyncio.run(main())
 
@@ -4957,5 +5157,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default=CONFIG_PATH)
+    parser.add_argument(
+        "--event-only", action="store_true",
+        help="post signed worker events via REST without a Discord Gateway session",
+    )
     args = parser.parse_args()
-    run_bridge(args.config)
+    run_bridge(args.config, event_only=args.event_only)
