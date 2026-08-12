@@ -4,10 +4,13 @@ A Discord-driven control plane for interactive Claude Code and Codex workers.
 
 `agent-bridge` maps each Discord channel (under a **Claude** category) 1:1 to a
 persistent tmux-backed worker running either **Claude Code** or **Codex** (in
-YOLO mode): one channel per repo, one worker per repo, no threads. `/harness`
+YOLO mode): one channel per repo, one worker per repo, no threads. Codex uses
+the stable `codex app-server` protocol by default; tmux remains the process and
+web-console surface rather than the control protocol. `/harness`
 switches a channel's engine. Your channel messages are forwarded into the
-worker; the worker's replies and live task checklists are relayed back out
-through engine hooks; each channel runs under a per-channel capability profile
+worker; replies, live plans, reasoning summaries, command/file activity, diff
+stats, and token usage are relayed back out; each channel runs under a
+per-channel capability profile
 (`owner` / `collab` / `utility` / `greeter`). **There is no LLM inside the
 bridge** — the agent (Claude Code or Codex), on your subscription, is the only
 intelligence in the loop. The bridge is deterministic plumbing around it. (The
@@ -25,6 +28,7 @@ MIT-licensed — see [`LICENSE`](LICENSE).
 |---|---|
 | `bin/agent-bridge` | Python daemon: Discord ↔ worker pipe (discord.py + signed-event HTTP listener) |
 | `bin/agent-worker` | Worker lifecycle over tmux sessions (`cw-<name>`) |
+| `bin/codex-app-worker` | Persistent JSON-RPC client for `codex app-server`; structured state/control + tmux rendering |
 | `bin/bridge-ctl` | Thin signed client: add repos/guests, request approvals |
 | `bin/discord-notify` | Post a message/file to a Discord channel from the host |
 | `bin/claude-worker-todo-relay` | PostToolUse/TodoWrite hook → live task checkboxes to Discord |
@@ -58,6 +62,8 @@ The host that runs the bridge needs:
   logged in interactively on a **Claude subscription** (not an API key, not
   Bedrock/Vertex). Run `claude` once and `/login` first.
 - **`claude-launch`** — a launcher wrapper that this repo does **not** include.
+- The **Codex CLI**, logged in with `codex login` on a **ChatGPT subscription**.
+  The default backend requires a release that provides `codex app-server`.
 - **`agy`** — required only for the **experimental** Antigravity harness. It
   must be installed and authenticated before selecting `/harness antigravity`.
   See the limitations below before switching a channel to it.
@@ -96,7 +102,8 @@ and Codex update dialogs are handled similarly.
 
 Actual provider quota failures are different from the bridge's configurable
 guest budgets. Claude and Codex can refuse a turn before their Stop hook fires,
-so the bridge watches each delivered turn for the provider's hard-limit screen.
+so the bridge watches Claude and legacy Codex TUI turns for the provider's
+hard-limit screen; app-server workers report a typed `usageLimitExceeded` error.
 It posts the reported reset time to that worker's Discord channel once, keeps
 the configured model, and suggests switching model/harness or retrying after
 reset. Ordinary approaching-limit notices and optional reset-credit offers do
@@ -112,13 +119,38 @@ tmux session name: this prevents tmux-resurrect's shell-only `cw-*` placeholders
 from masquerading as live agents after a reboot. Explicit `/stop`, `/fresh`,
 `/clear`, and low-level `agent-worker stop` operations cancel recovery.
 
+### Codex app-server workers
+
+New Codex workers run `bin/codex-app-worker` inside the existing `cw-<name>`
+tmux session. It owns one
+[`codex app-server --stdio`](https://developers.openai.com/codex/app-server)
+child, stores the Codex thread id and structured state under the worker state
+directory, and accepts
+host-local control over a mode-0600 Unix socket. `agent-worker send`, steering,
+interrupt, readiness, model/fast mode, compaction, restart, and resume use this
+protocol instead of typing into and scraping the Codex TUI.
+
+The tmux session and `output.log` deliberately remain. Existing browser-console
+APIs (`list`, `status`, `send`, `read`, `start`, `stop`, `restart`, and terminal
+attach) therefore keep the same CLI contract, while the attached terminal shows
+commands, command output, file activity, and final responses.
+
+During each Codex turn Discord gets one live activity card that is edited in
+place every few seconds. It shows Codex's UI-safe reasoning summary, plan state,
+recent commands/tools/files, diff counts, elapsed time, and tokens; raw reasoning
+and raw command output are never put in that card. The final response remains a
+separate message. Existing running Codex TUI workers are not replaced when the
+bridge restarts—they keep their recorded `backend=tui` until explicitly
+restarted. Set `codex_backend` or a repo's `backend` to `tui` for rollback.
+
 ## Standalone install
 
 This installs the bridge directly on a host, without the dotfiles submodule.
 
 1. **Install dependencies** (see [Requirements](#requirements)): Python 3,
-   discord.py, Pillow, tmux, jq, curl, the `claude` CLI (logged in), and a
-   `claude-launch` wrapper on PATH.
+   discord.py, Pillow, tmux, jq, curl, the `claude` CLI (logged in), the Codex
+   CLI (`codex login`, with app-server support), and a `claude-launch` wrapper
+   on PATH.
 
 2. **Link the tools into place.** Run the bundled linker:
 
@@ -220,7 +252,8 @@ The bridge reads a single JSON file at `~/.config/claude-bridge/config.json`
 |---|---|---|
 | `category_id` | int | Channel id of the **Claude** category new repo channels are created under. |
 | `allowed_users` | int[] | Owner Discord user ids. Gate config/roster-changing slash commands and every owner-only action (reaction decisions, guest management). A channel's editor guests can additionally run the read-only and worker-control commands on their own channel (see below). |
-| `idle_minutes` | int | Idle workers are stopped after this many minutes (default `45`). The next message revives them with `--continue`. A Codex worker with an active persistent goal is exempt while its footer says `Pursuing goal`; direct worker progress notifications also refresh its activity clock. |
+| `idle_minutes` | int | Idle workers are stopped after this many minutes (default `45`). The next message revives them. A Codex worker with an active persistent goal is exempt via structured goal state (or the legacy TUI footer); progress events also refresh its activity clock. |
+| `codex_backend` | string | Backend for newly started Codex workers: `app-server` (default) or rollback-compatible `tui`. Does not replace already-running workers. |
 | `listen_host` | string | Bind address for the event and health listener (default `127.0.0.1`). Use a tailnet address or `0.0.0.0` only when satellites must reach it; signed writes still require the shared HMAC secret. |
 | `listen_port` | int | Port of the signed-event listener (default `8765`). Must match the port in `bridge-webhook`. `GET /healthz` exposes a non-secret liveness summary on the same listener. |
 | `machines` | object | Optional logical host names mapped to `{ "ssh": "user@target" }`. Repos select one with `host`; absent means local. |
@@ -236,7 +269,8 @@ Each entry in `repos` is keyed by the Discord channel id (as a string) and holds
 | `name` | string | Worker/channel name (tmux session `cw-<name>`, state dir). |
 | `dir` | string | Absolute path to the repo the worker runs in. |
 | `host` | string | Optional key in `machines`; absent or `local` runs on the bridge host. |
-| `harness` | string | `claude` (default), `codex`, or experimental `antigravity`. |
+| `harness` | string | `codex` (default), `claude`, or experimental `antigravity`. |
+| `backend` | string | Optional per-repo Codex override: `app-server` or `tui`. Ignored by other harnesses. |
 | `profile` | string | Capability profile: `owner` (default), `collab`, `utility`, or `greeter`. |
 | `guests` | int[] | Editor guest ids (View + Send — can drive the worker). Optional. |
 | `viewers` | int[] | View-only guest ids (can watch, can't drive). Optional. |
@@ -250,6 +284,7 @@ start with an empty `repos` object. A complete example:
   "category_id": 111111111111111111,
   "allowed_users": [222222222222222222],
   "idle_minutes": 45,
+  "codex_backend": "app-server",
   "listen_host": "127.0.0.1",
   "listen_port": 8765,
   "welcome_channel": 333333333333333333,
@@ -519,8 +554,9 @@ channel you run it in.
 | `/fast [worker]` | Toggle Codex Fast mode on or off. Running it once enables faster inference with increased plan usage; running it again returns the worker to standard speed. Codex workers only. |
 | `/stop [worker]` | Stop a worker (state kept; a message revives it). |
 | `/restart [worker]` | Restart a worker, resuming its conversation. |
-| `/screen [worker]` | Post the worker's live TUI screen (image, or a code-block fallback). |
-| `/model <model> [worker]` | Switch the worker's model (e.g. `opus`, `sonnet`, `haiku`). Outside Claude, `/model` may open an interactive picker — drive it via `/screen`. |
+| `/screen [worker]` | Post the worker's live terminal screen (image, or a code-block fallback). |
+| `/usage [worker]` | Show Claude's usage panel or Codex app-server's structured session tokens and plan window. |
+| `/model <model> [worker]` | Switch the worker's model. App-server Codex validates against `model/list`; legacy TUI engines may still open an interactive picker. |
 | `/clear [worker]` | Fresh context **now**: restart without `--continue`. **Also purges the channel's messages.** |
 | `/fresh [worker]` | Shut down and arm a fresh start: the next message begins a new session (lazy, no resume). **Also purges the channel's messages.** |
 | `/compact [focus] [worker]` | Compact the worker's context (optional focus hint). |

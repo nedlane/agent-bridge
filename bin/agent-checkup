@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Readiness check for the local agent control plane:
-#   Discord -> claude-bridge -> agent-worker -> tmux -> claude-launch ->
-#   interactive Claude Code (Claude subscription; no LLM in the bridge).
+#   Discord -> agent-bridge -> agent-worker -> tmux -> Claude Code, or
+#   codex-app-worker -> `codex app-server` (subscription; no LLM in bridge).
 #
 # Verifies the pieces that can be checked from this machine — Claude Code on
 # its *subscription* auth path (never API-key/provider billing), tmux, the
@@ -38,11 +38,34 @@ else
   fail "claude not found — install Claude Code and run \`claude\` to log in"
 fi
 
+# --- Codex app-server ---------------------------------------------------------
+if command -v codex >/dev/null 2>&1; then
+  pass "codex installed ($(codex --version 2>/dev/null | head -1 || echo 'version unknown'))"
+  if codex app-server --help >/dev/null 2>&1; then
+    pass "codex app-server available"
+  else
+    fail "codex app-server unavailable — upgrade the Codex CLI"
+  fi
+  if codex login status 2>/dev/null | grep -qi 'logged in'; then
+    pass "codex interactive (subscription) credentials present"
+  else
+    warn "codex login not detected — run \`codex login\` with your ChatGPT subscription"
+  fi
+else
+  fail "codex not found — install Codex CLI and run \`codex login\`"
+fi
+
 # --- forbidden API/provider env --------------------------------------------------
 for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
            CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX; do
   if [[ -n "${!var:-}" ]]; then
     warn "$var is set — would push Claude Code onto API/provider billing (claude-launch strips it, but find and remove the source)"
+  fi
+done
+for var in OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_ORGANIZATION \
+           CODEX_API_KEY AZURE_OPENAI_API_KEY; do
+  if [[ -n "${!var:-}" ]]; then
+    warn "$var is set — could select API billing (codex-app-worker strips it)"
   fi
 done
 
@@ -75,7 +98,7 @@ else
 fi
 
 # --- worker tooling ----------------------------------------------------------------
-for tool in claude-launch agent-worker claude-worker-todo-relay \
+for tool in claude-launch agent-worker codex-app-worker claude-worker-todo-relay \
             claude-worker-done-relay codex-worker-done-relay \
             agent-session-usage claude-bridge bridge-ctl discord-notify \
             agent-checkup; do
@@ -138,7 +161,7 @@ if [[ -r "$bridge_cfg" ]]; then
         continue
       fi
       if ssh -n -o ConnectTimeout=8 -o BatchMode=yes "$machine_target" \
-        "command -v agent-worker agent-session-usage claude-worker-done-relay codex-worker-done-relay >/dev/null 2>&1 && grep -qF 'BRIDGE_WEBHOOK_URL=$parent_url' \"\$HOME/.config/claude-workers/bridge-webhook\" 2>/dev/null"; then
+        "command -v agent-worker codex-app-worker agent-session-usage claude-worker-done-relay codex-worker-done-relay >/dev/null 2>&1 && grep -qF 'BRIDGE_WEBHOOK_URL=$parent_url' \"\$HOME/.config/claude-workers/bridge-webhook\" 2>/dev/null"; then
         pass "satellite $machine_name ($machine_target): worker, usage helper, relays, and parent webhook ready"
       else
         warn "satellite $machine_name ($machine_target): unreachable, worker/usage/relay tools missing, or bridge-webhook not pointed at the parent"

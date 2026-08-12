@@ -1092,6 +1092,7 @@ class StartArgsHarnessTests(unittest.TestCase):
     def test_codex_no_prompt_no_profile(self):
         args = cb.start_args("w", "/d", 42, resume=True, harness="codex")
         self.assertEqual(args[args.index("--harness") + 1], "codex")
+        self.assertEqual(args[args.index("--backend") + 1], "app-server")
         self.assertIn("--resume", args)
         # Codex carries no settings-file profile or system-prompt injection, and
         # nothing rides after "--".
@@ -1101,6 +1102,12 @@ class StartArgsHarnessTests(unittest.TestCase):
     def test_codex_no_resume_omits_flag(self):
         args = cb.start_args("w", "/d", 42, resume=False, harness="codex")
         self.assertNotIn("--resume", args)
+
+    def test_codex_can_retain_legacy_tui_backend(self):
+        args = cb.start_args(
+            "w", "/d", 42, resume=False, harness="codex", backend="tui"
+        )
+        self.assertEqual(args[args.index("--backend") + 1], "tui")
 
     def test_antigravity_uses_worker_launcher_without_claude_flags(self):
         args = cb.start_args(
@@ -1119,6 +1126,76 @@ class AntigravityHarnessTests(unittest.TestCase):
         self.assertTrue(cb.screen_is_ready("ready\n❯ ", "antigravity"))
         self.assertEqual(cb.worker_model_tag("unused", "antigravity"),
                          "Antigravity")
+
+
+class CodexAppServerBridgeTests(unittest.TestCase):
+    def test_backend_defaults_and_repo_override(self):
+        cfg = cb.default_config()
+        self.assertEqual(
+            cb.codex_backend_for(cfg, {"harness": "codex"}), "app-server"
+        )
+        self.assertEqual(
+            cb.codex_backend_for(
+                cfg, {"harness": "codex", "backend": "tui"}
+            ),
+            "tui",
+        )
+        self.assertEqual(
+            cb.codex_backend_for(cfg, {"harness": "claude"}), "tui"
+        )
+
+    def test_structured_model_tag(self):
+        self.assertEqual(
+            cb.app_server_model_tag({
+                "backend": "app-server",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "service_tier": "priority",
+            }),
+            "Codex · gpt-5.6-sol high · Fast on",
+        )
+
+    def test_progress_card_has_plan_activity_diff_and_tokens(self):
+        rendered = cb.format_worker_progress({
+            "worker": "bridge",
+            "status": "active",
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+            "elapsed_seconds": 83,
+            "reasoning_summary": "Checking the worker protocol",
+            "plan": [
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Implement", "status": "inProgress"},
+            ],
+            "activities": ["Running: `pytest -q`", "Updated `app.py`"],
+            "diff": {"files": 2, "additions": 10, "deletions": 3},
+            "token_usage": {"total": {
+                "inputTokens": 1000,
+                "cachedInputTokens": 800,
+                "outputTokens": 40,
+                "reasoningOutputTokens": 10,
+            }},
+        })
+        for expected in (
+            "working · 1m 23s", "**Now**", "Checking the worker protocol",
+            "`✓` Inspect", "`▶` Implement", "pytest -q", "2 files · +10 −3",
+            "tokens 200 in · 50 out · 800 cached",
+        ):
+            self.assertIn(expected, rendered)
+        self.assertLessEqual(len(rendered), cb.DISCORD_LIMIT)
+
+    def test_structured_usage_includes_plan_window(self):
+        rendered = cb.format_app_server_usage("bridge", {
+            "token_usage": {"total": {
+                "inputTokens": 100, "cachedInputTokens": 60,
+                "outputTokens": 9, "reasoningOutputTokens": 1,
+            }},
+            "rate_limits": {"rateLimits": {"primary": {
+                "usedPercent": 22, "windowDurationMins": 10080,
+            }}},
+        })
+        self.assertIn("40 input · 10 output · 60 cache read", rendered)
+        self.assertIn("Plan window (7d): 22% used", rendered)
 
 
 class HandoffPathTests(unittest.TestCase):

@@ -4,6 +4,7 @@
   "welcome_channel": 333333333333333333,
   "requests_channel": 444444444444444444,
   "idle_minutes": 120,
+  "codex_backend": "app-server",
   "listen_host": "127.0.0.1",
   "listen_port": 8765,
   "machines": {

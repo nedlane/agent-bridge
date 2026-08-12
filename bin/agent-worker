@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Manage persistent tmux-backed interactive Claude Code workers (desktop-only
-# half of the local agent control plane: Discord/OpenClaw/Hermes -> Codex ->
-# agent-worker -> tmux -> claude-launch -> interactive Claude Code).
+# Manage persistent tmux-backed Claude Code, Codex, and Antigravity workers.
+# Codex defaults to a structured app-server child; tmux remains the supervisor,
+# output log, and interactive web-console surface.
 #
-# Each worker is a detached tmux session named "cw-<name>" running
-# shared/bin/claude-launch, so it uses the normal interactive subscription
-# auth path — never an Anthropic API key or Bedrock/Vertex billing. The Claude
-# session title is "<host> / worker:<name>", keeping orchestrated workers
-# distinguishable (for Codex and in the claude.ai session list) from manual
-# `cl` sessions, whose titles use the directory name.
+# Each worker is a detached tmux session named "cw-<name>". Launchers strip
+# provider API-key environment variables so Claude and Codex stay on their
+# normal interactive subscription auth paths. Claude session titles use
+# "<host> / worker:<name>" to distinguish them from manual `cl` sessions.
 #
-#   agent-worker start <name> [--dir DIR] [--harness claude|codex] [--resume]
+#   agent-worker start <name> [--dir DIR] [--harness claude|codex]
+#                              [--backend tui|app-server] [--resume]
 #                              [-- engine args...]
 #                                            # blocks until the worker is ready
 #                                            # --harness picks the engine
@@ -22,13 +21,15 @@
 #   agent-worker key   <name> <key>...     # send raw keys (Escape, C-c, …)
 #   agent-worker list
 #   agent-worker status <name>
+#   agent-worker inspect <name>          # structured state (app-server only)
 #   agent-worker state <name> <operation> # bridge lifecycle/file primitives
 #   agent-worker restart <name>            # same name, same recorded dir
 #   agent-worker stop <name>
 #
-# State (no secrets) lives under ${XDG_STATE_HOME:-~/.local/state}/claude-workers/<name>/:
-#   meta        flat key=value: name, session, dir, label, created, log
+# State lives under ${XDG_STATE_HOME:-~/.local/state}/claude-workers/<name>/:
+#   meta        flat key=value: name, session, dir, harness, backend, created, log
 #   output.log  raw terminal output (tmux pipe-pane), append-only
+#   app-server.json + control.sock for app-server workers
 # Orchestrators should read those files instead of shell state.
 set -euo pipefail
 
@@ -80,6 +81,29 @@ alive() {
 
 meta_get() { # meta_get <name> <key>
   sed -n "s/^$2=//p" "$STATE_ROOT/$1/meta" 2>/dev/null | head -1
+}
+
+backend_for() {
+  local backend
+  backend="$(meta_get "$1" backend)"
+  printf '%s\n' "${backend:-tui}"
+}
+
+app_worker_path() {
+  local worker
+  worker="$(command -v codex-app-worker || true)"
+  [[ -n "$worker" ]] || worker="$(dirname "$(readlink -f "$0")")/codex-app-worker"
+  printf '%s\n' "$worker"
+}
+
+app_control() { # app_control <name> <command> [args...]
+  local name="$1" command="$2" worker socket
+  shift 2
+  worker="$(app_worker_path)"
+  socket="$(meta_get "$name" control_socket)"
+  [[ -n "$socket" ]] || socket="$STATE_ROOT/$name/control.sock"
+  [[ -x "$worker" ]] || die "codex-app-worker not found (run scripts/link.sh)"
+  "$worker" ctl --socket "$socket" "$command" "$@"
 }
 
 screen_of() { tmux capture-pane -p -t "$(pane_for "$1")" -S -50 2>/dev/null || true; }
@@ -187,6 +211,23 @@ wait_until() {
   local name="$1" timeout="$2" for_text="${3:-}" started=$SECONDS screen done_now stable=0
   while :; do
     alive "$name" || { echo "agent-worker: worker '$name' died while waiting" >&2; return 1; }
+    if [[ "$(backend_for "$name")" == app-server && -z "$for_text" ]]; then
+      local app_ready app_status
+      app_ready="$(app_control "$name" inspect --field ready 2>/dev/null || true)"
+      app_status="$(app_control "$name" inspect --field status 2>/dev/null || true)"
+      done_now=0
+      [[ "$app_ready" == True && "$app_status" != active && "$app_status" != starting ]] \
+        && done_now=1
+      if (( done_now )); then
+        (( stable >= 1 )) && return 0
+        stable=$((stable + 1))
+      else
+        stable=0
+      fi
+      (( SECONDS - started >= timeout )) && return 2
+      sleep "$POLL"
+      continue
+    fi
     screen="$(screen_of "$name")"
     done_now=0
     if is_update_dialog "$screen"; then
@@ -219,7 +260,7 @@ cmd_start() {
   require_name "${1:-}"
   local name="$1"
   shift
-  local dir="$PWD" chat="" harness="claude" resume=0 extra=()
+  local dir="$PWD" chat="" harness="claude" backend="" resume=0 extra=()
   while (($#)); do
     case "$1" in
       --dir)    dir="${2:?--dir needs a value}"; shift 2 ;;
@@ -235,6 +276,8 @@ cmd_start() {
       # meta so restart/relays know the engine without re-reading bridge config.
       --harness)   harness="${2:?--harness needs a value}"; shift 2 ;;
       --harness=*) harness="${1#--harness=}"; shift ;;
+      --backend)   backend="${2:?--backend needs a value}"; shift 2 ;;
+      --backend=*) backend="${1#--backend=}"; shift ;;
       # Resume the prior conversation. Engine-specific: Claude gets --continue,
       # Codex gets `resume --last`. Centralized here so the bridge just says
       # "resume" and each launcher does the right thing.
@@ -246,6 +289,13 @@ cmd_start() {
   [[ "$chat" =~ ^[^[:space:]]*$ ]] || die "invalid --chat target '$chat'"
   [[ "$harness" == claude || "$harness" == codex || "$harness" == antigravity ]] \
     || die "invalid --harness '$harness' (claude, codex, or antigravity)"
+  if [[ -z "$backend" ]]; then
+    [[ "$harness" == codex ]] && backend="${CODEX_WORKER_BACKEND:-app-server}" || backend=tui
+  fi
+  [[ "$backend" == tui || "$backend" == app-server ]] \
+    || die "invalid --backend '$backend' (tui or app-server)"
+  [[ "$harness" == codex || "$backend" == tui ]] \
+    || die "backend '$backend' is only supported by the codex harness"
   [[ -d "$dir" ]] || die "no such directory: $dir"
   if session_exists "$name"; then
     if alive "$name"; then
@@ -267,9 +317,17 @@ cmd_start() {
   # scripts/link.sh); claude-launch may also be provided by the dotfiles tree.
   if [[ "$harness" == codex ]]; then
     command -v codex >/dev/null 2>&1 || die "codex CLI not found on PATH"
-    launcher="$(command -v codex-launch || true)"
-    [[ -n "$launcher" ]] || launcher="$(dirname "$(readlink -f "$0")")/codex-launch"
-    [[ -x "$launcher" ]] || die "codex-launch not found (run scripts/link.sh)"
+    if [[ "$backend" == app-server ]]; then
+      codex app-server --help >/dev/null 2>&1 \
+        || die "codex app-server unavailable (upgrade the Codex CLI or use --backend tui)"
+      launcher="$(app_worker_path)"
+      [[ -x "$launcher" ]] || die "codex-app-worker not found (run scripts/link.sh)"
+      ((${#extra[@]} == 0)) || die "engine arguments are not supported by the app-server backend"
+    else
+      launcher="$(command -v codex-launch || true)"
+      [[ -n "$launcher" ]] || launcher="$(dirname "$(readlink -f "$0")")/codex-launch"
+      [[ -x "$launcher" ]] || die "codex-launch not found (run scripts/link.sh)"
+    fi
   elif [[ "$harness" == antigravity ]]; then
     command -v agy >/dev/null 2>&1 || die "agy CLI not found on PATH"
     launcher="$(command -v antigravity-launch || true)"
@@ -292,6 +350,12 @@ cmd_start() {
   # a worker at an alternate Codex home, e.g. for tests) rides along when set.
   local env_prefix=(env "CLAUDE_WORKER=$name")
   [[ -n "${CODEX_HOME:-}" ]] && env_prefix+=("CODEX_HOME=$CODEX_HOME")
+  [[ -n "${XDG_CONFIG_HOME:-}" ]] \
+    && env_prefix+=("XDG_CONFIG_HOME=$XDG_CONFIG_HOME")
+  [[ -n "${CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE:-}" ]] \
+    && env_prefix+=(
+      "CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE=$CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE"
+    )
 
   # Build the launch command string for a given resume choice. Resume is
   # engine-specific and applied here (not in the launcher-selection block) so
@@ -302,6 +366,13 @@ cmd_start() {
   build_cmd() {  # $1: 1 to resume the prior conversation, 0 for a fresh session
     local want_resume="$1" la=(${launcher_args[@]+"${launcher_args[@]}"}) \
           ex=(${extra[@]+"${extra[@]}"})
+    if [[ "$backend" == app-server ]]; then
+      la=(run --name "$name" --dir "$dir" --state-dir "$state")
+      [[ -n "$chat" ]] && la+=(--chat "$chat")
+      (( want_resume )) && la+=(--resume)
+      printf '%q ' "${env_prefix[@]}" "$launcher" "${la[@]}"
+      return
+    fi
     if (( want_resume )); then
       case "$harness" in
         claude)            ex=(--continue ${ex[@]+"${ex[@]}"}) ;;
@@ -327,10 +398,12 @@ cmd_start() {
     echo "session=$session"
     echo "dir=$dir"
     echo "harness=$harness"
+    echo "backend=$backend"
     echo "label=worker:$name"
     if [[ -n "$chat" ]]; then echo "chat=$chat"; fi
     echo "created=$(date '+%Y-%m-%dT%H:%M:%S%z')"
     echo "log=$state/output.log"
+    if [[ "$backend" == app-server ]]; then echo "control_socket=$state/control.sock"; fi
   } > "$state/meta"
 
   echo "started worker '$name'"
@@ -414,6 +487,14 @@ cmd_send() {
   [[ -n "$text" ]] || die "usage: agent-worker send <name> [--type] <text|->"
   alive "$name" || die "worker '$name' is not running"
   [[ "$text" == "-" ]] && text="$(cat)"
+  if [[ "$(backend_for "$name")" == app-server ]]; then
+    if (( typed )); then
+      printf '%s' "$text" | app_control "$name" send --typed - >/dev/null
+    else
+      printf '%s' "$text" | app_control "$name" send - >/dev/null
+    fi
+    return
+  fi
   # An update menu can appear on an already-created pane just before the
   # bridge's first send. Dismiss it through the same readiness loop used at
   # startup instead of pasting into the menu and reporting a failed send.
@@ -498,6 +579,15 @@ cmd_key() {
   local name="$1"; shift
   alive "$name" || die "worker '$name' is not running"
   (($#)) || die "usage: agent-worker key <name> <key> [key...]"
+  if [[ "$(backend_for "$name")" == app-server ]]; then
+    local key
+    for key in "$@"; do
+      if [[ "$key" == Escape || "$key" == C-c ]]; then
+        app_control "$name" interrupt >/dev/null
+        return
+      fi
+    done
+  fi
   tmux send-keys -t "$(pane_for "$name")" "$@"
 }
 
@@ -542,6 +632,15 @@ cmd_status() {
   else
     echo "running: no"
   fi
+}
+
+cmd_inspect() {
+  require_name "${1:-}"
+  local name="$1"
+  alive "$name" || die "worker '$name' is not running"
+  [[ "$(backend_for "$name")" == app-server ]] \
+    || die "worker '$name' uses the TUI backend (no structured state)"
+  app_control "$name" inspect
 }
 
 cmd_state() {
@@ -612,16 +711,17 @@ cmd_stop() {
 
 cmd_restart() {
   require_name "${1:-}"
-  local name="$1" dir chat harness
+  local name="$1" dir chat harness backend
   dir="$(meta_get "$name" dir)"
   chat="$(meta_get "$name" chat)"
   harness="$(meta_get "$name" harness)"
+  backend="$(backend_for "$name")"
   [[ -n "$harness" ]] || harness="claude"  # pre-harness workers default to claude
   [[ -n "$dir" ]] || die "no recorded state for '$name' (use: agent-worker start $name --dir DIR)"
   if session_exists "$name"; then
     tmux kill-session -t "=$(session_for "$name")"
   fi
-  local restart_args=(--dir "$dir" --harness "$harness")
+  local restart_args=(--dir "$dir" --harness "$harness" --backend "$backend" --resume)
   [[ -n "$chat" ]] && restart_args+=(--chat "$chat")
   cmd_start "$name" "${restart_args[@]}"
 }
@@ -629,7 +729,7 @@ cmd_restart() {
 cmd="${1:-}"
 shift || true
 case "$cmd" in
-  start|send|wait|read|key|list|status|state|stop|restart) "cmd_$cmd" "$@" ;;
+  start|send|wait|read|key|list|status|inspect|state|stop|restart) "cmd_$cmd" "$@" ;;
   ''|-h|--help|help) usage ;;
   *) die "unknown command '$cmd' (see agent-worker --help)" ;;
 esac
