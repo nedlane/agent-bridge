@@ -10,8 +10,9 @@ LLM in the bridge: Claude Code, on the Claude subscription, is the only
 intelligence in the loop.
 
 Lifecycle: workers idle longer than idle_minutes are stopped; the next
-message revives them with `claude --continue`, restoring the conversation
-from Claude Code's own session history.
+message revives them from the engine's own session history. Codex workers with
+an active persistent goal are exempt because their idle prompt is only the gap
+between automatic continuation turns, not an abandoned worker.
 
 Config:  ~/.config/claude-bridge/config.json
          {category_id, allowed_users, idle_minutes, listen_port,
@@ -1841,6 +1842,19 @@ def worker_busy_text(screen):
     return any(marker in (screen or "") for marker in (
         "esc to interrupt", "Compacting", "Working (",
     ))
+
+
+def screen_has_active_goal(screen):
+    """Whether the live Codex footer says this thread owns a persistent goal.
+
+    Persistent goals deliberately return to an idle composer between automatic
+    continuation turns. Treating that brief idle state as ordinary inactivity
+    kills a multi-day goal as soon as its wall-clock idle deadline has already
+    elapsed. Only inspect the live tail so a historical footer in scrollback
+    cannot keep an unrelated session alive forever.
+    """
+    tail = "\n".join((screen or "").splitlines()[-8:])
+    return "pursuing goal" in tail.lower()
 
 
 def screen_is_compacting(screen):
@@ -4133,6 +4147,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         worker = event.get("worker", "")
         if worker:
             notified.add(worker)
+            # Direct progress messages are real worker activity. Previously
+            # only inbound prompts and turn-end hooks refreshed this clock, so
+            # a long Codex goal that reported through discord-notify could be
+            # stopped as "idle" immediately after finishing a continuation.
+            last_activity[worker] = time.time()
         channel_id = worker_notification_channel(cfg, worker, event.get("chat", ""))
         content = event.get("content") or ""
         if channel_id and (content or attachments):
@@ -4616,6 +4635,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             worker = event.get("worker", "")
             if worker:
                 notified.add(worker)
+                last_activity[worker] = time.time()
             channel_id = worker_notification_channel(
                 cfg, worker, event.get("chat", "")
             )
@@ -4663,18 +4683,24 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 if last is None or time.time() - last < idle_s:
                     continue
                 target = resolve_host_target(cfg, repo)
-                if await asyncio.to_thread(worker_alive, name, target) and not (
-                    await asyncio.to_thread(worker_busy, name, target)
+                if not await asyncio.to_thread(worker_alive, name, target):
+                    continue
+                screen = await asyncio.to_thread(
+                    worker_screen, name, 30, False, target)
+                if worker_busy_text(screen) or (
+                    harness_for(repo) == "codex"
+                    and screen_has_active_goal(screen)
                 ):
-                    await asyncio.to_thread(worker_stop, name, target)
-                    last_activity.pop(name, None)
-                    channel_id = channel_for_worker(name)
-                    if channel_id:
-                        await post(
-                            channel_id,
-                            f"💤 `{name}` idle for {cfg['idle_minutes']}m — stopped. "
-                            "Your next message resumes the conversation.",
-                        )
+                    continue
+                await asyncio.to_thread(worker_stop, name, target)
+                last_activity.pop(name, None)
+                channel_id = channel_for_worker(name)
+                if channel_id:
+                    await post(
+                        channel_id,
+                        f"💤 `{name}` idle for {cfg['idle_minutes']}m — stopped. "
+                        "Your next message resumes the conversation.",
+                    )
 
     async def main():
         app = web.Application(client_max_size=MAX_REQUEST_BYTES)

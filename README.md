@@ -220,7 +220,7 @@ The bridge reads a single JSON file at `~/.config/claude-bridge/config.json`
 |---|---|---|
 | `category_id` | int | Channel id of the **Claude** category new repo channels are created under. |
 | `allowed_users` | int[] | Owner Discord user ids. Gate config/roster-changing slash commands and every owner-only action (reaction decisions, guest management). A channel's editor guests can additionally run the read-only and worker-control commands on their own channel (see below). |
-| `idle_minutes` | int | Idle workers are stopped after this many minutes (default `45`). The next message revives them with `--continue`. |
+| `idle_minutes` | int | Idle workers are stopped after this many minutes (default `45`). The next message revives them with `--continue`. A Codex worker with an active persistent goal is exempt while its footer says `Pursuing goal`; direct worker progress notifications also refresh its activity clock. |
 | `listen_host` | string | Bind address for the event and health listener (default `127.0.0.1`). Use a tailnet address or `0.0.0.0` only when satellites must reach it; signed writes still require the shared HMAC secret. |
 | `listen_port` | int | Port of the signed-event listener (default `8765`). Must match the port in `bridge-webhook`. `GET /healthz` exposes a non-secret liveness summary on the same listener. |
 | `machines` | object | Optional logical host names mapped to `{ "ssh": "user@target" }`. Repos select one with `host`; absent means local. |
