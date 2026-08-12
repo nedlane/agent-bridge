@@ -2865,6 +2865,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                       f"{r.stderr.strip()[-400:]}")
                 return
             await asyncio.to_thread(disarm_fresh, name, None, target)
+            # Codex goals resume themselves and can already be working by the
+            # time agent-worker's startup probe returns. That is successful
+            # recovery: do not wait for idle (or stop it after a timeout) and
+            # do not inject a duplicate continuation prompt.
+            screen = await asyncio.to_thread(
+                worker_screen, name, 40, False, target)
+            if worker_busy_text(screen):
+                last_activity[name] = time.time()
+                print(f"[bridge] {name}: interrupted turn resumed automatically")
+                return
             if not await wait_ready(name, host_target=target):
                 print(f"[bridge] {name}: recovered worker never became ready")
                 # Make the next periodic pass retry rather than leaving a
