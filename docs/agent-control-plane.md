@@ -14,22 +14,19 @@ agent-bridge           discord.py client + signed HTTP listener (+ /healthz)
                        local by default; tailnet-bindable for satellites
       │  forwards locally, or over SSH to a configured worker host
       ▼
-agent-worker          worker lifecycle over a tmux session named `cw-<name>`
-      │  launches / resumes the session (Claude Code via claude-launch, or
-      ▼                                  Codex via codex-launch in YOLO mode)
-claude-launch / codex-launch   wrapper that starts the interactive engine on
-      │                        the subscription auth path (see §4)
-      ▼
-Claude Code / Codex (interactive)   the only intelligence in the loop
+agent-worker          lifecycle over a tmux session named `cw-<name>`
+      ├── Claude/legacy Codex TUI: claude-launch / codex-launch
+      └── Codex default: codex-app-worker ──stdio JSON-RPC──► codex app-server
+                                                               (YOLO policy)
 ```
 
 There is **no LLM in the bridge**. `agent-bridge` is a deterministic pipe: it
 maps each Discord channel 1:1 to one tmux-backed worker, forwards channel
-messages into the worker as keystrokes, and posts replies back out. All
-reasoning happens inside Claude Code, running on the Claude subscription.
+messages into the worker and posts replies back out. Claude/TUI workers retain
+the keystroke path; app-server workers use a host-local Unix control socket.
+All reasoning happens inside the selected subscription-backed agent.
 
-Two things flow back to Discord, and both are driven by **Claude Code hooks**
-(not by polling):
+Claude Code sends two things back through hooks:
 
 - **Replies** — when a worker turn ends, the **Stop** hook
   (`claude-worker-done-relay`) wakes the bridge, which extracts the final reply
@@ -38,14 +35,25 @@ Two things flow back to Discord, and both are driven by **Claude Code hooks**
   (`claude-worker-todo-relay`) fires on every todo/task update and relays the
   current checklist into Discord as checkboxes.
 
+Codex app-server needs no Codex hooks. Its protocol notifications supply the
+final reply plus a live stream of UI-safe reasoning summaries, plan updates,
+command/tool/file activity, diff stats, token usage, typed failures, goals, and
+rate limits. `codex-app-worker` signs those events to the same bridge listener.
+The bridge edits one Discord progress card in place for the turn, then posts
+the final answer as a separate, durable channel message. Steering updates the
+active turn and its existing card; a later independent turn gets a new card.
+The activity feed uses structured intent labels and fenced commands. It never
+puts raw reasoning or raw command output in the progress card.
+
 On a satellite worker, reply extraction and usage collection happen beside the
-transcript. The done relay includes the reply plus a compact token snapshot in
-its signed event; this keeps replies, `/cost`, subagent accounting, and guest
-budgets at parity without mounting the satellite's session files on the parent.
+transcript. A legacy done relay or the app-server worker includes the reply plus
+a compact token snapshot in its signed event; this keeps replies, `/cost`,
+subagent accounting, and guest budgets at parity without mounting the
+satellite's session files on the parent.
 
 Idle workers (idle longer than `idle_minutes`) are stopped; the next message
-revives them with `claude --continue`, restoring the conversation from Claude
-Code's own session history.
+resumes the provider conversation. Codex app-server resumes its persisted
+thread id; Claude uses `--continue`.
 
 ## 2. Hook registration in `~/.claude/settings.json`
 
@@ -98,9 +106,35 @@ only acts for orchestrated workers (those started by `agent-worker`, which sets
 `$CLAUDE_WORKER`), a manual `claude` session stays silent, and each always exits
 `0` so a relay failure can never break the Claude session.
 
-## 2b. Codex worker profile (`~/.codex/worker.config.toml`)
+## 2b. Codex app-server (default)
 
-A channel switched to Codex (`/harness codex`) needs the Codex equivalent of the
+No Codex hook profile is needed on the default backend. `codex-app-worker`
+starts `codex app-server --stdio`, sends the initialize/initialized handshake,
+and starts or resumes a thread with `approvalPolicy=never` and
+`danger-full-access`. It strips API-key environment variables before launch,
+so authentication stays on the normal `codex login` / ChatGPT subscription
+path.
+
+Its state lives beside the existing worker metadata:
+
+```
+~/.local/state/claude-workers/<name>/
+  meta                       backend=app-server, control_socket=...
+  app-server.json            thread/model/turn/plan/usage state
+  app-server-events.jsonl    rotating mode-0600 host-local protocol log
+  control.sock               mode-0600 send/inspect/interrupt API
+  output.log                 tmux/web-console terminal output
+```
+
+The tmux shell contract stays intact for the separate worker web UI: list,
+status, start, send, screen capture, logs, stop/restart, and terminal attach all
+continue to go through `agent-worker`. Existing TUI workers are not converted
+by a daemon restart. `codex_backend: "tui"` globally, or `backend: "tui"` on
+one repo, is the rollback path for its next start.
+
+## 2c. Legacy Codex TUI profile (`~/.codex/worker.config.toml`)
+
+A channel explicitly using `backend: "tui"` needs the Codex equivalent of the
 `Stop` relay. Codex fires its own **`Stop`** hook at the end of every turn, and
 its payload carries the final assistant message inline — so `codex-worker-done-relay`
 reads it and POSTs the same `claude.worker.turn_ended` event, reply text and all
@@ -132,8 +166,8 @@ worker still runs — it just falls back to the worker's own `discord-notify` fo
 replies (no silent-turn safety net). Your base `~/.codex/config.toml` is never
 modified.
 
-Provider quota refusal is the exception to the Stop-hook path: Codex can remain
-on its hard-limit screen without firing Stop at all. The bridge therefore arms
+Provider quota refusal is the exception to the legacy Stop-hook path: Codex can
+remain on its hard-limit screen without firing Stop at all. The bridge therefore arms
 a lightweight pane watcher for every delivered Claude/Codex turn. A hard-limit
 message is posted once to the mapped Discord channel with its reset time; an
 ordinary approaching-limit reminder is not. If Codex also opens its cheaper-
@@ -145,7 +179,7 @@ Because the full-trust worker was explicitly launched with bypass enabled, it
 selects **Yes, I accept** and waits for the real input prompt before the bridge
 pastes the first Discord message.
 
-## 2c. Antigravity has no relay yet
+## 2d. Antigravity has no relay yet
 
 `/harness antigravity` starts a worker through `antigravity-launch`, and
 everything *inbound* works — the bridge pastes messages into the pane, and

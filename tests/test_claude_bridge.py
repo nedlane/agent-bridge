@@ -516,6 +516,27 @@ class ScreenIsCompactingTests(unittest.TestCase):
         self.assertFalse(cb.screen_is_compacting("❯ "))
 
 
+class ScreenHasActiveGoalTests(unittest.TestCase):
+    def test_live_codex_goal_footer(self):
+        screen = (
+            "• Finished one continuation\n\n"
+            "› Summarize recent commits\n\n"
+            "  gpt-5.6-sol high · ~/repo       Pursuing goal (17h 7m)"
+        )
+        self.assertTrue(cb.screen_has_active_goal(screen))
+
+    def test_plain_idle_codex_worker(self):
+        self.assertFalse(cb.screen_has_active_goal(
+            "• Done\n\n› Find and fix a bug\n\n  gpt-5.6-sol high · ~/repo"
+        ))
+
+    def test_old_goal_footer_in_scrollback_does_not_pin_worker(self):
+        screen = "Pursuing goal (2h)\n" + "\n".join(
+            f"new line {i}" for i in range(9)
+        )
+        self.assertFalse(cb.screen_has_active_goal(screen))
+
+
 class ChannelFromChatTests(unittest.TestCase):
     def test_simple(self):
         self.assertEqual(cb.channel_from_chat("discord:123"), 123)
@@ -1071,6 +1092,7 @@ class StartArgsHarnessTests(unittest.TestCase):
     def test_codex_no_prompt_no_profile(self):
         args = cb.start_args("w", "/d", 42, resume=True, harness="codex")
         self.assertEqual(args[args.index("--harness") + 1], "codex")
+        self.assertEqual(args[args.index("--backend") + 1], "app-server")
         self.assertIn("--resume", args)
         # Codex carries no settings-file profile or system-prompt injection, and
         # nothing rides after "--".
@@ -1080,6 +1102,12 @@ class StartArgsHarnessTests(unittest.TestCase):
     def test_codex_no_resume_omits_flag(self):
         args = cb.start_args("w", "/d", 42, resume=False, harness="codex")
         self.assertNotIn("--resume", args)
+
+    def test_codex_can_retain_legacy_tui_backend(self):
+        args = cb.start_args(
+            "w", "/d", 42, resume=False, harness="codex", backend="tui"
+        )
+        self.assertEqual(args[args.index("--backend") + 1], "tui")
 
     def test_antigravity_uses_worker_launcher_without_claude_flags(self):
         args = cb.start_args(
@@ -1098,6 +1126,141 @@ class AntigravityHarnessTests(unittest.TestCase):
         self.assertTrue(cb.screen_is_ready("ready\n❯ ", "antigravity"))
         self.assertEqual(cb.worker_model_tag("unused", "antigravity"),
                          "Antigravity")
+
+
+class CodexAppServerBridgeTests(unittest.TestCase):
+    def test_backend_defaults_and_repo_override(self):
+        cfg = cb.default_config()
+        self.assertEqual(
+            cb.codex_backend_for(cfg, {"harness": "codex"}), "app-server"
+        )
+        self.assertEqual(
+            cb.codex_backend_for(
+                cfg, {"harness": "codex", "backend": "tui"}
+            ),
+            "tui",
+        )
+        self.assertEqual(
+            cb.codex_backend_for(cfg, {"harness": "claude"}), "tui"
+        )
+
+    def test_structured_model_tag(self):
+        self.assertEqual(
+            cb.app_server_model_tag({
+                "backend": "app-server",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "service_tier": "priority",
+            }),
+            "Codex · gpt-5.6-sol high · Fast on",
+        )
+
+    def test_progress_card_has_plan_activity_diff_and_tokens(self):
+        rendered = cb.format_worker_progress({
+            "worker": "bridge",
+            "status": "active",
+            "model": "gpt-5.6-sol",
+            "effort": "high",
+            "elapsed_seconds": 83,
+            "reasoning_summary": "Checking the worker protocol",
+            "plan": [
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Implement", "status": "inProgress"},
+            ],
+            "activities": ["Running: `pytest -q`", "Updated `app.py`"],
+            "diff": {"files": 2, "additions": 10, "deletions": 3},
+            "token_usage": {"total": {
+                "inputTokens": 1000,
+                "cachedInputTokens": 800,
+                "outputTokens": 40,
+                "reasoningOutputTokens": 10,
+            }},
+        })
+        for expected in (
+            "working · 1m 23s", "**Now**", "Checking the worker protocol",
+            "`✓` Inspect", "`▶` Implement", "pytest -q", "2 files · +10 −3",
+            "tokens 200 in · 50 out · 800 cached",
+        ):
+            self.assertIn(expected, rendered)
+        self.assertLessEqual(len(rendered), cb.DISCORD_LIMIT)
+
+    def test_progress_embed_has_rich_live_sections(self):
+        embed = cb.worker_progress_embed({
+            "worker": "bridge", "status": "active",
+            "model": "gpt-5.6-sol", "effort": "high", "fast": True,
+            "elapsed_seconds": 83,
+            "updated_at": "2026-08-13T05:00:00+10:00",
+            "reasoning_summary": "Tracing the request through the control plane",
+            "plan": [
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Implement", "status": "inProgress"},
+            ],
+            "activities": ["Running: `pytest -q`", "Updated `app.py`"],
+            "diff": {"files": 2, "additions": 10, "deletions": 3},
+            "token_usage": {"total": {
+                "inputTokens": 1000, "cachedInputTokens": 800,
+                "outputTokens": 40, "reasoningOutputTokens": 10,
+            }},
+        })
+        self.assertEqual(embed["color"], 0x5865F2)
+        self.assertIn("bridge is working", embed["title"])
+        self.assertIn("Tracing the request", embed["description"])
+        fields = {field["name"]: field["value"] for field in embed["fields"]}
+        plan_field = next(value for name, value in fields.items()
+                          if name.startswith("Plan"))
+        self.assertIn("🔵 Implement", plan_field)
+        self.assertIn("pytest -q", fields["Live activity"])
+        self.assertIn("+10", fields["Changes"])
+        self.assertIn("50", fields["Tokens"])
+        self.assertIn("Fast", embed["footer"]["text"])
+        self.assertEqual(embed["timestamp"], "2026-08-13T05:00:00+10:00")
+
+    def test_structured_activity_uses_real_code_fence_without_markdown_leak(self):
+        rendered = cb._activity_feed([{
+            "kind": "command", "status": "running",
+            "label": "Searching the codebase",
+            "detail": "rg -n 'TODO|FIXME' src tests",
+        }])
+        self.assertIn("▶ **Searching the codebase**", rendered)
+        self.assertIn("```sh\nrg -n 'TODO|FIXME' src tests\n```", rendered)
+        self.assertNotIn("`rg -n", rendered)
+
+    def test_activity_code_fence_cannot_be_closed_by_command(self):
+        rendered = cb._activity_block({
+            "kind": "command", "status": "completed",
+            "label": "Command completed", "detail": "printf '```oops'",
+        })
+        self.assertIn("``\u200b`oops", rendered)
+        self.assertEqual(rendered.count("```"), 2)
+
+    def test_completed_receipt_drops_transient_reasoning_and_activity(self):
+        embed = cb.worker_progress_embed({
+            "worker": "bridge", "status": "completed",
+            "reasoning_summary": "transient work summary",
+            "plan": [{"step": "Inspect", "status": "completed"}],
+            "activities": [{
+                "kind": "command", "status": "completed",
+                "label": "Tests completed", "detail": "pytest -q",
+            }],
+            "diff": {"files": 1, "additions": 2, "deletions": 0},
+        })
+        self.assertNotIn("transient work summary", embed["description"])
+        self.assertIn("permanent message", embed["description"])
+        self.assertEqual([field["name"] for field in embed["fields"]], ["Changes"])
+        self.assertIn("completed", embed["footer"]["text"])
+
+    def test_structured_usage_includes_plan_window(self):
+        rendered = cb.format_app_server_usage("bridge", {
+            "token_usage": {"total": {
+                "inputTokens": 100, "cachedInputTokens": 60,
+                "outputTokens": 9, "reasoningOutputTokens": 1,
+            }},
+            "rate_limits": {"rateLimits": {"primary": {
+                "usedPercent": 22, "windowDurationMins": 10080,
+            }}},
+        })
+        self.assertIn("40 input · 10 output · 60 cache read", rendered)
+        self.assertIn("Plan window (7d): 22% used", rendered)
 
 
 class HandoffPathTests(unittest.TestCase):
@@ -2218,9 +2381,23 @@ class RemoteWorkerStateTests(unittest.TestCase):
     def test_state_and_fresh_checks_dispatch_to_satellite(self):
         self.assertTrue(cb.worker_has_state("app", host_target="me@mac"))
         self.assertTrue(cb.fresh_pending("app", host_target="me@mac"))
+        self.assertTrue(cb.active_turn_pending("app", host_target="me@mac"))
+        self.assertTrue(cb.mark_active_turn("app", host_target="me@mac"))
+        self.assertTrue(cb.clear_active_turn("app", host_target="me@mac"))
         remote = "\n".join(call[-1] for call in self.calls)
         self.assertIn("agent-worker state app has", remote)
         self.assertIn("agent-worker state app fresh-pending", remote)
+        self.assertIn("agent-worker state app active", remote)
+        self.assertIn("agent-worker state app active-mark", remote)
+        self.assertIn("agent-worker state app active-clear", remote)
+
+    def test_local_active_turn_marker_round_trip(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertFalse(cb.active_turn_pending("app", root))
+            self.assertTrue(cb.mark_active_turn("app", root))
+            self.assertTrue(cb.active_turn_pending("app", root))
+            self.assertTrue(cb.clear_active_turn("app", root))
+            self.assertFalse(cb.active_turn_pending("app", root))
 
     def test_remote_path_is_reported_by_satellite(self):
         self.assertEqual(

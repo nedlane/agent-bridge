@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """agent-bridge — deterministic Discord <-> agent worker pipe (Claude Code / Codex).
 
-Each Discord channel under the Claude category maps to one tmux-backed
-interactive Claude Code worker (channel-per-repo, one worker per repo, no
-threads). The bridge forwards your channel messages to the worker via
-`agent-worker send`, and posts the worker's replies back when the worker's
-Stop hook (claude-worker-done-relay) reports a finished turn. There is no
-LLM in the bridge: Claude Code, on the Claude subscription, is the only
-intelligence in the loop.
+Each Discord channel under the Claude category maps to one tmux-backed agent
+worker (channel-per-repo, one worker per repo, no Discord threads). The bridge
+forwards channel messages through `agent-worker send` and posts replies from
+Claude's Stop hook or Codex app-server's structured events. There is no LLM in
+the bridge: the subscription-backed agent is the only intelligence in the loop.
 
 Lifecycle: workers idle longer than idle_minutes are stopped; the next
-message revives them with `claude --continue`, restoring the conversation
-from Claude Code's own session history.
+message revives them from the engine's own session history. Codex workers with
+an active persistent goal are exempt because their idle prompt is only the gap
+between automatic continuation turns, not an abandoned worker.
 
 Config:  ~/.config/claude-bridge/config.json
          {category_id, allowed_users, idle_minutes, listen_port,
@@ -21,17 +20,17 @@ Secrets: ~/.config/claude-workers/discord-bot-token   (Discord bot token)
                                                        BRIDGE_WEBHOOK_SECRET,
                                                        shared with the hooks)
 
-Workers run on one of three engines: Claude Code (default), Codex, or
+Workers run on one of three engines: Codex (default), Claude Code, or
 Antigravity — the latter two in YOLO mode (bypass all approvals + sandbox, the
 analog of Claude's bypass-permissions). `/harness` switches a channel between
 them; each engine keeps its own conversation. Claude's protocol is injected as
 a system prompt; Codex's and Antigravity's ride in as the worker's first
 message instead.
 
-Turn-end replies are pushed by an engine-specific Stop hook — Claude's
-claude-worker-done-relay hands the bridge a transcript path, Codex's
-codex-worker-done-relay carries the reply inline (see
-docs/agent-control-plane.md).
+Turn-end replies are pushed by Claude's Stop hook or by the default Codex
+app-server worker. The latter also edits a Discord live card with reasoning
+summaries, plan/activity, diff, and token telemetry. The legacy Codex TUI
+backend retains `codex-worker-done-relay` (see docs/agent-control-plane.md).
 
 ANTIGRAVITY IS NOT AT PARITY: there is no equivalent relay for `agy`, so an
 antigravity worker's turn-end reply is NOT posted automatically. It reaches
@@ -77,8 +76,9 @@ on connect). The `worker` option defaults to the channel's mapped worker:
 A message starting with "/ignore" is a channel-only note: the bridge drops it
 (marking it 🙈) instead of relaying it, so you can talk in a worker's channel
 without the worker picking it up.
-A plain message starting with "/" that is NOT one of the above is typed into
-the worker as keystrokes, so any other Claude Code slash command still works.
+A plain message starting with "/" that is NOT one of the above is routed to
+the worker: TUI backends receive keystrokes and app-server handles its supported
+local commands without screen scraping.
 The worker named "orchestrator" additionally gets the ORCHESTRATOR brief, so
 its channel doubles as a natural-language remote for all of the above.
 
@@ -190,6 +190,18 @@ INBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
 # unread after this long, rather than surfacing in an unrelated later
 # session.
 HANDOFF_MAX_AGE_SECONDS = 24 * 3600
+
+# A hard host/process death leaves the active-turn marker behind. Give
+# tmux-continuum time to restore its saved layout first, then replace any
+# resulting shell-only cw-* placeholder with a real resumed worker and steer
+# the interrupted turn back into motion. The periodic reaper retries failures.
+RECOVERY_STARTUP_DELAY_SECONDS = 10
+RECOVERY_PROMPT = """[Automatic recovery after a host or worker restart]
+
+Your previous turn was interrupted before its completion hook ran. Resume the
+active goal/task from the persisted conversation and continue working from
+where it stopped. Do not send a status update merely because of this recovery
+notice; follow the existing Discord notification rules."""
 
 # Injected into every worker's system prompt: the worker itself is the
 # publisher. It messages Ned through discord-notify (which auto-targets the
@@ -350,8 +362,18 @@ def system_prompt(name, state_root=None):
     return base
 
 
+def codex_backend_for(cfg, repo):
+    """Codex transport for a repo; other harnesses always retain their TUI."""
+    if harness_for(repo) != "codex":
+        return "tui"
+    backend = (repo or {}).get("backend") or (cfg or {}).get(
+        "codex_backend", "app-server"
+    )
+    return backend if backend in ("tui", "app-server") else "app-server"
+
+
 def start_args(name, directory, channel_id, resume, profile="owner",
-               harness="claude"):
+               harness="claude", backend=None):
     """argv for agent-worker start. Claude workers get the Discord protocol
     injected as a system prompt and the channel's capability profile applied
     (owner = full trust, unchanged). Codex workers run in YOLO full-trust with
@@ -364,6 +386,8 @@ def start_args(name, directory, channel_id, resume, profile="owner",
         "--chat", f"discord:{channel_id}",
         "--harness", harness,
     ]
+    if harness == "codex":
+        args += ["--backend", backend or "app-server"]
     if resume:
         args.append("--resume")
     if harness in ("codex", "antigravity"):
@@ -566,6 +590,7 @@ def default_config():
         "category_id": 0,
         "allowed_users": [],
         "idle_minutes": 45,
+        "codex_backend": "app-server",
         "listen_host": "127.0.0.1",
         "listen_port": 8765,
         "machines": {},
@@ -1489,6 +1514,282 @@ def split_message(text, limit=DISCORD_LIMIT):
     return [c.rstrip("\n") for c in chunks if c.strip()]
 
 
+def _progress_text(value, limit):
+    """Single-line, bounded text for the live card (mentions disabled at send)."""
+    value = " ".join(str(value or "").split())
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+
+def _discord_code(value, limit=360):
+    """Text safe inside a Discord fenced code block."""
+    value = str(value or "").replace("```", "``\u200b`").strip()
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+
+def _discord_inline_code(value, limit=100):
+    """Text safe inside Discord inline code."""
+    value = " ".join(str(value or "").split()).replace("`", "ˋ")
+    value = value if len(value) <= limit else value[:limit - 1] + "…"
+    return f"`{value}`"
+
+
+def _legacy_activity(value):
+    """Convert pre-structured worker activity into the new display shape."""
+    text = str(value or "")
+    command = re.match(r"Running:\s*`(.*)`$", text)
+    if command:
+        return {
+            "kind": "command", "status": "running", "label": "Running command",
+            "detail": command.group(1),
+        }
+    command = re.match(r"Command finished \(([^)]*)\):\s*`(.*)`$", text)
+    if command:
+        return {
+            "kind": "command", "status": "completed", "label": "Command completed",
+            "meta": command.group(1).replace(", ", " · "),
+            "detail": command.group(2),
+        }
+    return {"kind": "activity", "status": "completed", "label": text}
+
+
+def _activity_block(raw):
+    """One legible activity entry, keeping commands wholly inside code fences."""
+    activity = raw if isinstance(raw, dict) else _legacy_activity(raw)
+    status = str(activity.get("status") or "completed")
+    kind = str(activity.get("kind") or "activity")
+    icon = "▶" if status == "running" else ("✕" if status == "failed" else "✓")
+    label = _progress_text(activity.get("label") or kind.replace("_", " ").title(), 100)
+    meta = _progress_text(activity.get("meta"), 80)
+    heading = f"{icon} **{label}**" + (f"  ·  {meta}" if meta else "")
+    if kind == "command" and activity.get("detail"):
+        return f"{heading}\n```sh\n{_discord_code(activity['detail'])}\n```"
+    paths = activity.get("paths") or []
+    if isinstance(paths, list) and paths:
+        shown = "  ".join(_discord_inline_code(path) for path in paths[:4])
+        return f"{heading}\n{shown}"
+    detail = _progress_text(activity.get("detail"), 300)
+    return f"{heading}" + (f"\n{detail}" if detail else "")
+
+
+def _activity_feed(activities, limit=1024):
+    """Newest useful activity that fits one Discord embed field."""
+    blocks = []
+    size = 0
+    for raw in reversed(list(activities or [])[-8:]):
+        block = _activity_block(raw)
+        added = len(block) + (2 if blocks else 0)
+        if size + added > limit:
+            continue
+        blocks.insert(0, block)
+        size += added
+        if len(blocks) >= 4:
+            break
+    return "\n\n".join(blocks) or "Waiting for the first tool call…"
+
+
+def format_worker_progress(event):
+    """Render a compact, coding-UI-style Discord live activity card."""
+    status = str(event.get("status") or "active")
+    active = status in ("active", "inProgress", "starting")
+    icon = "⚙️" if active else ("✅" if status == "completed" else "⏹️")
+    elapsed = max(0, int(event.get("elapsed_seconds") or 0))
+    elapsed_text = f"{elapsed // 60}m {elapsed % 60:02d}s" if elapsed >= 60 else f"{elapsed}s"
+    model = _progress_text(event.get("model") or "Codex", 50)
+    effort = _progress_text(event.get("effort"), 15)
+    tier = " · Fast" if event.get("fast") else ""
+    title_status = "working" if active else status
+    lines = [
+        f"{icon} **{_progress_text(event.get('worker') or 'worker', 50)}** "
+        f"· `{model}{(' ' + effort) if effort else ''}`{tier} · {title_status} · {elapsed_text}"
+    ]
+
+    summary = _progress_text(event.get("reasoning_summary"), 360)
+    if summary:
+        lines += ["", f"**Now**  {summary}"]
+
+    plan = event.get("plan") or []
+    if isinstance(plan, list) and plan:
+        lines += ["", "**Plan**"]
+        for item in plan[:6]:
+            if not isinstance(item, dict):
+                continue
+            item_status = str(item.get("status") or "pending").lower()
+            marker = "✓" if item_status in ("completed", "complete") else (
+                "▶" if item_status in ("inprogress", "in_progress", "active") else "○"
+            )
+            lines.append(f"`{marker}` {_progress_text(item.get('step') or item.get('text'), 180)}")
+
+    activities = event.get("activities") or []
+    if isinstance(activities, list) and activities:
+        lines += ["", "**Recent activity**"]
+        for activity in activities[-4:]:
+            lines.append("• " + _progress_text(activity, 220))
+
+    stats = event.get("diff") or {}
+    usage = ((event.get("token_usage") or {}).get("total") or {})
+    footer = []
+    if any(int(stats.get(key) or 0) for key in ("files", "additions", "deletions")):
+        footer.append(
+            f"{int(stats.get('files') or 0)} files · +{int(stats.get('additions') or 0)} "
+            f"−{int(stats.get('deletions') or 0)}"
+        )
+    if isinstance(usage, dict) and usage:
+        raw_input = int(usage.get("inputTokens") or 0)
+        cached = int(usage.get("cachedInputTokens") or 0)
+        output = int(usage.get("outputTokens") or 0) + int(
+            usage.get("reasoningOutputTokens") or 0
+        )
+        footer.append(
+            f"tokens {format_tokens(max(0, raw_input - cached))} in · "
+            f"{format_tokens(output)} out · {format_tokens(cached)} cached"
+        )
+    if footer:
+        lines += ["", "-# " + "  |  ".join(footer)]
+    rendered = "\n".join(lines)
+    return rendered[:DISCORD_LIMIT - 1] + ("…" if len(rendered) >= DISCORD_LIMIT else "")
+
+
+def worker_progress_embed(event):
+    """Build a rich Discord progress embed as an API-shaped dictionary."""
+    status = str(event.get("status") or "active")
+    active = status in ("active", "inProgress", "starting")
+    completed = status == "completed"
+    elapsed = max(0, int(event.get("elapsed_seconds") or 0))
+    elapsed_text = (
+        f"{elapsed // 60}m {elapsed % 60:02d}s" if elapsed >= 60 else f"{elapsed}s"
+    )
+    worker = _progress_text(event.get("worker") or "worker", 80)
+    summary = _progress_text(event.get("reasoning_summary"), 900)
+    title = (
+        f"● {worker} is working" if active else
+        f"✓ {worker} finished" if completed else
+        f"■ {worker} {status}"
+    )
+    embed = {
+        "title": title,
+        "description": (
+            summary or "Connecting to Codex and preparing the turn…"
+            if active else
+            "Turn completed. The final response is preserved as a permanent "
+            "message in the channel." if completed else
+            f"The turn ended with status: {status}."
+        ),
+        "color": 0x5865F2 if active else (0x23A55A if completed else 0xED4245),
+        "fields": [],
+    }
+
+    plan = event.get("plan") or []
+    if active and isinstance(plan, list) and plan:
+        plan_lines = []
+        for item in plan[:7]:
+            if not isinstance(item, dict):
+                continue
+            item_status = str(item.get("status") or "pending").lower()
+            marker = "✅" if item_status in ("completed", "complete") else (
+                "🔵" if item_status in ("inprogress", "in_progress", "active")
+                else "⬜"
+            )
+            plan_lines.append(
+                f"{marker} {_progress_text(item.get('step') or item.get('text'), 170)}"
+            )
+        if plan_lines:
+            done = sum(
+                1 for item in plan[:7] if isinstance(item, dict)
+                and str(item.get("status") or "").lower() in ("completed", "complete")
+            )
+            embed["fields"].append({
+                "name": f"Plan  ·  {done}/{len(plan_lines)} complete",
+                "value": "\n".join(plan_lines)[:1024],
+                "inline": False,
+            })
+
+    activities = event.get("activities") or []
+    if active and isinstance(activities, list) and activities:
+        embed["fields"].append({
+            "name": "Live activity" if active else "Activity",
+            "value": _activity_feed(activities), "inline": False,
+        })
+
+    stats = event.get("diff") or {}
+    token_usage = event.get("token_usage") or {}
+    usage = token_usage.get("total") or {}
+    if any(int(stats.get(key) or 0) for key in ("files", "additions", "deletions")):
+        embed["fields"].append({
+            "name": "Changes",
+            "value": (
+                f"**{int(stats.get('files') or 0)}** files\n"
+                f"`+{int(stats.get('additions') or 0)}`  "
+                f"`−{int(stats.get('deletions') or 0)}`"
+            ),
+            "inline": True,
+        })
+    if isinstance(usage, dict) and usage:
+        raw_input = int(usage.get("inputTokens") or 0)
+        cached = int(usage.get("cachedInputTokens") or 0)
+        output = int(usage.get("outputTokens") or 0) + int(
+            usage.get("reasoningOutputTokens") or 0
+        )
+        context_window = int(token_usage.get("modelContextWindow") or 0)
+        total_tokens = int(usage.get("totalTokens") or 0)
+        context = (
+            f"\n{min(100, round(total_tokens * 100 / context_window))}% context"
+            if context_window and total_tokens else ""
+        )
+        embed["fields"].append({
+            "name": "Tokens",
+            "value": (
+                f"**{format_tokens(max(0, raw_input - cached))}** in  ·  "
+                f"**{format_tokens(output)}** out\n{format_tokens(cached)} cached{context}"
+            ),
+            "inline": True,
+        })
+
+    model = _progress_text(event.get("model") or "Codex", 50)
+    effort = _progress_text(event.get("effort"), 15)
+    mode = "Fast" if event.get("fast") else "Standard"
+    model_label = f"{model}{(' · ' + effort) if effort else ''} · {mode}"
+    state_label = "live" if active else ("completed" if completed else status)
+    embed["footer"] = {
+        "text": f"{model_label}  •  {elapsed_text}  •  {state_label}"
+    }
+    if event.get("updated_at"):
+        embed["timestamp"] = str(event["updated_at"])
+    return embed
+
+
+def format_app_server_usage(name, state):
+    """Structured /usage output without opening or scraping a TUI panel."""
+    usage = ((state.get("token_usage") or {}).get("total") or {})
+    raw_limits = state.get("rate_limits") or {}
+    limits = raw_limits.get("rateLimits") or raw_limits
+    lines = [f"📊 **{name}** · Codex app-server"]
+    if usage:
+        raw_input = int(usage.get("inputTokens") or 0)
+        cached = int(usage.get("cachedInputTokens") or 0)
+        output = int(usage.get("outputTokens") or 0) + int(
+            usage.get("reasoningOutputTokens") or 0
+        )
+        lines.append(
+            f"Session: {format_tokens(max(0, raw_input - cached))} input · "
+            f"{format_tokens(output)} output · {format_tokens(cached)} cache read"
+        )
+    primary = limits.get("primary") if isinstance(limits, dict) else None
+    if isinstance(primary, dict):
+        used = primary.get("usedPercent")
+        window = int(primary.get("windowDurationMins") or 0)
+        reset = primary.get("resetsAt")
+        label = f"{window // 1440}d" if window >= 1440 else f"{window // 60}h"
+        reset_text = ""
+        if reset:
+            reset_text = " · resets " + time.strftime(
+                "%a %-d %b, %-I:%M %p", time.localtime(int(reset))
+            )
+        lines.append(f"Plan window ({label}): {used}% used{reset_text}")
+    if len(lines) == 1:
+        lines.append("No token or rate-limit telemetry has arrived yet.")
+    return "\n".join(lines)
+
+
 def extract_last_reply(transcript_path):
     """Last assistant text from a Claude Code session transcript (jsonl)."""
     reply = ""
@@ -1831,6 +2132,19 @@ def worker_busy_text(screen):
     ))
 
 
+def screen_has_active_goal(screen):
+    """Whether the live Codex footer says this thread owns a persistent goal.
+
+    Persistent goals deliberately return to an idle composer between automatic
+    continuation turns. Treating that brief idle state as ordinary inactivity
+    kills a multi-day goal as soon as its wall-clock idle deadline has already
+    elapsed. Only inspect the live tail so a historical footer in scrollback
+    cannot keep an unrelated session alive forever.
+    """
+    tail = "\n".join((screen or "").splitlines()[-8:])
+    return "pursuing goal" in tail.lower()
+
+
 def screen_is_compacting(screen):
     """True when a worker pane is mid-compaction — a manual /compact or an
     auto-compact. The input box is being redrawn, so a paste lands in that
@@ -1946,14 +2260,30 @@ def codex_status_tag(screen):
     return label + (" · Fast on" if fast_on else " · Fast off")
 
 
-def worker_model_tag(name, harness):
+def app_server_model_tag(state):
+    """Build a Discord reply label from structured app-server state."""
+    if not isinstance(state, dict) or state.get("backend") != "app-server":
+        return None
+    label = "Codex"
+    if state.get("model"):
+        label += " · " + str(state["model"])
+    if state.get("effort"):
+        label += " " + str(state["effort"]).lower()
+    return label + (" · Fast on" if state.get("service_tier") == "priority"
+                    else " · Fast off")
+
+
+def worker_model_tag(name, harness, host_target=None):
     """Short engine/model/speed label for a worker's Discord reply."""
     if harness not in ("codex", "antigravity"):
         return "Claude"
     if harness == "antigravity":
         return "Antigravity"
+    structured = app_server_model_tag(worker_inspect(name, host_target))
+    if structured:
+        return structured
     try:
-        screen = worker_screen(name, 40)
+        screen = worker_screen(name, 40, host_target=host_target)
     except Exception:
         return "Codex"
     return codex_status_tag(screen) or "Codex"
@@ -2082,10 +2412,10 @@ def render_screen_png(text, path):
 
 
 def worker_start(name, directory, channel_id, resume, profile="owner",
-                 harness="claude", host_target=None):
+                 harness="claude", host_target=None, backend=None):
     return run_worker_cmd(
         host_target,
-        start_args(name, directory, channel_id, resume, profile, harness),
+        start_args(name, directory, channel_id, resume, profile, harness, backend),
         timeout=180,
     )
 
@@ -2095,6 +2425,19 @@ def worker_send(name, text, typed=False, host_target=None):
     if typed:
         args.append("--type")
     return run_worker_cmd(host_target, args + [text], timeout=30)
+
+
+def worker_inspect(name, host_target=None):
+    """Structured worker state, or None for a legacy/TUI worker."""
+    r = run_worker_cmd(host_target, ["agent-worker", "inspect", name], timeout=15)
+    if r.returncode != 0:
+        return None
+    try:
+        payload = json.loads(r.stdout)
+    except (TypeError, ValueError):
+        return None
+    state = payload.get("state") if isinstance(payload, dict) else None
+    return state if isinstance(state, dict) else None
 
 
 def worker_key(name, *keys, host_target=None):
@@ -2169,6 +2512,49 @@ def should_resume(has_state, fresh):
     """Resume the prior conversation only with saved state and no armed fresh
     start."""
     return has_state and not fresh
+
+
+def active_turn_path(name, state_root=None):
+    return os.path.join(state_root or STATE_ROOT, name, "active-turn")
+
+
+def active_turn_pending(name, state_root=None, host_target=None):
+    """Whether a delivered turn has not reached its completion hook yet.
+
+    The marker is durable across a host reboot. It is intentionally separate
+    from tmux liveness: tmux-resurrect can recreate a cw-* shell after boot,
+    but that shell is not the Claude/Codex process which owned the turn.
+    """
+    if host_target is not None:
+        r = run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "active"], timeout=15)
+        return r.returncode == 0
+    return os.path.isfile(active_turn_path(name, state_root))
+
+
+def mark_active_turn(name, state_root=None, host_target=None):
+    if host_target is not None:
+        return run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "active-mark"],
+            timeout=15,
+        ).returncode == 0
+    path = active_turn_path(name, state_root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+    return True
+
+
+def clear_active_turn(name, state_root=None, host_target=None):
+    if host_target is not None:
+        return run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "active-clear"],
+            timeout=15,
+        ).returncode == 0
+    try:
+        os.remove(active_turn_path(name, state_root))
+    except FileNotFoundError:
+        pass
+    return True
 
 
 def remove_worker_state(name, state_root=None):
@@ -2297,7 +2683,7 @@ def consume_handoff(name, state_root=None, now=None):
 # --------------------------------------------------------------------------
 
 
-def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
+def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtime
     import logging
 
     import aiohttp
@@ -2333,6 +2719,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     priced_path = {}    # worker name -> transcript path last priced for it
     limit_watchers = {} # worker name -> provider-limit polling task
     limit_noticed = {}  # worker name -> reset hint already posted
+    recovering = set()  # workers currently being relaunched after interruption
+    progress_cards = {} # (channel id, worker) -> (turn id, Discord message)
     if pricing is None:
         print(f"[bridge] no pricing table at {PRICING_FILE} — cost budgets off")
 
@@ -2504,6 +2892,16 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         while time.time() < deadline:
             if not await asyncio.to_thread(worker_alive, name, host_target):
                 return False
+            state = await asyncio.to_thread(worker_inspect, name, host_target)
+            if state and state.get("backend") == "app-server":
+                if state.get("ready") and state.get("status") != "starting":
+                    stable += 1
+                    if stable >= 2:
+                        return True
+                else:
+                    stable = 0
+                await asyncio.sleep(2)
+                continue
             screen = await asyncio.to_thread(worker_screen, name, 40, False, host_target)
             if screen_is_ready(screen, harness):
                 stable += 1
@@ -2532,6 +2930,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 
     async def post(channel_id, text, attachments=None):
         channel = client.get_channel(channel_id)
+        if channel is None and event_only:
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except discord.HTTPException:
+                channel = None
         if channel is None:
             print(f"[bridge] unknown channel {channel_id}, dropping message")
             return
@@ -2627,6 +3030,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not await asyncio.to_thread(worker_alive, name, target):
             return f"📊 `{name}` isn't running right now.", None
         harness = harness_of(name)
+        state = await asyncio.to_thread(worker_inspect, name, target)
+        if state:
+            return format_app_server_usage(name, state), None
         if harness in ("codex", "antigravity"):
             # Only Claude's usage panel is parseable here. Codex's is a
             # different panel whose slash form can *spend* a usage-limit reset,
@@ -2698,6 +3104,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if not channel_id:
             return False
         target = resolve_host_target(cfg, repo_by_name(name))
+        # app-server reports a typed usageLimitExceeded error with its turn-end
+        # event. Avoid stale terminal scraping on that structured path.
+        if await asyncio.to_thread(worker_inspect, name, target):
+            return False
         if screen is None:
             screen = await asyncio.to_thread(worker_screen, name, 80, False, target)
         hint = provider_usage_limit_notice(screen)
@@ -2715,6 +3125,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 f"continue. {hint} Switch model/harness or retry after the "
                 "reset; the configured model was not changed.",
             )
+        # This turn is definitively refused, not merely interrupted. Do not
+        # resurrect it after a later host reboot and hammer the same limit.
+        await asyncio.to_thread(clear_active_turn, name, None, target)
         return True
 
     async def watch_provider_limit(name, channel_id, baseline_hint=None):
@@ -2724,6 +3137,8 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         stale_hint = baseline_hint
         target = resolve_host_target(cfg, repo_by_name(name))
         try:
+            if await asyncio.to_thread(worker_inspect, name, target):
+                return
             # A turn may legitimately run for hours. The normal Stop event
             # cancels this task; this long ceiling only bounds a missing-hook
             # failure without abandoning long agent work.
@@ -2776,6 +3191,69 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         if clear_notice:
             limit_noticed.pop(name, None)
 
+    async def recover_interrupted_worker(repo):
+        """Resume and re-steer one turn that died without a completion hook."""
+        name = repo["name"]
+        if name in recovering:
+            return
+        target = resolve_host_target(cfg, repo)
+        if not await asyncio.to_thread(
+                active_turn_pending, name, None, target):
+            return
+        if await asyncio.to_thread(worker_alive, name, target):
+            return
+        channel_id = channel_for_worker(name)
+        if not channel_id:
+            return
+        recovering.add(name)
+        try:
+            print(f"[bridge] {name}: interrupted turn found; resuming worker")
+            r = await asyncio.to_thread(
+                worker_start, name, repo["dir"], channel_id,
+                should_resume(
+                    worker_has_state(name, host_target=target),
+                    fresh_pending(name, host_target=target),
+                ),
+                repo.get("profile", "owner"), harness_for(repo), target,
+                codex_backend_for(cfg, repo),
+            )
+            if r.returncode != 0:
+                print(f"[bridge] {name}: recovery start failed: "
+                      f"{r.stderr.strip()[-400:]}")
+                return
+            await asyncio.to_thread(disarm_fresh, name, None, target)
+            # Codex goals resume themselves and can already be working by the
+            # time agent-worker's startup probe returns. That is successful
+            # recovery: do not wait for idle (or stop it after a timeout) and
+            # do not inject a duplicate continuation prompt.
+            screen = await asyncio.to_thread(
+                worker_screen, name, 40, False, target)
+            if worker_busy_text(screen):
+                last_activity[name] = time.time()
+                print(f"[bridge] {name}: interrupted turn resumed automatically")
+                return
+            if not await wait_ready(name, host_target=target):
+                print(f"[bridge] {name}: recovered worker never became ready")
+                # Make the next periodic pass retry rather than leaving a
+                # resumed-but-unsteered TUI indefinitely. worker_stop clears
+                # the marker, so restore it after the deliberate cleanup.
+                await asyncio.to_thread(worker_stop, name, target)
+                await asyncio.to_thread(mark_active_turn, name, None, target)
+                return
+            if await deliver(name, RECOVERY_PROMPT):
+                last_activity[name] = time.time()
+                print(f"[bridge] {name}: interrupted turn resumed automatically")
+            else:
+                print(f"[bridge] {name}: recovery prompt could not be delivered")
+        finally:
+            recovering.discard(name)
+
+    async def recover_interrupted_workers(delay=0):
+        if delay:
+            await asyncio.sleep(delay)
+        for repo in list(cfg["repos"].values()):
+            await recover_interrupted_worker(repo)
+
     async def scan_existing_provider_limits():
         """Recover quota screens that predate a bridge restart/reconnect."""
         for repo in cfg["repos"].values():
@@ -2787,14 +3265,17 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 await notify_provider_limit(name, channel_for_worker(name))
 
     async def deliver(name, text, message=None, typed=False, tag=None):
-        # Messages go straight in even mid-turn — Claude Code (and Codex) queue
-        # typed-while-running input as steering, which is what check-ins and
-        # course corrections need. A ✅ confirms the message was delivered,
-        # whether the worker was idle or mid-turn (a queued steer still sent).
+        # Messages go straight in even mid-turn: app-server applies them to the
+        # active turn with turn/steer. This is steering, not a deferred
+        # follow-up queue. A ↪ reaction distinguishes that from ✅ on a new
+        # turn so Discord communicates the same state as a coding-focused UI.
         last_activity[name] = time.time()
         repo = repo_by_name(name)
         target = resolve_host_target(cfg, repo)
-        screen = await asyncio.to_thread(worker_screen, name, 30, False, target)
+        app_state = await asyncio.to_thread(worker_inspect, name, target)
+        was_active = bool(app_state and app_state.get("active_turn_id"))
+        screen = "" if app_state else await asyncio.to_thread(
+            worker_screen, name, 30, False, target)
         # A worker mid-compaction (manual /compact or an auto-compact) is
         # redrawing its input box; a paste — and the message pointing Claude at
         # a just-saved attachment — lands in that transient state and is
@@ -2812,7 +3293,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return False
         text = tag_inbound(text, typed, tag)
         r = await asyncio.to_thread(worker_send, name, text, typed, target)
-        if r.returncode != 0:
+        if r.returncode != 0 and not app_state:
             # A send that lands exactly on a turn boundary can wedge in the
             # TUI's queued-message state (displayed but never submitted, even
             # with Enter retries). Recover deterministically: restart the
@@ -2837,6 +3318,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                         fresh_pending(name, host_target=target),
                     ),
                     repo.get("profile", "owner"), harness_for(repo), target,
+                    codex_backend_for(cfg, repo),
                 )
                 if r2.returncode == 0:
                     await asyncio.to_thread(disarm_fresh, name, None, target)
@@ -2849,9 +3331,18 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if message:
                 await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
             return False
-        arm_limit_watcher(name, screen)
+        # Slash commands operate the TUI but are not agent turns. For a real
+        # prompt, persist the in-flight state only after delivery succeeded.
+        # App-server owns this marker directly from turn/started so an
+        # ultra-short turn cannot race a post-send mark; TUI workers retain the
+        # bridge-owned marker. Completion settles it, while a hard death leaves
+        # it for automatic recovery on the next startup/reaper pass.
+        if not typed and not app_state:
+            await asyncio.to_thread(mark_active_turn, name, None, target)
+        if not app_state:
+            arm_limit_watcher(name, screen)
         if message:
-            await message.add_reaction("✅")
+            await message.add_reaction("↪" if was_active else "✅")
         return True
 
     async def fetch_attachment(att, dest):
@@ -2977,6 +3468,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             r = await asyncio.to_thread(
                 worker_start, name, directory, message.channel.id, resume,
                 repo.get("profile", "owner"), harness, target,
+                codex_backend_for(cfg, repo),
             )
             if r.returncode != 0:
                 await message.channel.send(
@@ -3060,9 +3552,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         Discord delivery gets the tag on its first chunk and not its
         continuation chunks.
         """
-        harness = harness_for(repo_by_name(name))
+        repo = repo_by_name(name)
+        harness = harness_for(repo)
+        target = resolve_host_target(cfg, repo)
         try:
-            label = await asyncio.to_thread(worker_model_tag, name, harness)
+            label = await asyncio.to_thread(worker_model_tag, name, harness, target)
         except Exception:
             label = "Codex" if harness == "codex" else ("Antigravity" if harness == "antigravity" else "Claude")
         return f"-# 🤖 {label}\n{text}"
@@ -3120,6 +3614,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_for_worker(name), True,
             repo.get("profile", "owner"), harness_for(repo), target,
+            codex_backend_for(cfg, repo),
         )
         # Explicit resume: cancel any armed fresh so it can't re-fire.
         await asyncio.to_thread(disarm_fresh, name, None, target)
@@ -3143,6 +3638,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         r = await asyncio.to_thread(
             worker_start, name, repo["dir"], channel_id, False,
             repo.get("profile", "owner"), harness, target,
+            codex_backend_for(cfg, repo),
         )
         await asyncio.to_thread(disarm_fresh, name, None, target)
         if r.returncode != 0:
@@ -3902,6 +4398,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         print(f"[bridge] connected to Discord as {client.user} "
               f"({len(cfg['repos'])} repo channel(s) mapped, {synced} slash command(s))")
         asyncio.create_task(scan_existing_provider_limits())
+        # tmux-continuum restores pane layouts asynchronously at boot. Let it
+        # finish, then replace any shell-only cw-* placeholder whose durable
+        # active-turn marker says real work was interrupted.
+        asyncio.create_task(recover_interrupted_workers(
+            RECOVERY_STARTUP_DELAY_SECONDS))
 
     @client.event
     async def on_message(message):
@@ -4001,12 +4502,68 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         worker = event.get("worker", "")
         if worker:
             notified.add(worker)
+            # Direct progress messages are real worker activity. Previously
+            # only inbound prompts and turn-end hooks refreshed this clock, so
+            # a long Codex goal that reported through discord-notify could be
+            # stopped as "idle" immediately after finishing a continuation.
+            last_activity[worker] = time.time()
         channel_id = worker_notification_channel(cfg, worker, event.get("chat", ""))
         content = event.get("content") or ""
         if channel_id and (content or attachments):
             if worker:
                 content = await tag_reply(worker, content)
             await post(channel_id, content, attachments)
+
+    async def dispatch_worker_progress(event):
+        """Create/edit one structured activity card for each app-server turn."""
+        name = (event.get("worker") or "").strip()
+        channel_id = worker_notification_channel(cfg, name, event.get("chat", ""))
+        if not name or not channel_id:
+            return
+        # A separately launched event-only bridge is deliberately outbound
+        # only. Reject events for workers outside its explicit config mapping;
+        # an HMAC-valid production event must not leak into a preview channel.
+        if event_only and channel_for_worker(name) != channel_id:
+            print(f"[bridge] unmapped event-only worker {name!r}, dropping update")
+            return
+        channel = client.get_channel(channel_id)
+        if channel is None and event_only:
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except discord.HTTPException:
+                channel = None
+        if channel is None:
+            print(f"[bridge] unknown progress channel {channel_id}, dropping update")
+            return
+        last_activity[name] = time.time()
+        key = (channel_id, name)
+        turn_id = event.get("turn_id")
+        status = str(event.get("status") or "active")
+        terminal = status in ("completed", "interrupted", "failed", "cancelled")
+        current = progress_cards.get(key)
+        embed = discord.Embed.from_dict(worker_progress_embed(event))
+        try:
+            if current and current[0] == turn_id:
+                await current[1].edit(
+                    content=None, embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+                message = current[1]
+            elif terminal:
+                # A terminal update can race bridge startup and have no live card.
+                message = await channel.send(
+                    embed=embed, allowed_mentions=discord.AllowedMentions.none()
+                )
+            else:
+                message = await channel.send(
+                    embed=embed, allowed_mentions=discord.AllowedMentions.none()
+                )
+            if terminal:
+                progress_cards.pop(key, None)
+            else:
+                progress_cards[key] = (turn_id, message)
+        except discord.HTTPException as exc:
+            print(f"[bridge] progress update for {name} failed: {exc}")
 
     async def handle_multipart_event(request):
         """A remote worker whose files the bridge can't read off disk uploads
@@ -4119,13 +4676,23 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             return web.json_response({"error": "bad json"}, status=400)
 
         etype = event.get("event_type", "")
-        if etype == "claude.worker.turn_ended":
+        if etype == "claude.worker.progress":
+            await dispatch_worker_progress(event)
+        elif etype == "claude.worker.turn_ended":
             name = event.get("worker", "")
             channel_id = worker_notification_channel(
                 cfg, name, event.get("chat", "")
             )
             path = event.get("transcript_path", "")
             last_activity[name] = time.time()
+            goal = event.get("goal") or {}
+            if (event.get("backend") != "app-server"
+                    and not (isinstance(goal, dict)
+                             and goal.get("status") in ("active", "paused"))):
+                await asyncio.to_thread(
+                    clear_active_turn, name, None,
+                    resolve_host_target(cfg, repo_by_name(name)),
+                )
             # Serialize per transcript: two Stop-hook events for one worker can
             # land within the retry window below, and without the lock both read
             # the same pre-advance offset and post the reply twice.
@@ -4134,7 +4701,20 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 # A provider quota refusal can either fire Stop with an empty
                 # reply or strand the TUI without firing Stop at all. Check the
                 # first case here; a per-turn watcher covers the second.
-                limit_hit = await notify_provider_limit(name, channel_id)
+                if event.get("error_kind") == "usageLimitExceeded":
+                    limit_hit = True
+                    error = event.get("error") or {}
+                    detail = _progress_text(error.get("message") or
+                                            "The provider rejected this turn.", 500)
+                    if limit_noticed.get(name) != detail and channel_id:
+                        limit_noticed[name] = detail
+                        await post(
+                            channel_id,
+                            f"⛔ `{name}` hit the provider's usage limit and could "
+                            f"not continue. {detail}",
+                        )
+                else:
+                    limit_hit = await notify_provider_limit(name, channel_id)
                 watcher = limit_watchers.pop(name, None)
                 if watcher:
                     watcher.cancel()
@@ -4428,6 +5008,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             r = await asyncio.to_thread(
                 worker_start, name, repo["dir"], channel_id, resume,
                 repo.get("profile", "owner"), harness, target,
+                codex_backend_for(cfg, repo),
             )
             if r.returncode != 0:
                 return web.json_response({"error": r.stderr.strip()[-400:]}, status=500)
@@ -4480,6 +5061,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             worker = event.get("worker", "")
             if worker:
                 notified.add(worker)
+                last_activity[worker] = time.time()
             channel_id = worker_notification_channel(
                 cfg, worker, event.get("chat", "")
             )
@@ -4494,6 +5076,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     async def reaper():
         while True:
             await asyncio.sleep(60)
+            # Also acts as the crash-recovery retry loop. Normal idle workers
+            # have no active-turn marker and are untouched.
+            await recover_interrupted_workers()
             # Prune bookkeeping for transcripts that no longer exist — /clear,
             # /fresh and /close all leave their old path's entry stranded (the
             # dicts are keyed by transcript path, not worker name), an otherwise
@@ -4524,18 +5109,28 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 if last is None or time.time() - last < idle_s:
                     continue
                 target = resolve_host_target(cfg, repo)
-                if await asyncio.to_thread(worker_alive, name, target) and not (
-                    await asyncio.to_thread(worker_busy, name, target)
-                ):
-                    await asyncio.to_thread(worker_stop, name, target)
-                    last_activity.pop(name, None)
-                    channel_id = channel_for_worker(name)
-                    if channel_id:
-                        await post(
-                            channel_id,
-                            f"💤 `{name}` idle for {cfg['idle_minutes']}m — stopped. "
-                            "Your next message resumes the conversation.",
-                        )
+                if not await asyncio.to_thread(worker_alive, name, target):
+                    continue
+                state = await asyncio.to_thread(worker_inspect, name, target)
+                screen = "" if state else await asyncio.to_thread(
+                    worker_screen, name, 30, False, target)
+                goal = (state or {}).get("goal") or {}
+                if ((state and state.get("status") == "active")
+                    or worker_busy_text(screen) or (
+                        harness_for(repo) == "codex"
+                        and (screen_has_active_goal(screen)
+                             or goal.get("status") in ("active", "paused"))
+                    )):
+                    continue
+                await asyncio.to_thread(worker_stop, name, target)
+                last_activity.pop(name, None)
+                channel_id = channel_for_worker(name)
+                if channel_id:
+                    await post(
+                        channel_id,
+                        f"💤 `{name}` idle for {cfg['idle_minutes']}m — stopped. "
+                        "Your next message resumes the conversation.",
+                    )
 
     async def main():
         app = web.Application(client_max_size=MAX_REQUEST_BYTES)
@@ -4545,9 +5140,19 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         await runner.setup()
         site = web.TCPSite(runner, cfg["listen_host"], int(cfg["listen_port"]))
         await site.start()
-        print(f"[bridge] event listener on {cfg['listen_host']}:{cfg['listen_port']}")
-        asyncio.create_task(reaper())
-        await client.start(token)
+        mode = "event-only preview" if event_only else "gateway"
+        print(f"[bridge] event listener on {cfg['listen_host']}:{cfg['listen_port']} ({mode})")
+        if event_only:
+            # Authenticated REST without a second Gateway session: safe beside
+            # production because it cannot consume inbound Discord messages.
+            await client.login(token)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await client.close()
+        else:
+            asyncio.create_task(reaper())
+            await client.start(token)
 
     asyncio.run(main())
 
@@ -4555,5 +5160,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default=CONFIG_PATH)
+    parser.add_argument(
+        "--event-only", action="store_true",
+        help="post signed worker events via REST without a Discord Gateway session",
+    )
     args = parser.parse_args()
-    run_bridge(args.config)
+    run_bridge(args.config, event_only=args.event_only)

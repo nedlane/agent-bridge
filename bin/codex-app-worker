@@ -1,0 +1,1254 @@
+#!/usr/bin/env python3
+"""Persistent Codex app-server worker with a tmux-compatible terminal.
+
+This process is the Codex backend for ``agent-worker``.  It owns one
+``codex app-server`` child over the stable stdio JSON-RPC transport, persists
+the Codex thread id, exposes a small Unix-socket control API to the bridge, and
+renders structured activity to stdout.  Running it inside the existing cw-*
+tmux session preserves screen/log/interactive web-console compatibility while
+removing terminal scraping from the control path.
+
+The control protocol is one JSON object per Unix-socket connection and one
+JSON response.  It is intentionally host-local and the socket is mode 0600.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import hashlib
+import hmac
+import json
+import os
+import re
+import shlex
+import signal
+import sys
+import time
+import traceback
+import urllib.error
+import urllib.request
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+
+APP_SERVER_STATE = "app-server.json"
+CONTROL_SOCKET = "control.sock"
+EVENT_LOG = "app-server-events.jsonl"
+WEBHOOK_FILE = "bridge-webhook"
+ACTIVE_MARKER = "active-turn"
+MAX_CONTROL_BYTES = 2 * 1024 * 1024
+MAX_EVENT_LOG_BYTES = 25 * 1024 * 1024
+PROGRESS_INTERVAL = 2.0
+ACTIVITY_LIMIT = 8
+HIGH_VOLUME_EVENTS = {
+    "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
+    "item/reasoning/summaryTextDelta",
+}
+
+API_KEY_ENV = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_ORGANIZATION",
+    "CODEX_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+)
+
+
+class RpcError(RuntimeError):
+    def __init__(self, method: str, error: Any):
+        self.method = method
+        self.error = error
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        super().__init__(f"{method}: {message}")
+
+
+def now_iso() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def read_kv(path: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            if "=" not in raw or raw.lstrip().startswith("#"):
+                continue
+            key, _, value = raw.partition("=")
+            result[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return result
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        os.chmod(tmp, 0o600)
+        json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|authorization)"
+    r"\b\s*[=:]\s*)"
+    r"([^\s'\"]+|'[^']*'|\"[^\"]*\")"
+)
+_SECRET_FLAG = re.compile(
+    r"(?i)(--?[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password)\s+)([^\s]+)"
+)
+_AUTH_HEADER = re.compile(
+    r"(?i)(\bauthorization\s*:\s*(?:bearer|basic)\s+)([^\s'\"]+)"
+)
+
+
+def redact_command(command: str, limit: int = 220) -> str:
+    """Make a command suitable for a Discord progress card.
+
+    Command output is never sent to progress cards.  The command itself is
+    useful context, but common inline credential forms are redacted first.
+    """
+    value = " ".join((command or "").split())
+    # Redact before parsing/unwrapping: a secret may contain shell syntax that
+    # changes how shlex tokenizes the display string.
+    value = _AUTH_HEADER.sub(r"\1[redacted]", value)
+    value = _SECRET_ASSIGNMENT.sub(r"\1[redacted]", value)
+    value = _SECRET_FLAG.sub(r"\1[redacted]", value)
+    # app-server commonly reports commands through its shell wrapper. Showing
+    # `/usr/bin/zsh -lc "..."` on every row is implementation noise, not
+    # useful activity. Unwrap only the exact argv shape; malformed quoting
+    # simply falls back to the original safe display.
+    with contextlib.suppress(ValueError):
+        argv = shlex.split(value)
+        if (len(argv) == 3 and argv[1] == "-lc"
+                and os.path.basename(argv[0]) in {
+                    "sh", "bash", "zsh", "dash", "fish",
+                }):
+            value = " ".join(argv[2].split())
+    if len(value) > limit:
+        value = value[: limit - 1] + "…"
+    return value
+
+
+def diff_stats(diff: str) -> dict[str, int]:
+    files: set[str] = set()
+    additions = deletions = 0
+    for line in (diff or "").splitlines():
+        if line.startswith("+++ b/"):
+            files.add(line[6:])
+        elif line.startswith("--- a/"):
+            files.add(line[6:])
+        elif line.startswith("+") and not line.startswith("+++"):
+            additions += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            deletions += 1
+    return {"files": len(files), "additions": additions, "deletions": deletions}
+
+
+def summarize_item(item: dict[str, Any], completed: bool = False) -> str | None:
+    """Return one concise, non-output activity line for a ThreadItem."""
+    kind = item.get("type")
+    if kind == "commandExecution":
+        command = redact_command(item.get("command") or "")
+        if completed:
+            code = item.get("exitCode")
+            duration = item.get("durationMs")
+            suffix = f"exit {code}" if code is not None else str(item.get("status") or "done")
+            if isinstance(duration, (int, float)):
+                suffix += f", {duration / 1000:.1f}s"
+            return f"Command finished ({suffix}): `{command}`"
+        return f"Running: `{command}`"
+    if kind == "fileChange":
+        paths = [str(c.get("path")) for c in item.get("changes") or [] if c.get("path")]
+        shown = ", ".join(f"`{p}`" for p in paths[:3]) or "files"
+        if len(paths) > 3:
+            shown += f" +{len(paths) - 3} more"
+        return ("Updated " if completed else "Editing ") + shown
+    if kind == "mcpToolCall":
+        label = ".".join(str(x) for x in (item.get("server"), item.get("tool")) if x)
+        return ("Tool finished: " if completed else "Using tool: ") + (label or "MCP")
+    if kind == "dynamicToolCall":
+        return ("Tool finished: " if completed else "Using tool: ") + str(item.get("tool") or "dynamic tool")
+    if kind == "collabToolCall":
+        tool = str(item.get("tool") or "agent coordination")
+        return ("Agent task finished: " if completed else "Coordinating agents: ") + tool
+    if kind == "webSearch":
+        query = " ".join(str(item.get("query") or "").split())[:180]
+        return ("Search finished: " if completed else "Searching: ") + (query or "web")
+    if kind == "imageView":
+        return f"Inspecting image: `{item.get('path') or 'image'}`"
+    if kind == "contextCompaction":
+        return "Compacted conversation context" if completed else "Compacting conversation context"
+    if kind == "enteredReviewMode":
+        return "Reviewing changes"
+    if kind == "exitedReviewMode":
+        return "Review complete"
+    return None
+
+
+def command_activity_label(command: str, completed: bool = False) -> str:
+    """Translate common shell operations into intent, like coding UIs do."""
+    lower = command.lower().strip()
+    done = completed
+    if re.search(r"(^|[;&| /])(pytest|unittest|vitest|jest)( |$)", lower) \
+            or re.search(r"(^|[;&| ])(cargo|go) test( |$)", lower):
+        return "Tests completed" if done else "Running tests"
+    if re.search(r"(^|[;&| /])(ruff|eslint|shellcheck|mypy|pyright|tsc)( |$)", lower):
+        return "Checks completed" if done else "Running checks"
+    if re.search(r"(^|[;&| ]+)(rg|grep)( |$)", lower):
+        return "Search completed" if done else "Searching the codebase"
+    if re.search(r"(^|[;&| ]+)(sed|nl|head|tail)( |$)", lower):
+        return "Source inspected" if done else "Reading source"
+    if re.search(r"(^|[;&| ]+)(ls|find|tree)( |$)", lower) or "rg --files" in lower:
+        return "Files inventoried" if done else "Exploring files"
+    if re.search(r"(^|[;&| ]+)git (status|diff|log|show)( |$)", lower):
+        return "Changes inspected" if done else "Inspecting changes"
+    return "Command completed" if done else "Running command"
+
+
+def activity_item(item: dict[str, Any], completed: bool = False) -> dict[str, Any] | None:
+    """Structured, presentation-neutral activity for Discord and future UIs."""
+    kind = item.get("type")
+    status = "completed" if completed else "running"
+    activity: dict[str, Any] = {
+        "id": str(item.get("id") or ""), "kind": kind or "activity",
+        "status": status,
+    }
+    if kind == "commandExecution":
+        command = redact_command(item.get("command") or "", 360)
+        activity.update({
+            "kind": "command", "label": command_activity_label(command, completed),
+            "detail": command,
+        })
+        if completed:
+            meta = []
+            if item.get("exitCode") is not None:
+                meta.append(f"exit {item['exitCode']}")
+            if isinstance(item.get("durationMs"), (int, float)):
+                meta.append(f"{item['durationMs'] / 1000:.1f}s")
+            activity["meta"] = " · ".join(meta)
+        return activity
+    if kind == "fileChange":
+        paths = [str(c.get("path")) for c in item.get("changes") or [] if c.get("path")]
+        activity.update({
+            "kind": "file", "label": "Files updated" if completed else "Editing files",
+            "paths": paths[:5], "meta": f"{len(paths)} file{'s' if len(paths) != 1 else ''}",
+        })
+        return activity
+    if kind in ("mcpToolCall", "dynamicToolCall"):
+        tool = ".".join(str(x) for x in (item.get("server"), item.get("tool")) if x)
+        activity.update({
+            "kind": "tool", "label": "Tool completed" if completed else "Using tool",
+            "detail": tool or "tool",
+        })
+        return activity
+    if kind == "webSearch":
+        activity.update({
+            "kind": "search", "label": "Web search completed" if completed else "Searching the web",
+            "detail": " ".join(str(item.get("query") or "").split())[:300],
+        })
+        return activity
+    legacy = summarize_item(item, completed)
+    if legacy:
+        activity.update({"label": legacy})
+        return activity
+    return None
+
+
+def usage_totals(token_usage: dict[str, Any]) -> dict[str, int] | None:
+    total = (token_usage or {}).get("total")
+    if not isinstance(total, dict):
+        return None
+    try:
+        raw_input = int(total.get("inputTokens") or 0)
+        cached = int(total.get("cachedInputTokens") or 0)
+        return {
+            "input": max(0, raw_input - cached),
+            "cache_read": cached,
+            "cache_write": int(total.get("cacheWriteInputTokens") or 0),
+            "output": int(total.get("outputTokens") or 0)
+            + int(total.get("reasoningOutputTokens") or 0),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def error_kind(error: Any) -> str | None:
+    if not isinstance(error, dict):
+        return None
+    info = error.get("codexErrorInfo")
+    if isinstance(info, str):
+        return info
+    if isinstance(info, dict) and info:
+        return next(iter(info))
+    return None
+
+
+class AppServerClient:
+    def __init__(self, argv: list[str], env: dict[str, str], notification_cb):
+        self.argv = argv
+        self.env = env
+        self.notification_cb = notification_cb
+        self.proc: asyncio.subprocess.Process | None = None
+        self.pending: dict[int, tuple[str, asyncio.Future]] = {}
+        self.next_id = 1
+        self.reader_task: asyncio.Task | None = None
+        self.stderr_task: asyncio.Task | None = None
+        self.write_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        self.proc = await asyncio.create_subprocess_exec(
+            *self.argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self.env,
+        )
+        self.reader_task = asyncio.create_task(self._reader())
+        self.stderr_task = asyncio.create_task(self._stderr())
+
+    async def _send(self, payload: dict[str, Any]) -> None:
+        if not self.proc or not self.proc.stdin:
+            raise RuntimeError("app-server is not running")
+        data = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+        async with self.write_lock:
+            self.proc.stdin.write(data)
+            await self.proc.stdin.drain()
+
+    async def request(self, method: str, params: dict[str, Any] | None = None,
+                      timeout: float = 60) -> Any:
+        request_id = self.next_id
+        self.next_id += 1
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = (method, future)
+        await self._send({"method": method, "id": request_id, "params": params or {}})
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self.pending.pop(request_id, None)
+
+    async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        await self._send({"method": method, "params": params or {}})
+
+    async def _reader(self) -> None:
+        assert self.proc and self.proc.stdout
+        try:
+            while line := await self.proc.stdout.readline():
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    print(f"[app-server invalid JSON] {line.decode(errors='replace').rstrip()}", flush=True)
+                    continue
+                if "id" in message and ("result" in message or "error" in message):
+                    pending = self.pending.get(message["id"])
+                    if pending:
+                        request_method, future = pending
+                    else:
+                        request_method, future = "request", None
+                    if future and not future.done():
+                        if "error" in message:
+                            future.set_exception(RpcError(request_method, message["error"]))
+                        else:
+                            future.set_result(message.get("result"))
+                    continue
+                if "id" in message and "method" in message:
+                    asyncio.create_task(self._server_request(message))
+                    continue
+                if "method" in message:
+                    try:
+                        await self.notification_cb(
+                            message["method"], message.get("params") or {}
+                        )
+                    except Exception:
+                        print(
+                            f"[app-server notification failed] {message['method']}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        traceback.print_exc()
+        finally:
+            failure = RuntimeError("codex app-server exited")
+            for _, future in list(self.pending.values()):
+                if not future.done():
+                    future.set_exception(failure)
+
+    async def _server_request(self, message: dict[str, Any]) -> None:
+        method = message.get("method")
+        request_id = message.get("id")
+        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+            result = {"decision": "decline"}
+        elif method in ("applyPatchApproval", "execCommandApproval"):
+            result = {"decision": {"denied": {"rejection": "agent-bridge runs non-interactively"}}}
+        elif method == "item/tool/requestUserInput":
+            result = {"answers": {}}
+        elif method == "mcpServer/elicitation/request":
+            result = {"action": "decline"}
+        elif method == "item/tool/call":
+            result = {"contentItems": [{"type": "inputText", "text": "Client tool unavailable"}], "success": False}
+        elif method == "fuzzyFileSearch":
+            result = {"files": []}
+        else:
+            await self._send({
+                "id": request_id,
+                "error": {"code": -32601, "message": f"Unsupported client request: {method}"},
+            })
+            return
+        await self._send({"id": request_id, "result": result})
+
+    async def _stderr(self) -> None:
+        assert self.proc and self.proc.stderr
+        while line := await self.proc.stderr.readline():
+            print(f"[app-server] {line.decode(errors='replace').rstrip()}", flush=True)
+
+    async def close(self) -> None:
+        if self.proc and self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 5)
+            except asyncio.TimeoutError:
+                self.proc.kill()
+                await self.proc.wait()
+        for task in (self.reader_task, self.stderr_task):
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+
+class CodexAppWorker:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.name = args.name
+        self.cwd = os.path.abspath(args.dir)
+        self.state_dir = Path(args.state_dir).resolve()
+        self.state_file = self.state_dir / APP_SERVER_STATE
+        self.socket_path = self.state_dir / CONTROL_SOCKET
+        self.event_log = self.state_dir / EVENT_LOG
+        self.chat = args.chat or ""
+        self.state = load_json(self.state_file)
+        self.state.update({
+            "backend": "app-server",
+            "name": self.name,
+            "cwd": self.cwd,
+            "ready": False,
+            "status": "starting",
+            "active_turn_id": None,
+            "last_error": None,
+            "updated_at": now_iso(),
+        })
+        self.state.setdefault("activities", [])
+        self.state.setdefault("plan", [])
+        self.state.setdefault("diff", {"files": 0, "additions": 0, "deletions": 0})
+        self.state.setdefault("service_tier", None)
+        self.activities: deque[Any] = deque(
+            self.state.get("activities") or [], maxlen=ACTIVITY_LIMIT
+        )
+        self.client: AppServerClient | None = None
+        self.control_server: asyncio.AbstractServer | None = None
+        self.stop_event = asyncio.Event()
+        self.turn_started_at: float | None = None
+        self.final_reply = ""
+        self.reasoning_summary = ""
+        self.progress_task: asyncio.Task | None = None
+        self.last_turn_id: str | None = None
+        self.send_lock = asyncio.Lock()
+        self.model_catalog: dict[str, dict[str, Any]] = {}
+        self.streaming_messages: set[str] = set()
+        self.outbound_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=16)
+        self.outbound_task: asyncio.Task | None = None
+        self.crashed = False
+
+    def save(self) -> None:
+        self.state["activities"] = list(self.activities)
+        self.state["updated_at"] = now_iso()
+        atomic_json(self.state_file, self.state)
+
+    def terminal(self, text: str = "", end: str = "\n") -> None:
+        print(text, end=end, flush=True)
+
+    def add_activity(self, activity: Any) -> None:
+        if activity:
+            self.activities.append(activity)
+            if isinstance(activity, dict):
+                text = activity.get("label") or activity.get("kind") or "Activity"
+                detail = activity.get("detail")
+                self.terminal(f"• {text}{(': ' + str(detail)) if detail else ''}")
+            else:
+                self.terminal(f"• {activity}")
+            self.save()
+            self.schedule_progress()
+
+    def complete_activity(self, item: dict[str, Any]) -> None:
+        """Replace an in-flight row with its completion instead of duplicating it."""
+        item_id = str(item.get("id") or "")
+        if item_id:
+            self.activities = deque(
+                (row for row in self.activities
+                 if not isinstance(row, dict) or row.get("id") != item_id),
+                maxlen=ACTIVITY_LIMIT,
+            )
+        else:
+            started = activity_item(item, completed=False)
+            if started:
+                with contextlib.suppress(ValueError):
+                    self.activities.remove(started)
+        self.add_activity(activity_item(item, completed=True))
+
+    async def start(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            self.socket_path.unlink()
+        self.save()
+        self.outbound_task = asyncio.create_task(self.send_bridge_events())
+
+        env = dict(os.environ)
+        for key in API_KEY_ENV:
+            env.pop(key, None)
+        argv = [self.args.codex_command, "app-server", "--stdio"]
+        if self.args.strict_config:
+            argv.append("--strict-config")
+        self.client = AppServerClient(argv, env, self.on_notification)
+        await self.client.start()
+        init = await self.client.request("initialize", {
+            "clientInfo": {
+                "name": "agent_bridge",
+                "title": "agent-bridge",
+                "version": "1",
+            }
+        })
+        await self.client.notify("initialized")
+        self.state["codex_home"] = init.get("codexHome") if isinstance(init, dict) else None
+        await self.refresh_models()
+        await self.open_thread()
+
+        self.control_server = await asyncio.start_unix_server(
+            self.handle_control, path=str(self.socket_path)
+        )
+        os.chmod(self.socket_path, 0o600)
+        self.install_terminal_input()
+        self.state["ready"] = True
+        if self.state.get("status") == "starting":
+            self.state["status"] = "idle"
+        self.save()
+        self.render_header()
+        self.render_prompt()
+
+    async def refresh_models(self) -> None:
+        assert self.client
+        try:
+            result = await self.client.request("model/list", {"limit": 100})
+            self.model_catalog = {
+                row["id"]: row for row in (result.get("data") or []) if row.get("id")
+            }
+        except Exception as exc:
+            self.terminal(f"⚠ model catalog unavailable: {exc}")
+
+    async def open_thread(self) -> None:
+        assert self.client
+        thread_id = self.state.get("thread_id") if self.args.resume else None
+        if self.args.resume and not thread_id:
+            try:
+                listing = await self.client.request("thread/list", {
+                    "cwd": self.cwd,
+                    "limit": 1,
+                    "sortKey": "recency_at",
+                    "sortDirection": "desc",
+                })
+                rows = listing.get("data") or []
+                thread_id = rows[0].get("id") if rows else None
+            except Exception as exc:
+                self.terminal(f"⚠ could not discover previous thread: {exc}")
+        params = {
+            "cwd": self.cwd,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        }
+        model = self.state.get("model")
+        if model:
+            params["model"] = model
+        if thread_id:
+            try:
+                result = await self.client.request(
+                    "thread/resume", {"threadId": thread_id, **params}, timeout=120
+                )
+            except RpcError as exc:
+                self.terminal(f"⚠ resume failed, starting a fresh thread: {exc}")
+                result = await self.client.request("thread/start", params, timeout=120)
+        else:
+            result = await self.client.request("thread/start", params, timeout=120)
+        thread = result.get("thread") or {}
+        self.state.update({
+            "thread_id": thread.get("id"),
+            "transcript_path": thread.get("path"),
+            "status": (thread.get("status") or {}).get("type", "idle"),
+            "model": result.get("model") or self.state.get("model"),
+            "model_provider": result.get("modelProvider"),
+            "effort": result.get("reasoningEffort"),
+        })
+        self.save()
+        if self.state.get("thread_id"):
+            with contextlib.suppress(Exception):
+                await self.client.request("thread/name/set", {
+                    "threadId": self.state["thread_id"],
+                    "name": f"worker:{self.name}",
+                })
+        await self.refresh_goal()
+        await self.refresh_rate_limits()
+
+    async def refresh_goal(self) -> None:
+        assert self.client
+        if not self.state.get("thread_id"):
+            return
+        try:
+            result = await self.client.request(
+                "thread/goal/get", {"threadId": self.state["thread_id"]}
+            )
+            self.state["goal"] = result.get("goal")
+            self.save()
+        except Exception:
+            pass
+
+    async def refresh_rate_limits(self) -> None:
+        assert self.client
+        try:
+            result = await self.client.request("account/rateLimits/read")
+            self.state["rate_limits"] = result
+            self.save()
+        except Exception:
+            pass
+
+    def render_header(self) -> None:
+        self.terminal("╭─ Codex app-server worker")
+        self.terminal(f"│ worker  {self.name}")
+        self.terminal(f"│ thread  {self.state.get('thread_id') or 'new'}")
+        self.terminal(f"│ cwd     {self.cwd}")
+        self.terminal("╰─ structured control · tmux/web console compatible")
+
+    def render_prompt(self) -> None:
+        if self.state.get("status") == "active":
+            return
+        fast = " fast" if self.state.get("service_tier") == "priority" else ""
+        effort = f" {self.state.get('effort')}" if self.state.get("effort") else ""
+        self.terminal(f"{self.state.get('model') or 'Codex'}{effort}{fast} · {self.cwd}")
+        self.terminal("› ", end="")
+
+    def install_terminal_input(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        loop = asyncio.get_running_loop()
+
+        def ready() -> None:
+            line = sys.stdin.readline()
+            if line == "":
+                loop.remove_reader(sys.stdin.fileno())
+                return
+            asyncio.create_task(self.submit_terminal(line.rstrip("\r\n")))
+
+        loop.add_reader(sys.stdin.fileno(), ready)
+
+    async def submit_terminal(self, text: str) -> None:
+        try:
+            await self.submit(text, typed=text.lstrip().startswith("/"))
+        except Exception as exc:
+            self.terminal(f"\n⚠ {exc}")
+            self.render_prompt()
+
+    async def new_thread(self) -> None:
+        result = await self.client.request("thread/start", {
+            "cwd": self.cwd,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            **({"model": self.state["model"]} if self.state.get("model") else {}),
+        }, timeout=120)
+        thread = result.get("thread") or {}
+        self.state.update({
+            "thread_id": thread.get("id"),
+            "transcript_path": thread.get("path"),
+            "active_turn_id": None,
+            "status": "idle",
+            "goal": None,
+            "token_usage": None,
+            "plan": [],
+            "diff": {"files": 0, "additions": 0, "deletions": 0},
+            "reasoning_summary": "",
+            "model": result.get("model") or self.state.get("model"),
+            "model_provider": result.get("modelProvider"),
+            "effort": result.get("reasoningEffort"),
+        })
+        self.activities.clear()
+        self.save()
+
+    async def local_command(self, text: str) -> dict[str, Any] | None:
+        assert self.client
+        command, _, arg = text.strip().partition(" ")
+        command = command.lower()
+        arg = arg.strip()
+        if command in ("/status", "/usage"):
+            if command == "/usage":
+                await self.refresh_rate_limits()
+            self.terminal("\n" + json.dumps(self.state, indent=2, ensure_ascii=False))
+            self.render_prompt()
+            return {"ok": True, "mode": "local", "state": self.state}
+        if command in ("/models",):
+            self.terminal("\nAvailable models:")
+            for row in self.model_catalog.values():
+                self.terminal(f"  {row['id']} ({row.get('defaultReasoningEffort') or 'default'})")
+            self.render_prompt()
+            return {"ok": True, "mode": "local"}
+        if command == "/model":
+            if not arg:
+                raise ValueError("usage: /model MODEL")
+            if self.model_catalog and arg not in self.model_catalog:
+                raise ValueError(f"unknown model {arg!r}; use /models")
+            self.state["model"] = arg
+            row = self.model_catalog.get(arg) or {}
+            self.state["effort"] = row.get("defaultReasoningEffort") or self.state.get("effort")
+            self.save()
+            self.terminal(f"\nModel set to {arg} for subsequent turns.")
+            self.render_prompt()
+            return {"ok": True, "mode": "local", "model": arg}
+        if command == "/fast":
+            self.state["service_tier"] = (
+                None if self.state.get("service_tier") == "priority" else "priority"
+            )
+            self.save()
+            self.terminal("\nFast mode " + ("on." if self.state["service_tier"] else "off."))
+            self.render_prompt()
+            return {"ok": True, "mode": "local", "fast": bool(self.state["service_tier"])}
+        if command == "/compact":
+            await self.client.request(
+                "thread/compact/start", {"threadId": self.state["thread_id"]}
+            )
+            self.add_activity("Compacting conversation context")
+            return {"ok": True, "mode": "compact"}
+        if command == "/review":
+            target = ({"type": "custom", "instructions": arg}
+                      if arg else {"type": "uncommittedChanges"})
+            result = await self.client.request("review/start", {
+                "threadId": self.state["thread_id"], "target": target, "delivery": "inline"
+            })
+            return {"ok": True, "mode": "review", "result": result}
+        if command in ("/new", "/clear"):
+            if self.state.get("active_turn_id"):
+                raise ValueError("cannot start a new thread while a turn is active")
+            await self.new_thread()
+            self.terminal("\nStarted a new Codex thread.")
+            self.render_prompt()
+            return {"ok": True, "mode": "new", "thread_id": self.state["thread_id"]}
+        if command in ("/interrupt", "/stop"):
+            await self.interrupt()
+            return {"ok": True, "mode": "interrupt"}
+        if command == "/goal":
+            await self.refresh_goal()
+            self.terminal("\n" + json.dumps(self.state.get("goal"), indent=2, ensure_ascii=False))
+            self.render_prompt()
+            return {"ok": True, "mode": "local", "goal": self.state.get("goal")}
+        if command in ("/help", "/commands"):
+            self.terminal("\nCommands: /status /usage /models /model /fast /compact /review /new /goal /interrupt")
+            self.render_prompt()
+            return {"ok": True, "mode": "local"}
+        return None
+
+    async def submit(self, text: str, typed: bool = False) -> dict[str, Any]:
+        text = text.strip()
+        if not text:
+            self.render_prompt()
+            return {"ok": True, "mode": "empty"}
+        async with self.send_lock:
+            if text.startswith("/"):
+                handled = await self.local_command(text)
+                if handled is not None:
+                    return handled
+                if typed:
+                    raise ValueError(f"unsupported app-server command: {text.split()[0]}")
+            assert self.client
+            payload = [{"type": "text", "text": text}]
+            active_turn = self.state.get("active_turn_id")
+            # thread/status can flip to idle a few milliseconds before the
+            # matching turn/completed notification. The turn id is the
+            # authoritative steering guard during that window.
+            if active_turn:
+                result = await self.client.request("turn/steer", {
+                    "threadId": self.state["thread_id"],
+                    "expectedTurnId": active_turn,
+                    "input": payload,
+                })
+                self.add_activity({
+                    "kind": "steering", "status": "completed",
+                    "label": "Steering applied",
+                    "detail": "The active turn was updated with a new instruction.",
+                })
+                return {"ok": True, "mode": "steer", "turn_id": result.get("turnId")}
+            params: dict[str, Any] = {
+                "threadId": self.state["thread_id"],
+                "input": payload,
+                "cwd": self.cwd,
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            }
+            for source, target in (("model", "model"), ("effort", "effort"),
+                                   ("service_tier", "serviceTier")):
+                if self.state.get(source):
+                    params[target] = self.state[source]
+            self.final_reply = ""
+            self.reasoning_summary = ""
+            self.activities.clear()
+            self.streaming_messages.clear()
+            self.state["plan"] = []
+            self.state["diff"] = {"files": 0, "additions": 0, "deletions": 0}
+            self.state["reasoning_summary"] = ""
+            self.turn_started_at = time.time()
+            self.save()
+            result = await self.client.request("turn/start", params, timeout=120)
+            turn = result.get("turn") or {}
+            turn_id = turn.get("id")
+            self.last_turn_id = turn_id
+            # Notifications normally follow this response, but a tiny/fake
+            # turn can complete before this coroutine is rescheduled. Never
+            # resurrect a turn that turn/completed has already settled.
+            if self.state.get("last_completed_turn_id") != turn_id:
+                self.state["active_turn_id"] = turn_id
+                self.state["status"] = "active"
+                self.turn_started_at = self.turn_started_at or time.time()
+            self.save()
+            self.terminal(f"\n› {text.splitlines()[0][:240]}")
+            self.terminal("Working (app-server • esc to interrupt)")
+            if self.state.get("active_turn_id") == turn_id:
+                await self.emit_progress(force=True)
+            return {"ok": True, "mode": "start", "turn_id": turn_id}
+
+    async def interrupt(self) -> None:
+        if not self.state.get("active_turn_id"):
+            return
+        assert self.client
+        await self.client.request("turn/interrupt", {
+            "threadId": self.state["thread_id"],
+            "turnId": self.state["active_turn_id"],
+        })
+
+    async def on_notification(self, method: str, params: dict[str, Any]) -> None:
+        if method not in HIGH_VOLUME_EVENTS:
+            self.append_event(method, params)
+        if method == "turn/started":
+            turn = params.get("turn") or {}
+            self.state["active_turn_id"] = turn.get("id")
+            self.last_turn_id = turn.get("id")
+            self.state["status"] = "active"
+            self.turn_started_at = self.turn_started_at or time.time()
+            (self.state_dir / ACTIVE_MARKER).touch(mode=0o600, exist_ok=True)
+            self.save()
+            await self.emit_progress(force=True)
+        elif method == "thread/status/changed":
+            status = params.get("status") or {}
+            self.state["status"] = status.get("type", self.state.get("status"))
+            self.state["active_flags"] = status.get("activeFlags") or []
+            self.save()
+        elif method == "item/started":
+            self.add_activity(activity_item(params.get("item") or {}, completed=False))
+        elif method == "item/completed":
+            item = params.get("item") or {}
+            if item.get("type") == "agentMessage" and item.get("text"):
+                text = str(item["text"])
+                if item.get("phase") == "final_answer" or not self.final_reply:
+                    self.final_reply = text
+                item_id = str(item.get("id") or "")
+                if item_id in self.streaming_messages:
+                    self.streaming_messages.discard(item_id)
+                    self.terminal()
+                else:
+                    self.terminal("\n" + text)
+            elif item.get("type") == "reasoning":
+                summaries = item.get("summary") or []
+                if summaries:
+                    self.reasoning_summary = "\n".join(str(x) for x in summaries)[-800:]
+            self.complete_activity(item)
+        elif method == "item/commandExecution/outputDelta":
+            delta = params.get("delta") or ""
+            if delta:
+                self.terminal(str(delta), end="")
+        elif method == "item/agentMessage/delta":
+            delta = str(params.get("delta") or "")
+            if delta:
+                item_id = str(params.get("itemId") or "")
+                if item_id not in self.streaming_messages:
+                    self.streaming_messages.add(item_id)
+                    self.terminal()
+                self.terminal(delta, end="")
+        elif method == "item/reasoning/summaryTextDelta":
+            self.reasoning_summary = (self.reasoning_summary + str(params.get("delta") or ""))[-800:]
+            self.state["reasoning_summary"] = self.reasoning_summary
+            self.schedule_progress()
+        elif method == "turn/plan/updated":
+            self.state["plan"] = params.get("plan") or []
+            self.save()
+            self.schedule_progress()
+        elif method == "turn/diff/updated":
+            self.state["diff"] = diff_stats(params.get("diff") or "")
+            self.save()
+            self.schedule_progress()
+        elif method == "thread/tokenUsage/updated":
+            self.state["token_usage"] = params.get("tokenUsage")
+            self.save()
+            self.schedule_progress()
+        elif method == "thread/goal/updated":
+            self.state["goal"] = params.get("goal")
+            self.save()
+            self.schedule_progress()
+        elif method == "thread/goal/cleared":
+            self.state["goal"] = None
+            self.save()
+        elif method == "account/rateLimits/updated":
+            self.state["rate_limits"] = params.get("rateLimits")
+            self.save()
+        elif method in ("warning", "configWarning"):
+            self.add_activity("Warning: " + str(params.get("message") or params.get("summary") or "Codex warning"))
+        elif method == "error":
+            error = params.get("error") or {}
+            self.state["last_error"] = error
+            self.add_activity("Error: " + str(error.get("message") or "Codex error"))
+        elif method == "turn/completed":
+            await self.on_turn_completed(params.get("turn") or {})
+
+    def append_event(self, method: str, params: dict[str, Any]) -> None:
+        record = {"time": now_iso(), "method": method, "params": params}
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                if self.event_log.stat().st_size >= MAX_EVENT_LOG_BYTES:
+                    rotated = self.event_log.with_suffix(
+                        self.event_log.suffix + ".1"
+                    )
+                    with contextlib.suppress(OSError):
+                        rotated.unlink()
+                    os.replace(self.event_log, rotated)
+            fd = os.open(
+                self.event_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+            )
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.write("\n")
+        except OSError:
+            pass
+
+    async def on_turn_completed(self, turn: dict[str, Any]) -> None:
+        status = turn.get("status") or "failed"
+        error = turn.get("error")
+        self.last_turn_id = turn.get("id") or self.state.get("active_turn_id")
+        if self.progress_task and not self.progress_task.done():
+            self.progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.progress_task
+        self.progress_task = None
+        self.state.update({
+            "status": "idle" if status in ("completed", "interrupted", "failed") else status,
+            "last_turn_status": status,
+            "last_completed_turn_id": self.last_turn_id,
+            "last_error": error,
+            "active_turn_id": None,
+        })
+        self.save()
+        goal = self.state.get("goal") or {}
+        if not isinstance(goal, dict) or goal.get("status") not in ("active", "paused"):
+            with contextlib.suppress(FileNotFoundError):
+                (self.state_dir / ACTIVE_MARKER).unlink()
+        if status == "completed":
+            self.terminal("\n✓ Turn completed")
+        elif status == "interrupted":
+            self.terminal("\n■ Turn interrupted")
+        else:
+            self.terminal("\n✗ Turn failed: " + str((error or {}).get("message") or "unknown error"))
+        await self.emit_progress(force=True, terminal_status=status)
+        await self.emit_turn_end(turn)
+        self.turn_started_at = None
+        self.render_prompt()
+
+    def progress_payload(self, terminal_status: str | None = None) -> dict[str, Any]:
+        elapsed = int(time.time() - self.turn_started_at) if self.turn_started_at else 0
+        return {
+            "event_type": "claude.worker.progress",
+            "worker": self.name,
+            "chat": self.chat,
+            "engine": "codex",
+            "backend": "app-server",
+            "thread_id": self.state.get("thread_id"),
+            "turn_id": self.state.get("active_turn_id") or self.last_turn_id,
+            "status": terminal_status or self.state.get("status"),
+            "model": self.state.get("model"),
+            "effort": self.state.get("effort"),
+            "fast": self.state.get("service_tier") == "priority",
+            "elapsed_seconds": elapsed,
+            "updated_at": now_iso(),
+            "activities": list(self.activities),
+            "plan": self.state.get("plan") or [],
+            "diff": self.state.get("diff") or {},
+            "token_usage": self.state.get("token_usage") or {},
+            "reasoning_summary": redact_command(self.reasoning_summary[-800:], 500),
+        }
+
+    def schedule_progress(self) -> None:
+        if not self.chat or self.progress_task and not self.progress_task.done():
+            return
+
+        async def later() -> None:
+            try:
+                await asyncio.sleep(PROGRESS_INTERVAL)
+                if self.state.get("status") == "active":
+                    await self.emit_progress(force=True)
+            finally:
+                self.progress_task = None
+
+        self.progress_task = asyncio.create_task(later())
+
+    async def emit_progress(self, force: bool = False,
+                            terminal_status: str | None = None) -> None:
+        if not self.chat or (not force and self.state.get("status") != "active"):
+            return
+        with contextlib.suppress(asyncio.QueueFull):
+            self.outbound_queue.put_nowait(self.progress_payload(terminal_status))
+
+    async def emit_turn_end(self, turn: dict[str, Any]) -> None:
+        if not self.chat:
+            return
+        totals = usage_totals(self.state.get("token_usage") or {})
+        usage = ({"engine": "codex", "totals": totals,
+                  "fast_share": 1.0 if self.state.get("service_tier") == "priority" else 0.0}
+                 if totals else None)
+        payload = {
+            "event_type": "claude.worker.turn_ended",
+            "worker": self.name,
+            "dir": self.cwd,
+            "chat": self.chat,
+            "session_id": self.state.get("thread_id") or "",
+            "transcript_path": self.state.get("transcript_path") or str(self.state_file),
+            "reply": self.final_reply,
+            "engine": "codex",
+            "backend": "app-server",
+            "model": self.state.get("model") or "",
+            "turn_status": turn.get("status"),
+            "error": turn.get("error"),
+            "error_kind": error_kind(turn.get("error")),
+            "rate_limits": self.state.get("rate_limits"),
+            "goal": self.state.get("goal"),
+        }
+        if usage:
+            payload["usage"] = usage
+        # A disconnected bridge may leave obsolete progress updates queued.
+        # Drop those before the lossless turn-end event so the final reply is
+        # the next thing sent when the listener returns.
+        kept = []
+        latest_progress = None
+        while not self.outbound_queue.empty():
+            queued = self.outbound_queue.get_nowait()
+            self.outbound_queue.task_done()
+            if queued.get("event_type") == "claude.worker.progress":
+                latest_progress = queued
+            else:
+                kept.append(queued)
+        for queued in kept:
+            self.outbound_queue.put_nowait(queued)
+        if latest_progress:
+            self.outbound_queue.put_nowait(latest_progress)
+        await self.outbound_queue.put(payload)
+
+    async def send_bridge_events(self) -> None:
+        while True:
+            payload = await self.outbound_queue.get()
+            try:
+                await asyncio.to_thread(self.post_bridge_event, payload)
+            finally:
+                self.outbound_queue.task_done()
+
+    def post_bridge_event(self, payload: dict[str, Any]) -> bool:
+        config_home = Path(
+            os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        )
+        config_path = Path(os.environ.get(
+            "CLAUDE_WORKERS_BRIDGE_WEBHOOK_FILE",
+            str(config_home / "claude-workers" / WEBHOOK_FILE),
+        ))
+        config = read_kv(config_path)
+        url, secret = config.get("BRIDGE_WEBHOOK_URL"), config.get("BRIDGE_WEBHOOK_SECRET")
+        if not url or not secret:
+            return False
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", "X-Webhook-Signature": signature},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return 200 <= response.status < 300
+        except (OSError, urllib.error.URLError):
+            return False
+
+    async def handle_control(self, reader: asyncio.StreamReader,
+                             writer: asyncio.StreamWriter) -> None:
+        try:
+            raw = await reader.read(MAX_CONTROL_BYTES + 1)
+            if len(raw) > MAX_CONTROL_BYTES:
+                raise ValueError("control request too large")
+            request = json.loads(raw or b"{}")
+            command = request.get("command")
+            if command == "inspect":
+                response = {"ok": True, "state": self.state}
+            elif command == "send":
+                response = await self.submit(str(request.get("text") or ""), bool(request.get("typed")))
+            elif command == "interrupt":
+                await self.interrupt()
+                response = {"ok": True}
+            else:
+                raise ValueError(f"unknown control command: {command}")
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+        writer.write((json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+        with contextlib.suppress(ConnectionError):
+            await writer.drain()
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+    async def run(self) -> int:
+        try:
+            await self.start()
+            assert self.client and self.client.proc
+            stop_task = asyncio.create_task(self.stop_event.wait())
+            app_task = asyncio.create_task(self.client.proc.wait())
+            done, pending = await asyncio.wait(
+                (stop_task, app_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            if app_task in done and not self.stop_event.is_set():
+                code = app_task.result()
+                self.crashed = True
+                self.state["last_error"] = {
+                    "message": f"codex app-server exited unexpectedly ({code})"
+                }
+                self.terminal(f"\n✗ codex app-server exited unexpectedly ({code})")
+                await self.emit_progress(force=True, terminal_status="failed")
+                return code or 1
+            return 0
+        finally:
+            self.state["ready"] = False
+            self.state["status"] = "failed" if self.crashed else "stopped"
+            self.save()
+            if self.control_server:
+                self.control_server.close()
+                await self.control_server.wait_closed()
+            with contextlib.suppress(FileNotFoundError):
+                self.socket_path.unlink()
+            if self.client:
+                await self.client.close()
+            if self.outbound_task:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.outbound_queue.join(), 12)
+                self.outbound_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.outbound_task
+
+
+async def control_request(socket_path: str, request: dict[str, Any],
+                          timeout: float = 30) -> dict[str, Any]:
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_unix_connection(socket_path), timeout=timeout
+    )
+    writer.write(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())
+    writer.write_eof()
+    await writer.drain()
+    raw = await asyncio.wait_for(reader.read(MAX_CONTROL_BYTES), timeout=timeout)
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise RuntimeError("invalid control response")
+    return value
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    sub = root.add_subparsers(dest="subcommand", required=True)
+    run = sub.add_parser("run")
+    run.add_argument("--name", required=True)
+    run.add_argument("--dir", required=True)
+    run.add_argument("--state-dir", required=True)
+    run.add_argument("--chat", default="")
+    run.add_argument("--resume", action="store_true")
+    run.add_argument("--codex-command", default="codex")
+    run.add_argument("--strict-config", action="store_true")
+    ctl = sub.add_parser("ctl")
+    ctl.add_argument("--socket", required=True)
+    ctl.add_argument("--timeout", type=float, default=30)
+    ctl.add_argument("command", choices=("inspect", "send", "interrupt"))
+    ctl.add_argument("--typed", action="store_true")
+    ctl.add_argument("--field")
+    ctl.add_argument("text", nargs="?")
+    return root
+
+
+async def async_main(args: argparse.Namespace) -> int:
+    if args.subcommand == "run":
+        worker = CodexAppWorker(args)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, worker.stop_event.set)
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(worker.interrupt()))
+        return await worker.run()
+
+    text = args.text
+    if args.command == "send" and text == "-":
+        text = sys.stdin.read()
+    request = {"command": args.command}
+    if args.command == "send":
+        request.update({"text": text or "", "typed": args.typed})
+    response = await control_request(args.socket, request, timeout=args.timeout)
+    if not response.get("ok"):
+        print(response.get("error") or "control request failed", file=sys.stderr)
+        return 1
+    if args.field:
+        value: Any = response.get("state") or response
+        for part in args.field.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        if isinstance(value, (dict, list)):
+            print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        elif value is not None:
+            print(value)
+    else:
+        print(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def main() -> int:
+    try:
+        return asyncio.run(async_main(parser().parse_args()))
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"codex-app-worker: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
