@@ -516,6 +516,27 @@ class ScreenIsCompactingTests(unittest.TestCase):
         self.assertFalse(cb.screen_is_compacting("❯ "))
 
 
+class ScreenHasActiveGoalTests(unittest.TestCase):
+    def test_live_codex_goal_footer(self):
+        screen = (
+            "• Finished one continuation\n\n"
+            "› Summarize recent commits\n\n"
+            "  gpt-5.6-sol high · ~/repo       Pursuing goal (17h 7m)"
+        )
+        self.assertTrue(cb.screen_has_active_goal(screen))
+
+    def test_plain_idle_codex_worker(self):
+        self.assertFalse(cb.screen_has_active_goal(
+            "• Done\n\n› Find and fix a bug\n\n  gpt-5.6-sol high · ~/repo"
+        ))
+
+    def test_old_goal_footer_in_scrollback_does_not_pin_worker(self):
+        screen = "Pursuing goal (2h)\n" + "\n".join(
+            f"new line {i}" for i in range(9)
+        )
+        self.assertFalse(cb.screen_has_active_goal(screen))
+
+
 class ChannelFromChatTests(unittest.TestCase):
     def test_simple(self):
         self.assertEqual(cb.channel_from_chat("discord:123"), 123)
