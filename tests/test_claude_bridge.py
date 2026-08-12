@@ -2218,9 +2218,23 @@ class RemoteWorkerStateTests(unittest.TestCase):
     def test_state_and_fresh_checks_dispatch_to_satellite(self):
         self.assertTrue(cb.worker_has_state("app", host_target="me@mac"))
         self.assertTrue(cb.fresh_pending("app", host_target="me@mac"))
+        self.assertTrue(cb.active_turn_pending("app", host_target="me@mac"))
+        self.assertTrue(cb.mark_active_turn("app", host_target="me@mac"))
+        self.assertTrue(cb.clear_active_turn("app", host_target="me@mac"))
         remote = "\n".join(call[-1] for call in self.calls)
         self.assertIn("agent-worker state app has", remote)
         self.assertIn("agent-worker state app fresh-pending", remote)
+        self.assertIn("agent-worker state app active", remote)
+        self.assertIn("agent-worker state app active-mark", remote)
+        self.assertIn("agent-worker state app active-clear", remote)
+
+    def test_local_active_turn_marker_round_trip(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertFalse(cb.active_turn_pending("app", root))
+            self.assertTrue(cb.mark_active_turn("app", root))
+            self.assertTrue(cb.active_turn_pending("app", root))
+            self.assertTrue(cb.clear_active_turn("app", root))
+            self.assertFalse(cb.active_turn_pending("app", root))
 
     def test_remote_path_is_reported_by_satellite(self):
         self.assertEqual(

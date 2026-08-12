@@ -62,8 +62,21 @@ session_for() { printf '%s%s' "$SESSION_PREFIX" "$1"; }
 # tmux's -t matching is prefix-fuzzy; '=' forces an exact session match.
 # Commands that take a target-PANE need the trailing ':' ("=name:") — bare
 # "=name" only resolves for target-session commands on tmux 3.2.
-alive() { tmux has-session -t "=$(session_for "$1")" 2>/dev/null; }
+session_exists() { tmux has-session -t "=$(session_for "$1")" 2>/dev/null; }
 pane_for() { printf '=%s:' "$(session_for "$1")"; }
+
+# A tmux session name alone is not proof that the worker survived. On this
+# host tmux-resurrect recreates every old cw-* session after a reboot, but it
+# cannot recreate the agent process: the pane is a plain zsh shell showing
+# stale captured output. Treat only sessions launched by this driver as live.
+# cmd_start removes a resurrected shell before reusing its session name.
+alive() {
+  local name="$1" start
+  session_exists "$name" || return 1
+  start="$(tmux display-message -p -t "$(pane_for "$name")" \
+    '#{pane_start_command}' 2>/dev/null || true)"
+  [[ " $start " == *" CLAUDE_WORKER=$name "* ]]
+}
 
 meta_get() { # meta_get <name> <key>
   sed -n "s/^$2=//p" "$STATE_ROOT/$1/meta" 2>/dev/null | head -1
@@ -234,7 +247,16 @@ cmd_start() {
   [[ "$harness" == claude || "$harness" == codex || "$harness" == antigravity ]] \
     || die "invalid --harness '$harness' (claude, codex, or antigravity)"
   [[ -d "$dir" ]] || die "no such directory: $dir"
-  alive "$name" && die "worker '$name' is already running (try: agent-worker restart $name)"
+  if session_exists "$name"; then
+    if alive "$name"; then
+      die "worker '$name' is already running (try: agent-worker restart $name)"
+    fi
+    # tmux-resurrect restores the pane layout and captured contents, but not
+    # the Claude/Codex process or CLAUDE_WORKER launch marker. Remove that
+    # shell placeholder so the real worker can reclaim its canonical name.
+    tmux kill-session -t "=$(session_for "$name")"
+    echo "  note:   removed stale resurrected tmux session" >&2
+  fi
 
   local session state launcher launcher_args=()
   session="$(session_for "$name")"
@@ -542,8 +564,18 @@ cmd_state() {
     fresh-disarm)
       rm -f "$state/no-resume"
       ;;
+    active)
+      [[ -f "$state/active-turn" ]]
+      ;;
+    active-mark)
+      mkdir -p "$state"
+      : > "$state/active-turn"
+      ;;
+    active-clear)
+      rm -f "$state/active-turn"
+      ;;
     purge)
-      alive "$name" && die "worker '$name' is still running"
+      session_exists "$name" && die "worker '$name' still has a tmux session"
       [[ -d "$state" ]] || return 1
       rm -rf -- "$state"
       ;;
@@ -561,7 +593,7 @@ cmd_state() {
       printf '%s\n' "$state/inbox"
       ;;
     *)
-      die "usage: agent-worker state <name> <has|fresh-pending|fresh-arm|fresh-disarm|purge|path|read|remove|ensure-inbox> [file]"
+      die "usage: agent-worker state <name> <has|fresh-pending|fresh-arm|fresh-disarm|active|active-mark|active-clear|purge|path|read|remove|ensure-inbox> [file]"
       ;;
   esac
 }
@@ -569,7 +601,11 @@ cmd_state() {
 cmd_stop() {
   require_name "${1:-}"
   local name="$1"
-  alive "$name" || die "worker '$name' is not running"
+  session_exists "$name" || die "worker '$name' is not running"
+  # A deliberate stop cancels crash recovery for the current turn. A hard
+  # host/process death never reaches this path, so its marker survives and the
+  # bridge can resume it on startup.
+  rm -f "$STATE_ROOT/$name/active-turn"
   tmux kill-session -t "=$(session_for "$name")"
   echo "stopped worker '$name' (state kept; restart with: agent-worker restart $name)"
 }
@@ -582,7 +618,7 @@ cmd_restart() {
   harness="$(meta_get "$name" harness)"
   [[ -n "$harness" ]] || harness="claude"  # pre-harness workers default to claude
   [[ -n "$dir" ]] || die "no recorded state for '$name' (use: agent-worker start $name --dir DIR)"
-  if alive "$name"; then
+  if session_exists "$name"; then
     tmux kill-session -t "=$(session_for "$name")"
   fi
   local restart_args=(--dir "$dir" --harness "$harness")
