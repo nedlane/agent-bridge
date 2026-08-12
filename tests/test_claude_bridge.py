@@ -1233,6 +1233,22 @@ class CodexAppServerBridgeTests(unittest.TestCase):
         self.assertIn("``\u200b`oops", rendered)
         self.assertEqual(rendered.count("```"), 2)
 
+    def test_completed_receipt_drops_transient_reasoning_and_activity(self):
+        embed = cb.worker_progress_embed({
+            "worker": "bridge", "status": "completed",
+            "reasoning_summary": "transient work summary",
+            "plan": [{"step": "Inspect", "status": "completed"}],
+            "activities": [{
+                "kind": "command", "status": "completed",
+                "label": "Tests completed", "detail": "pytest -q",
+            }],
+            "diff": {"files": 1, "additions": 2, "deletions": 0},
+        })
+        self.assertNotIn("transient work summary", embed["description"])
+        self.assertIn("permanent message", embed["description"])
+        self.assertEqual([field["name"] for field in embed["fields"]], ["Changes"])
+        self.assertIn("completed", embed["footer"]["text"])
+
     def test_structured_usage_includes_plan_window(self):
         rendered = cb.format_app_server_usage("bridge", {
             "token_usage": {"total": {

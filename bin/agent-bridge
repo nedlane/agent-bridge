@@ -1667,16 +1667,19 @@ def worker_progress_embed(event):
     )
     embed = {
         "title": title,
-        "description": summary or (
-            "Connecting to Codex and preparing the turn…" if active
-            else "The turn has ended."
+        "description": (
+            summary or "Connecting to Codex and preparing the turn…"
+            if active else
+            "Turn completed. The final response is preserved as a permanent "
+            "message in the channel." if completed else
+            f"The turn ended with status: {status}."
         ),
         "color": 0x5865F2 if active else (0x23A55A if completed else 0xED4245),
         "fields": [],
     }
 
     plan = event.get("plan") or []
-    if isinstance(plan, list) and plan:
+    if active and isinstance(plan, list) and plan:
         plan_lines = []
         for item in plan[:7]:
             if not isinstance(item, dict):
@@ -1701,7 +1704,7 @@ def worker_progress_embed(event):
             })
 
     activities = event.get("activities") or []
-    if isinstance(activities, list) and activities:
+    if active and isinstance(activities, list) and activities:
         embed["fields"].append({
             "name": "Live activity" if active else "Activity",
             "value": _activity_feed(activities), "inline": False,
