@@ -102,6 +102,16 @@ the configured model, and suggests switching model/harness or retrying after
 reset. Ordinary approaching-limit notices and optional reset-credit offers do
 not trigger a false alarm.
 
+An in-flight turn also survives a host or worker-process restart. The bridge
+writes a durable marker after it successfully delivers a real prompt and
+clears it only after the completion hook has settled at an idle TUI. On bridge
+startup (and once a minute afterward), a marked worker whose process is gone is
+resumed and receives an internal continuation prompt. `agent-worker` validates
+the pane's original `CLAUDE_WORKER` launch command rather than trusting the
+tmux session name: this prevents tmux-resurrect's shell-only `cw-*` placeholders
+from masquerading as live agents after a reboot. Explicit `/stop`, `/fresh`,
+`/clear`, and low-level `agent-worker stop` operations cancel recovery.
+
 ## Standalone install
 
 This installs the bridge directly on a host, without the dotfiles submodule.

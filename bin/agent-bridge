@@ -191,6 +191,18 @@ INBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
 # session.
 HANDOFF_MAX_AGE_SECONDS = 24 * 3600
 
+# A hard host/process death leaves the active-turn marker behind. Give
+# tmux-continuum time to restore its saved layout first, then replace any
+# resulting shell-only cw-* placeholder with a real resumed worker and steer
+# the interrupted turn back into motion. The periodic reaper retries failures.
+RECOVERY_STARTUP_DELAY_SECONDS = 10
+RECOVERY_PROMPT = """[Automatic recovery after a host or worker restart]
+
+Your previous turn was interrupted before its completion hook ran. Resume the
+active goal/task from the persisted conversation and continue working from
+where it stopped. Do not send a status update merely because of this recovery
+notice; follow the existing Discord notification rules."""
+
 # Injected into every worker's system prompt: the worker itself is the
 # publisher. It messages Ned through discord-notify (which auto-targets the
 # worker's repo channel, and can attach images/files with -i); the bridge's
@@ -2171,6 +2183,49 @@ def should_resume(has_state, fresh):
     return has_state and not fresh
 
 
+def active_turn_path(name, state_root=None):
+    return os.path.join(state_root or STATE_ROOT, name, "active-turn")
+
+
+def active_turn_pending(name, state_root=None, host_target=None):
+    """Whether a delivered turn has not reached its completion hook yet.
+
+    The marker is durable across a host reboot. It is intentionally separate
+    from tmux liveness: tmux-resurrect can recreate a cw-* shell after boot,
+    but that shell is not the Claude/Codex process which owned the turn.
+    """
+    if host_target is not None:
+        r = run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "active"], timeout=15)
+        return r.returncode == 0
+    return os.path.isfile(active_turn_path(name, state_root))
+
+
+def mark_active_turn(name, state_root=None, host_target=None):
+    if host_target is not None:
+        return run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "active-mark"],
+            timeout=15,
+        ).returncode == 0
+    path = active_turn_path(name, state_root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").close()
+    return True
+
+
+def clear_active_turn(name, state_root=None, host_target=None):
+    if host_target is not None:
+        return run_worker_cmd(
+            host_target, ["agent-worker", "state", name, "active-clear"],
+            timeout=15,
+        ).returncode == 0
+    try:
+        os.remove(active_turn_path(name, state_root))
+    except FileNotFoundError:
+        pass
+    return True
+
+
 def remove_worker_state(name, state_root=None):
     """Delete a worker's entire state dir — meta, logs, inbox, and any /fresh
     marker — so /close leaves nothing behind. A missing dir (already-clean or
@@ -2333,6 +2388,7 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     priced_path = {}    # worker name -> transcript path last priced for it
     limit_watchers = {} # worker name -> provider-limit polling task
     limit_noticed = {}  # worker name -> reset hint already posted
+    recovering = set()  # workers currently being relaunched after interruption
     if pricing is None:
         print(f"[bridge] no pricing table at {PRICING_FILE} — cost budgets off")
 
@@ -2715,6 +2771,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
                 f"continue. {hint} Switch model/harness or retry after the "
                 "reset; the configured model was not changed.",
             )
+        # This turn is definitively refused, not merely interrupted. Do not
+        # resurrect it after a later host reboot and hammer the same limit.
+        await asyncio.to_thread(clear_active_turn, name, None, target)
         return True
 
     async def watch_provider_limit(name, channel_id, baseline_hint=None):
@@ -2775,6 +2834,58 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             task.cancel()
         if clear_notice:
             limit_noticed.pop(name, None)
+
+    async def recover_interrupted_worker(repo):
+        """Resume and re-steer one turn that died without a completion hook."""
+        name = repo["name"]
+        if name in recovering:
+            return
+        target = resolve_host_target(cfg, repo)
+        if not await asyncio.to_thread(
+                active_turn_pending, name, None, target):
+            return
+        if await asyncio.to_thread(worker_alive, name, target):
+            return
+        channel_id = channel_for_worker(name)
+        if not channel_id:
+            return
+        recovering.add(name)
+        try:
+            print(f"[bridge] {name}: interrupted turn found; resuming worker")
+            r = await asyncio.to_thread(
+                worker_start, name, repo["dir"], channel_id,
+                should_resume(
+                    worker_has_state(name, host_target=target),
+                    fresh_pending(name, host_target=target),
+                ),
+                repo.get("profile", "owner"), harness_for(repo), target,
+            )
+            if r.returncode != 0:
+                print(f"[bridge] {name}: recovery start failed: "
+                      f"{r.stderr.strip()[-400:]}")
+                return
+            await asyncio.to_thread(disarm_fresh, name, None, target)
+            if not await wait_ready(name, host_target=target):
+                print(f"[bridge] {name}: recovered worker never became ready")
+                # Make the next periodic pass retry rather than leaving a
+                # resumed-but-unsteered TUI indefinitely. worker_stop clears
+                # the marker, so restore it after the deliberate cleanup.
+                await asyncio.to_thread(worker_stop, name, target)
+                await asyncio.to_thread(mark_active_turn, name, None, target)
+                return
+            if await deliver(name, RECOVERY_PROMPT):
+                last_activity[name] = time.time()
+                print(f"[bridge] {name}: interrupted turn resumed automatically")
+            else:
+                print(f"[bridge] {name}: recovery prompt could not be delivered")
+        finally:
+            recovering.discard(name)
+
+    async def recover_interrupted_workers(delay=0):
+        if delay:
+            await asyncio.sleep(delay)
+        for repo in list(cfg["repos"].values()):
+            await recover_interrupted_worker(repo)
 
     async def scan_existing_provider_limits():
         """Recover quota screens that predate a bridge restart/reconnect."""
@@ -2849,6 +2960,12 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             if message:
                 await message.channel.send(f"⚠️ send failed: {r.stderr.strip()}")
             return False
+        # Slash commands operate the TUI but are not agent turns. For a real
+        # prompt, persist the in-flight state only after delivery succeeded.
+        # The completion event settles/clears it; a hard death leaves it for
+        # automatic recovery on the next bridge startup/reaper pass.
+        if not typed:
+            await asyncio.to_thread(mark_active_turn, name, None, target)
         arm_limit_watcher(name, screen)
         if message:
             await message.add_reaction("✅")
@@ -3902,6 +4019,11 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
         print(f"[bridge] connected to Discord as {client.user} "
               f"({len(cfg['repos'])} repo channel(s) mapped, {synced} slash command(s))")
         asyncio.create_task(scan_existing_provider_limits())
+        # tmux-continuum restores pane layouts asynchronously at boot. Let it
+        # finish, then replace any shell-only cw-* placeholder whose durable
+        # active-turn marker says real work was interrupted.
+        asyncio.create_task(recover_interrupted_workers(
+            RECOVERY_STARTUP_DELAY_SECONDS))
 
     @client.event
     async def on_message(message):
@@ -4126,6 +4248,10 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
             )
             path = event.get("transcript_path", "")
             last_activity[name] = time.time()
+            await asyncio.to_thread(
+                clear_active_turn, name, None,
+                resolve_host_target(cfg, repo_by_name(name)),
+            )
             # Serialize per transcript: two Stop-hook events for one worker can
             # land within the retry window below, and without the lock both read
             # the same pre-advance offset and post the reply twice.
@@ -4494,6 +4620,9 @@ def run_bridge(config_path):  # pragma: no cover - exercised live, not in tests
     async def reaper():
         while True:
             await asyncio.sleep(60)
+            # Also acts as the crash-recovery retry loop. Normal idle workers
+            # have no active-turn marker and are untouched.
+            await recover_interrupted_workers()
             # Prune bookkeeping for transcripts that no longer exist — /clear,
             # /fresh and /close all leave their old path's entry stranded (the
             # dicts are keyed by transcript path, not worker name), an otherwise
