@@ -636,6 +636,17 @@ class PurgeSuffixTests(unittest.TestCase):
         self.assertEqual(out, " — couldn't clear the channel: blocked")
 
 
+class ShouldPurgeMessageTests(unittest.TestCase):
+    def test_without_preserved_message_deletes_everything(self):
+        self.assertTrue(cb.should_purge_message(123))
+
+    def test_preserves_deferred_interaction_response(self):
+        self.assertFalse(cb.should_purge_message(123, preserve_message_id=123))
+
+    def test_deletes_other_messages(self):
+        self.assertTrue(cb.should_purge_message(456, preserve_message_id=123))
+
+
 class ReplyPreviewTests(unittest.TestCase):
     def test_none_when_empty(self):
         self.assertIsNone(cb.reply_preview(""))

@@ -1986,6 +1986,16 @@ def purge_suffix(deleted, note=None):
     return ""
 
 
+def should_purge_message(message_id, preserve_message_id=None):
+    """Whether a channel cleanup should delete one Discord message.
+
+    Slash commands defer before doing worker control so Discord does not time
+    them out.  /fresh and /clear then purge the channel; preserve that deferred
+    response so it can be edited into the command confirmation afterwards.
+    """
+    return preserve_message_id is None or message_id != preserve_message_id
+
+
 def reply_preview(body, limit=200):
     """One-line, length-capped snippet of a replied-to message (or None)."""
     body = (body or "").strip().replace("\n", " ")
@@ -2969,7 +2979,7 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
                 except discord.HTTPException:
                     pass
 
-    async def purge_channel(channel_id):
+    async def purge_channel(channel_id, preserve_message_id=None):
         """Delete a worker channel's messages (Ned's and the bot's) to clear
         clutter when the context is wiped (/clear, /fresh). Returns
         (deleted, note): the count removed and a human hint if something
@@ -2986,7 +2996,13 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
             try:
                 # bulk=True clears everything under 14 days in one shot;
                 # bulk=False then removes anything older, one message at a time.
-                deleted += len(await channel.purge(limit=None, bulk=bulk))
+                deleted += len(await channel.purge(
+                    limit=None,
+                    bulk=bulk,
+                    check=lambda message: should_purge_message(
+                        message.id, preserve_message_id
+                    ),
+                ))
             except discord.Forbidden:
                 note = "bot needs the **Manage Messages** permission to clean up"
                 break
@@ -3583,7 +3599,7 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
         )
         return f"```\n{r.stdout}\n```", None
 
-    async def do_fresh(name):
+    async def do_fresh(name, preserve_message_id=None):
         # Shut down now and arm a fresh start: the next message begins a
         # brand-new session with no --continue, without resuming first. The
         # marker survives the stop.
@@ -3592,7 +3608,9 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
         await asyncio.to_thread(worker_stop, name, target)
         await asyncio.to_thread(arm_fresh, name, None, target)
         # A fresh context deserves a fresh channel — wipe the old chatter.
-        purged, note = await purge_channel(channel_for_worker(name))
+        purged, note = await purge_channel(
+            channel_for_worker(name), preserve_message_id
+        )
         return (
             f"🧼 `{name}` shut down — your next message starts a fresh "
             f"context (no resume).{purge_suffix(purged, note)}", None,
@@ -3623,7 +3641,7 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
             else f"⚠️ restart failed: {r.stderr.strip()}", None,
         )
 
-    async def do_clear(name):
+    async def do_clear(name, preserve_message_id=None):
         # Deterministic context wipe: a fresh session (no resume) instead of the
         # /clear TUI command, so it works regardless of worker state and
         # re-injects the Discord protocol.
@@ -3647,7 +3665,7 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
         if harness in ("codex", "antigravity"):
             codex_unprimed.add(name)
         # Wiped the worker's context — wipe the channel's clutter to match.
-        purged, note = await purge_channel(channel_id)
+        purged, note = await purge_channel(channel_id, preserve_message_id)
         return f"🧹 `{name}` restarted with a fresh context{purge_suffix(purged, note)}", None
 
     async def wait_busy(name, harness, timeout=HANDOFF_PICKUP_SECONDS,
@@ -4117,7 +4135,7 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
         files = [
             discord.File(a) for a in (attachments or []) if os.path.isfile(a)
         ]
-        await interaction.followup.send(text, files=files)
+        await interaction.edit_original_response(content=text, attachments=files)
 
     @tree.command(name="status", description="Worker state (owner: all workers; guest: this channel's)")
     async def slash_status(interaction):
@@ -4140,7 +4158,11 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
         if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        await reply(interaction, *await do_fresh(name))
+        response = await interaction.original_response()
+        text, attachments = await do_fresh(
+            name, preserve_message_id=response.id
+        )
+        await reply(interaction, text, attachments)
 
     @tree.command(name="clear", description="Fresh context now + wipe the channel: restart the worker without --continue")
     @describe(worker="Worker name (defaults to this channel's worker)")
@@ -4148,7 +4170,11 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
         if not (name := await guard_scoped(interaction, worker)):
             return
         await interaction.response.defer(thinking=True)
-        await reply(interaction, *await do_clear(name))
+        response = await interaction.original_response()
+        text, attachments = await do_clear(
+            name, preserve_message_id=response.id
+        )
+        await reply(interaction, text, attachments)
 
     @tree.command(name="stop", description="Stop a worker (state kept; a message revives it)")
     @describe(worker="Worker name (defaults to this channel's worker)")
