@@ -292,6 +292,84 @@ class WorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.call[1]["expectedTurnId"], "turn-active")
             self.assertEqual(client.call[1]["input"][0]["text"], "change direction")
 
+    async def test_stale_active_turn_is_interrupted_before_follow_up(self):
+        class RecoveringClient:
+            def __init__(self, worker):
+                self.worker = worker
+                self.calls = []
+
+            async def request(self, method, params, timeout=60):
+                self.calls.append((method, params))
+                if method == "turn/interrupt":
+                    await self.worker.on_turn_completed({
+                        "id": "turn-stale", "status": "interrupted", "error": None,
+                    })
+                    return {}
+                if method == "turn/start":
+                    return {"turn": {"id": "turn-follow-up"}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = worker_mod.CodexAppWorker(
+                self.args(tmp, "/unused", name="recovery-worker")
+            )
+            client = RecoveringClient(worker)
+            worker.client = client
+            worker.state.update({
+                "thread_id": "thread-test",
+                "active_turn_id": "turn-stale",
+                "status": "active",
+            })
+            worker.last_protocol_activity -= (
+                worker_mod.STALE_ACTIVE_TURN_SECONDS + 1
+            )
+
+            result = await worker.submit("start a real follow-up")
+
+            self.assertEqual(
+                [method for method, _ in client.calls],
+                ["turn/interrupt", "turn/start"],
+            )
+            self.assertEqual(result["mode"], "start")
+            self.assertEqual(result["turn_id"], "turn-follow-up")
+            self.assertEqual(worker.state["active_turn_id"], "turn-follow-up")
+
+    async def test_turn_boundary_steer_failure_becomes_follow_up(self):
+        class BoundaryClient:
+            def __init__(self, worker):
+                self.worker = worker
+                self.calls = []
+
+            async def request(self, method, params, timeout=60):
+                self.calls.append(method)
+                if method == "turn/steer":
+                    await self.worker.on_turn_completed({
+                        "id": "turn-finishing", "status": "completed", "error": None,
+                    })
+                    raise worker_mod.RpcError(
+                        method, {"message": "no active turn for thread"}
+                    )
+                if method == "turn/start":
+                    return {"turn": {"id": "turn-next"}}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = worker_mod.CodexAppWorker(
+                self.args(tmp, "/unused", name="boundary-worker")
+            )
+            worker.client = BoundaryClient(worker)
+            worker.state.update({
+                "thread_id": "thread-test",
+                "active_turn_id": "turn-finishing",
+                "status": "active",
+            })
+            worker.turn_idle_event.clear()
+
+            result = await worker.submit("do not lose this")
+
+            self.assertEqual(worker.client.calls, ["turn/steer", "turn/start"])
+            self.assertEqual(result["turn_id"], "turn-next")
+
 
 if __name__ == "__main__":
     unittest.main()

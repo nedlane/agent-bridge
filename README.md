@@ -146,7 +146,10 @@ deferred follow-up. The next idle-state prompt starts a new turn and card
 (`✅` acknowledgement). Each final response is posted as a normal, permanent
 channel message. On completion the card collapses to a compact turn receipt,
 so the changing reasoning/activity layer is transient while outputs remain in
-the channel history.
+the channel history. If app-server loses a command completion and leaves a turn
+active but completely silent, the next message interrupts that orphan after
+five minutes of protocol inactivity and starts a real follow-up instead of
+steering input into a turn that can no longer consume it.
 Existing running Codex TUI workers are not replaced when the
 bridge restarts—they keep their recorded `backend=tui` until explicitly
 restarted. Set `codex_backend` or a repo's `backend` to `tui` for rollback.

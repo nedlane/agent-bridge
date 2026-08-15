@@ -43,6 +43,13 @@ MAX_CONTROL_BYTES = 2 * 1024 * 1024
 MAX_EVENT_LOG_BYTES = 25 * 1024 * 1024
 PROGRESS_INTERVAL = 2.0
 ACTIVITY_LIMIT = 8
+# A turn can occasionally remain marked active after its command process has
+# disappeared without app-server emitting turn/completed.  Steering into that
+# orphan is accepted but never reaches the model, so fresh Discord messages
+# appear to vanish.  Once the protocol has been completely quiet for this long,
+# a new message preempts the orphan and starts a real follow-up turn.
+STALE_ACTIVE_TURN_SECONDS = 5 * 60
+STALE_INTERRUPT_TIMEOUT = 15
 HIGH_VOLUME_EVENTS = {
     "item/agentMessage/delta",
     "item/commandExecution/outputDelta",
@@ -474,6 +481,9 @@ class CodexAppWorker:
         self.outbound_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=16)
         self.outbound_task: asyncio.Task | None = None
         self.crashed = False
+        self.last_protocol_activity = time.monotonic()
+        self.turn_idle_event = asyncio.Event()
+        self.turn_idle_event.set()
 
     def save(self) -> None:
         self.state["activities"] = list(self.activities)
@@ -785,17 +795,57 @@ class CodexAppWorker:
             # matching turn/completed notification. The turn id is the
             # authoritative steering guard during that window.
             if active_turn:
-                result = await self.client.request("turn/steer", {
-                    "threadId": self.state["thread_id"],
-                    "expectedTurnId": active_turn,
-                    "input": payload,
-                })
-                self.add_activity({
-                    "kind": "steering", "status": "completed",
-                    "label": "Steering applied",
-                    "detail": "The active turn was updated with a new instruction.",
-                })
-                return {"ok": True, "mode": "steer", "turn_id": result.get("turnId")}
+                stale = (
+                    time.monotonic() - self.last_protocol_activity
+                    >= STALE_ACTIVE_TURN_SECONDS
+                )
+                if stale:
+                    self.add_activity({
+                        "kind": "recovery", "status": "running",
+                        "label": "Recovering a stalled turn",
+                        "detail": "The inactive turn is being interrupted before this message is sent.",
+                    })
+                    self.turn_idle_event.clear()
+                    await self.client.request("turn/interrupt", {
+                        "threadId": self.state["thread_id"],
+                        "turnId": active_turn,
+                    }, timeout=10)
+                    try:
+                        await asyncio.wait_for(
+                            self.turn_idle_event.wait(), STALE_INTERRUPT_TIMEOUT
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise RuntimeError(
+                            "stalled Codex turn did not finish after interrupt"
+                        ) from exc
+                else:
+                    try:
+                        result = await self.client.request("turn/steer", {
+                            "threadId": self.state["thread_id"],
+                            "expectedTurnId": active_turn,
+                            "input": payload,
+                        }, timeout=10)
+                    except RpcError as steer_error:
+                        # The server can finish a turn just before its
+                        # turn/completed notification reaches us.  Let that
+                        # notification settle, then treat this input as the next
+                        # turn instead of dropping it at the boundary.
+                        try:
+                            await asyncio.wait_for(
+                                self.turn_idle_event.wait(), 2
+                            )
+                        except asyncio.TimeoutError:
+                            raise steer_error
+                    else:
+                        self.add_activity({
+                            "kind": "steering", "status": "completed",
+                            "label": "Steering applied",
+                            "detail": "The active turn was updated with a new instruction.",
+                        })
+                        return {
+                            "ok": True, "mode": "steer",
+                            "turn_id": result.get("turnId"),
+                        }
             params: dict[str, Any] = {
                 "threadId": self.state["thread_id"],
                 "input": payload,
@@ -844,9 +894,11 @@ class CodexAppWorker:
         })
 
     async def on_notification(self, method: str, params: dict[str, Any]) -> None:
+        self.last_protocol_activity = time.monotonic()
         if method not in HIGH_VOLUME_EVENTS:
             self.append_event(method, params)
         if method == "turn/started":
+            self.turn_idle_event.clear()
             turn = params.get("turn") or {}
             self.state["active_turn_id"] = turn.get("id")
             self.last_turn_id = turn.get("id")
@@ -977,6 +1029,7 @@ class CodexAppWorker:
         await self.emit_turn_end(turn)
         self.turn_started_at = None
         self.render_prompt()
+        self.turn_idle_event.set()
 
     def progress_payload(self, terminal_status: str | None = None) -> dict[str, Any]:
         elapsed = int(time.time() - self.turn_started_at) if self.turn_started_at else 0
