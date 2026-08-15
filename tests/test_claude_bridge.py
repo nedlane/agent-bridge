@@ -503,6 +503,21 @@ class ShouldResumeTests(unittest.TestCase):
         self.assertFalse(cb.should_resume(False, True))
 
 
+class ShouldRecoverFailedSendTests(unittest.TestCase):
+    def test_success_never_restarts(self):
+        self.assertFalse(cb.should_recover_failed_send(0, True, False))
+
+    def test_structured_normal_send_restarts(self):
+        self.assertTrue(cb.should_recover_failed_send(1, True, False))
+
+    def test_structured_typed_error_is_reported(self):
+        self.assertFalse(cb.should_recover_failed_send(1, True, True))
+
+    def test_tui_keeps_existing_recovery_for_typed_and_normal_sends(self):
+        self.assertTrue(cb.should_recover_failed_send(1, False, False))
+        self.assertTrue(cb.should_recover_failed_send(1, False, True))
+
+
 class ScreenIsCompactingTests(unittest.TestCase):
     def test_compacting_screen_matches(self):
         self.assertTrue(cb.screen_is_compacting("Compacting conversation…\n"))

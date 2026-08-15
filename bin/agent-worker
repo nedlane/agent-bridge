@@ -489,9 +489,9 @@ cmd_send() {
   [[ "$text" == "-" ]] && text="$(cat)"
   if [[ "$(backend_for "$name")" == app-server ]]; then
     if (( typed )); then
-      printf '%s' "$text" | app_control "$name" send --typed - >/dev/null
+      printf '%s' "$text" | app_control "$name" send --typed --stdin >/dev/null
     else
-      printf '%s' "$text" | app_control "$name" send - >/dev/null
+      printf '%s' "$text" | app_control "$name" send --stdin >/dev/null
     fi
     return
   fi

@@ -308,6 +308,11 @@ def error_kind(error: Any) -> str | None:
     return None
 
 
+def exception_message(exc: BaseException) -> str:
+    """Return a useful control-socket error even for blank TimeoutErrors."""
+    return str(exc).strip() or type(exc).__name__
+
+
 class AppServerClient:
     def __init__(self, argv: list[str], env: dict[str, str], notification_cb):
         self.argv = argv
@@ -1171,7 +1176,7 @@ class CodexAppWorker:
             else:
                 raise ValueError(f"unknown control command: {command}")
         except Exception as exc:
-            response = {"ok": False, "error": str(exc)}
+            response = {"ok": False, "error": exception_message(exc)}
         writer.write((json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
         with contextlib.suppress(ConnectionError):
             await writer.drain()
@@ -1256,6 +1261,7 @@ def parser() -> argparse.ArgumentParser:
     ctl.add_argument("--timeout", type=float, default=30)
     ctl.add_argument("command", choices=("inspect", "send", "interrupt"))
     ctl.add_argument("--typed", action="store_true")
+    ctl.add_argument("--stdin", action="store_true")
     ctl.add_argument("--field")
     ctl.add_argument("text", nargs="?")
     return root
@@ -1273,7 +1279,7 @@ async def async_main(args: argparse.Namespace) -> int:
         return await worker.run()
 
     text = args.text
-    if args.command == "send" and text == "-":
+    if args.command == "send" and (args.stdin or text == "-"):
         text = sys.stdin.read()
     request = {"command": args.command}
     if args.command == "send":

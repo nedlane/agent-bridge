@@ -2524,6 +2524,16 @@ def should_resume(has_state, fresh):
     return has_state and not fresh
 
 
+def should_recover_failed_send(returncode, structured, typed):
+    """Retry failed normal input after restarting its worker.
+
+    TUI sends have always used this recovery. Structured app-server workers
+    need it too when a stale turn wedges the control RPC, but an unsupported
+    typed/local command should report its error without restarting the worker.
+    """
+    return returncode != 0 and (not structured or not typed)
+
+
 def active_turn_path(name, state_root=None):
     return os.path.join(state_root or STATE_ROOT, name, "active-turn")
 
@@ -3309,14 +3319,16 @@ def run_bridge(config_path, event_only=False):  # pragma: no cover - live runtim
             return False
         text = tag_inbound(text, typed, tag)
         r = await asyncio.to_thread(worker_send, name, text, typed, target)
-        if r.returncode != 0 and not app_state:
-            # A send that lands exactly on a turn boundary can wedge in the
-            # TUI's queued-message state (displayed but never submitted, even
-            # with Enter retries). Recover deterministically: restart the
-            # worker with --continue and re-send once.
+        if should_recover_failed_send(r.returncode, bool(app_state), typed):
+            # A TUI send can wedge at a turn boundary. A structured app-server
+            # send can fail when an orphaned turn no longer answers its
+            # interrupt RPC. Recover both deterministically: restart the
+            # worker with its conversation resumed and re-send once.
             channel_id = channel_for_worker(name)
             if repo and channel_id:
-                print(f"[bridge] {name}: send wedged, restarting worker to recover")
+                detail = (r.stderr or "").strip() or "unknown control error"
+                print(f"[bridge] {name}: send failed ({detail}); "
+                      "restarting worker to recover")
                 await asyncio.to_thread(worker_stop, name, target)
                 # Carry the channel's capability profile AND engine through the
                 # restart — omitting either would silently relaunch a restricted

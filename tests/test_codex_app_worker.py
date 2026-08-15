@@ -27,6 +27,18 @@ worker_mod = load_worker()
 
 
 class PureHelperTests(unittest.TestCase):
+    def test_blank_exception_still_has_a_useful_control_error(self):
+        self.assertEqual(worker_mod.exception_message(asyncio.TimeoutError()),
+                         "TimeoutError")
+
+    def test_control_parser_accepts_stdin_with_typed_send(self):
+        args = worker_mod.parser().parse_args([
+            "ctl", "--socket", "/tmp/control.sock", "send", "--typed", "--stdin",
+        ])
+        self.assertTrue(args.typed)
+        self.assertTrue(args.stdin)
+        self.assertIsNone(args.text)
+
     def test_command_summary_hides_shell_wrapper(self):
         activity = worker_mod.summarize_item({
             "type": "commandExecution",
