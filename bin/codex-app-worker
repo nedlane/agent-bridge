@@ -41,6 +41,10 @@ WEBHOOK_FILE = "bridge-webhook"
 ACTIVE_MARKER = "active-turn"
 MAX_CONTROL_BYTES = 2 * 1024 * 1024
 MAX_EVENT_LOG_BYTES = 25 * 1024 * 1024
+# asyncio's subprocess streams default to 64 KiB per line. App-server sends
+# newline-delimited JSON and some notifications, especially turn/diff/updated,
+# legitimately contain the complete diff in one line.
+APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 PROGRESS_INTERVAL = 2.0
 ACTIVITY_LIMIT = 8
 # A turn can occasionally remain marked active after its command process has
@@ -332,6 +336,7 @@ class AppServerClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self.env,
+            limit=APP_SERVER_STREAM_LIMIT,
         )
         self.reader_task = asyncio.create_task(self._reader())
         self.stderr_task = asyncio.create_task(self._stderr())

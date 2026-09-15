@@ -1,6 +1,7 @@
 """Unit and protocol tests for the Codex app-server worker."""
 
 import asyncio
+import contextlib
 import importlib.util
 import json
 import os
@@ -211,6 +212,45 @@ class WorkerProtocolTests(unittest.IsolatedAsyncioTestCase):
             codex_command=fake,
             strict_config=False,
         )
+
+    async def test_client_accepts_json_rpc_lines_larger_than_asyncio_default(self):
+        fake_source = r'''#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({
+        "method": "test/largeNotification",
+        "params": {"payload": "x" * (96 * 1024)},
+    }, separators=(",", ":")), flush=True)
+    print(json.dumps({
+        "id": request["id"],
+        "result": {"ok": True},
+    }, separators=(",", ":")), flush=True)
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "large-line-app-server")
+            with open(fake, "w", encoding="utf-8") as handle:
+                handle.write(textwrap.dedent(fake_source))
+            os.chmod(fake, 0o755)
+            notifications = []
+
+            async def record_notification(method, params):
+                notifications.append((method, params))
+
+            client = worker_mod.AppServerClient(
+                [fake], os.environ.copy(), record_notification
+            )
+            await client.start()
+            try:
+                result = await client.request("test/large", timeout=2)
+                self.assertEqual(result, {"ok": True})
+                self.assertEqual(notifications[0][0], "test/largeNotification")
+                self.assertEqual(len(notifications[0][1]["payload"]), 96 * 1024)
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.close()
 
     async def test_worker_runs_turn_and_persists_structured_state(self):
         with tempfile.TemporaryDirectory() as tmp:
